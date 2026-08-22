@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+fail=0
+
+check() {
+  local label="$1" cmd="$2"
+  if eval "$cmd" >/dev/null 2>&1; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s\n' "$label"
+    fail=1
+  fi
+}
+
+printf 'AIH doctor\n'
+printf '%s\n' '----------'
+
+check "node >= 20"            "node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 20 ? 0 : 1)'"
+check "npm available"         "command -v npm"
+check "APP.md present"        "test -f APP.md"
+check "harness.yml present"   "test -f harness.yml"
+check "task template present" "test -f tasks/TEMPLATE.md"
+check "decisions log present" "test -f docs/decisions.md"
+check "core sources present"  "test -f core/src/agent-loop.ts"
+check "mcp-server present"    "test -f mcp-server/src/index.ts"
+check "skill present"         "test -f skills/aih-app-integration/SKILL.md"
+
+if [ -d node_modules ]; then
+  check "dependencies installed" "test -d node_modules/@modelcontextprotocol/sdk"
+else
+  printf '  warn  dependencies not installed yet (run: npm run bootstrap)\n'
+fi
+
+if [ "$fail" -eq 0 ]; then
+  printf '\nready.\n'
+else
+  printf '\nnot ready; fix the FAIL items above.\n'
+  exit 1
+fi

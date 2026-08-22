@@ -1,0 +1,604 @@
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
+import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
+import type { DiffLine } from "./diff.js";
+import { lineDiff } from "./diff.js";
+
+export interface GeneralToolsOptions {
+  cwd?: string;
+  gate?: ApprovalGate;
+  llm?: LLMAdapter | (() => LLMAdapter);
+  toolsProvider?: () => ToolRegistry | undefined;
+  ask?: (question: string, options?: string[]) => Promise<string>;
+  hooks?: ToolHooks;
+}
+
+const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn", "dist", "build"]);
+const MAX_GLOB = 500;
+const MAX_GREP = 200;
+const MAX_FETCH_BYTES = 1_500_000;
+const MAX_CONTENT = 64_000;
+
+function globToRegExp(pattern: string): RegExp {
+  let re = "^";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        re += ".*";
+        i += 1;
+      } else {
+        re += "[^/]*";
+      }
+    } else if (ch === "?") {
+      re += "[^/]";
+    } else if ("\\^$.|+()[]{}".includes(ch)) {
+      re += `\\${ch}`;
+    } else {
+      re += ch;
+    }
+  }
+  return new RegExp(`${re}$`);
+}
+
+function walk(base: string, out: string[]): void {
+  const stack = [base];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") && entry.isDirectory()) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) stack.push(full);
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        out.push(full);
+      }
+    }
+  }
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+}
+
+function stripTags(html: string): string {
+  return decodeEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<(br|\/p|\/div|\/h[1-6]|\/li|\/tr)[^>]*>/gi, "\n")
+      .replace(/<[^>]+>/g, ""),
+  );
+}
+
+function htmlToText(html: string): { title: string; text: string } {
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]?.trim() ?? "";
+  let body = html;
+  const main = /<main[\s\S]*?<\/main>/i.exec(html) ?? /<article[\s\S]*?<\/article>/i.exec(html);
+  if (main) body = main[0];
+  return { title: decodeEntities(title), text: stripTags(body).replace(/\n{3,}/g, "\n\n").trim() };
+}
+
+function readToolFile(cwd: string, p: unknown): { file: string; text: string } {
+  const file = resolve(cwd, String(p ?? ""));
+  if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`not found: ${file}`);
+  return { file, text: readFileSync(file, "utf8") };
+}
+
+export function registerGeneralTools(
+  registry: ToolRegistry,
+  opts: GeneralToolsOptions = {},
+  hideWrites = false,
+): void {
+  const cwd = opts.cwd ?? process.cwd();
+  const reg = (def: Parameters<ToolRegistry["register"]>[0]): void => {
+    if (hideWrites && def.kind === "write") return;
+    if (!registry.get(def.name)) registry.register(def);
+  };
+
+  reg({
+    name: "edit",
+    description:
+      "Replace an exact string in a file. old_string must match the file content exactly; " +
+      "if it occurs multiple times pass replace_all=true or make it more specific.",
+    kind: "write",
+    permission: "ask",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "file path" },
+        old_string: { type: "string", description: "exact text to find (must be unique unless replace_all)" },
+        new_string: { type: "string", description: "replacement text" },
+        replace_all: { type: "boolean", description: "replace every occurrence (default false)" },
+      },
+      required: ["path", "old_string", "new_string"],
+    },
+    execute: async (args) => {
+      const a = args as { path?: unknown; old_string?: unknown; new_string?: unknown; replace_all?: unknown };
+      const oldString = String(a.old_string ?? "");
+      if (!oldString) throw new Error("old_string is required");
+      const { file, text } = readToolFile(cwd, a.path);
+      const count = text.split(oldString).length - 1;
+      if (count === 0) {
+        throw new Error(
+          `old_string not found in ${file}; read the file and retry with the exact text (whitespace included)`,
+        );
+      }
+      if (count > 1 && !a.replace_all) {
+        throw new Error(`old_string occurs ${count} times in ${file}; pass replace_all=true or a more specific old_string`);
+      }
+      const newString = String(a.new_string ?? "");
+      const updated = a.replace_all ? text.split(oldString).join(newString) : text.replace(oldString, newString);
+      writeFileSync(file, updated);
+      return { path: file, replacements: a.replace_all ? count : 1, _diff: lineDiff(oldString, newString) };
+    },
+  });
+
+  reg({
+    name: "glob",
+    description: `Find files by glob pattern (supports ** and *), e.g. "**/*.ts". Relative to ${cwd}.`,
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "glob pattern" },
+        path: { type: "string", description: "base directory (default: workspace)" },
+      },
+      required: ["pattern"],
+    },
+    execute: async (args) => {
+      const a = args as { pattern?: unknown; path?: unknown };
+      const pattern = String(a.pattern ?? "");
+      if (!pattern) throw new Error("pattern is required");
+      const base = resolve(cwd, String(a.path ?? "."));
+      const p = pattern.includes("/") ? pattern : `**/${pattern}`;
+      const re = globToRegExp(p);
+      const files: string[] = [];
+      walk(base, files);
+      const matches = files
+        .map((f) => relative(base, f).split("\\").join("/"))
+        .filter((rel) => re.test(rel))
+        .sort()
+        .slice(0, MAX_GLOB);
+      return { base, pattern, count: matches.length, truncated: matches.length === MAX_GLOB, files: matches };
+    },
+  });
+
+  reg({
+    name: "grep",
+    description: "Search file contents with a regex; returns file:line matches (first 200).",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "regex pattern" },
+        path: { type: "string", description: "file or directory to search (default: workspace)" },
+        include: { type: "string", description: "glob filter for file names, e.g. \"*.ts\"" },
+      },
+      required: ["pattern"],
+    },
+    execute: async (args) => {
+      const a = args as { pattern?: unknown; path?: unknown; include?: unknown };
+      const pattern = String(a.pattern ?? "");
+      if (!pattern) throw new Error("pattern is required");
+      let re: RegExp;
+      try {
+        re = new RegExp(pattern);
+      } catch (err) {
+        throw new Error(`invalid regex: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const root = resolve(cwd, String(a.path ?? "."));
+      const includeRaw = String(a.include ?? "");
+      const includeRe = includeRaw
+        ? globToRegExp(includeRaw.includes("/") ? includeRaw : `**/${includeRaw}`)
+        : null;
+      const files: string[] = [];
+      if (existsSync(root) && statSync(root).isFile()) files.push(root);
+      else walk(root, files);
+      const matches: Array<{ file: string; line: number; text: string }> = [];
+      let scanned = 0;
+      for (const file of files) {
+        if (matches.length >= MAX_GREP) break;
+        if (includeRe && !includeRe.test(relative(root, file).split("\\").join("/"))) continue;
+        let text: string;
+        try {
+          text = readFileSync(file, "utf8");
+        } catch {
+          continue;
+        }
+        if (text.slice(0, 8192).includes("\u0000")) continue;
+        scanned += 1;
+        const lines = text.split("\n");
+        for (let i = 0; i < lines.length && matches.length < MAX_GREP; i += 1) {
+          if (re.test(lines[i])) {
+            matches.push({ file: relative(root, file).split("\\").join("/"), line: i + 1, text: lines[i].trim().slice(0, 400) });
+          }
+        }
+      }
+      return { pattern, scanned_files: scanned, count: matches.length, truncated: matches.length === MAX_GREP, matches };
+    },
+  });
+
+  const todosPath = join(cwd, ".aih", "todos.json");
+  reg({
+    name: "todo",
+    description:
+      "Replace the session todo list (task tracking). Pass the full list with statuses " +
+      "pending | in_progress | completed | cancelled; at most one in_progress.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          description: "full todo list (replaces previous)",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+            },
+            required: ["content", "status"],
+          },
+        },
+      },
+      required: ["todos"],
+    },
+    execute: async (args) => {
+      const list = Array.isArray((args as { todos?: unknown }).todos) ? ((args as { todos: unknown[] }).todos as object[]) : [];
+      const inProgress = list.filter((t) => (t as { status?: string }).status === "in_progress").length;
+      if (inProgress > 1) throw new Error("at most one todo may be in_progress");
+      mkdirSync(dirname(todosPath), { recursive: true });
+      const body = JSON.stringify({ updatedAt: new Date().toISOString(), todos: list }, null, 2);
+      writeFileSync(todosPath, `${body}\n`);
+      const items = list.map((t) => {
+        const item = t as { content?: string; status?: string };
+        return { content: String(item.content ?? ""), status: String(item.status ?? "pending") };
+      });
+      const rendered = items.length
+        ? items
+            .map((item) => {
+              const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : item.status === "cancelled" ? "-" : " ";
+              return `${mark} [${item.status}] ${item.content}`;
+            })
+            .join("\n")
+        : "(empty)";
+      return { file: todosPath, count: items.length, list: rendered, todos: items };
+    },
+  });
+
+  reg({
+    name: "remember",
+    description:
+      "Persist durable project knowledge to .aih/memory.md so future sessions can recall it. " +
+      "action=append adds a dated entry; action=set rewrites the whole memory file. Use for decisions, conventions, and facts that must survive across sessions.",
+    kind: "write",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["append", "set"],
+          description: "append a dated entry, or set (replace) the whole memory",
+        },
+        text: { type: "string", description: "the memory content to store" },
+      },
+      required: ["action", "text"],
+    },
+    execute: async (args) => {
+      const a = args as { action?: unknown; text?: unknown };
+      const action = String(a.action ?? "append");
+      const text = String(a.text ?? "").trim();
+      if (!text) throw new Error("remember requires non-empty text");
+      const path = join(cwd, ".aih", "memory.md");
+      mkdirSync(dirname(path), { recursive: true });
+      if (action === "set") {
+        writeFileSync(path, `# Project memory\n\n${text}\n`);
+      } else {
+        const stamp = new Date().toISOString().slice(0, 10);
+        const existing = existsSync(path) ? readFileSync(path, "utf8") : "# Project memory\n";
+        writeFileSync(path, `${existing.replace(/\s+$/, "")}\n\n- ${stamp} — ${text}\n`);
+      }
+      return { path, action };
+    },
+  });
+
+  reg({
+    name: "question",
+    description: "Ask the user a question and wait for their answer (interactive sessions only).",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "the question to ask" },
+        options: { type: "array", description: "optional list of suggested answers", items: { type: "string" } },
+      },
+      required: ["question"],
+    },
+    execute: async (args) => {
+      const a = args as { question?: unknown; options?: unknown };
+      if (!opts.ask) throw new Error("no interactive channel available; run in `aih chat` (TTY) to use question");
+      const answer = await opts.ask(String(a.question ?? ""), Array.isArray(a.options) ? (a.options as string[]) : undefined);
+      return { answer };
+    },
+  });
+
+  reg({
+    name: "webfetch",
+    description: "Fetch a URL and return its text content (HTML converted to plain text, max ~64KB).",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "absolute http(s) URL" },
+        format: { type: "string", enum: ["text", "markdown"], description: "output format (default text)" },
+      },
+      required: ["url"],
+    },
+    execute: async (args) => {
+      const a = args as { url?: unknown };
+      const url = String(a.url ?? "");
+      if (!/^https?:\/\//.test(url)) throw new Error("url must be absolute http(s)");
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      let res: Response;
+      try {
+        res = await fetch(url, { signal: controller.signal, redirect: "follow", headers: { "user-agent": "aih/0.2 (+harness)" } });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`webfetch failed: HTTP ${res.status}`);
+      const type = res.headers.get("content-type") ?? "";
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.byteLength > MAX_FETCH_BYTES) throw new Error(`content too large: ${buf.byteLength} bytes`);
+      const raw = buf.toString("utf8");
+      if (type.includes("html")) {
+        const { title, text } = htmlToText(raw);
+        return { url, title, format: "text", chars: text.length, content: text.slice(0, MAX_CONTENT) };
+      }
+      return { url, format: "text", chars: raw.length, content: raw.slice(0, MAX_CONTENT) };
+    },
+  });
+
+  reg({
+    name: "websearch",
+    description: "Web search (DuckDuckGo); returns titles, URLs and snippets.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "search query" },
+        max_results: { type: "number", description: "max results (default 8)" },
+      },
+      required: ["query"],
+    },
+    execute: async (args) => {
+      const a = args as { query?: unknown; max_results?: unknown };
+      const query = String(a.query ?? "");
+      if (!query) throw new Error("query is required");
+      const max = Math.min(20, Math.max(1, Number(a.max_results ?? 8) || 8));
+      const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      let res: Response;
+      try {
+        res = await fetch(endpoint, { signal: controller.signal, headers: { "user-agent": "Mozilla/5.0 (aih websearch)" } });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`websearch failed: HTTP ${res.status}`);
+      const html = await res.text();
+      const links = [...html.matchAll(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
+      const snippets = [...html.matchAll(/<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => stripTags(m[1]).trim());
+      const results = links.slice(0, max).map((m, i) => {
+        let href = decodeEntities(m[1]);
+        const uddg = /uddg=([^&]+)/.exec(href);
+        if (uddg) href = decodeURIComponent(uddg[1]);
+        return { title: stripTags(m[2]).trim(), url: href, snippet: snippets[i] ?? "" };
+      });
+      if (!results.length) throw new Error("no results (the search endpoint may be unavailable; try webfetch on a known URL)");
+      return { query, count: results.length, results };
+    },
+  });
+
+  reg({
+    name: "apply_patch",
+    description:
+      "Apply a multi-file patch. Format: *** Begin Patch ... *** End Patch with sections " +
+      "'*** Add File: <path>' (+ lines), '*** Delete File: <path>', '*** Update File: <path>' " +
+      "(optional '*** Move to: <newpath>', then hunks of '@@ context' / '-' old lines / '+' new lines).",
+    kind: "write",
+    permission: "ask",
+    parameters: {
+      type: "object",
+      properties: {
+        patch: { type: "string", description: "full patch text" },
+      },
+      required: ["patch"],
+    },
+    execute: async (args) => {
+      const a = args as { patch?: unknown };
+      const patch = String(a.patch ?? "");
+      const bodyMatch = /\*\*\* Begin Patch\n([\s\S]*?)\n?\*\*\* End Patch/.exec(patch);
+      if (!bodyMatch) throw new Error("patch must be wrapped in '*** Begin Patch' ... '*** End Patch'");
+      const lines = bodyMatch[1].split("\n");
+      const applied: string[] = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        const add = /^\*\*\* Add File: (.+)$/.exec(line);
+        if (add) {
+          const path = resolve(cwd, add[1].trim());
+          i += 1;
+          const content: string[] = [];
+          while (i < lines.length && !lineIsHeader(lines[i])) {
+            if (!lines[i].startsWith("+")) throw new Error(`expected '+' line in Add File section at line ${i + 1}`);
+            content.push(lines[i].slice(1));
+            i += 1;
+          }
+          mkdirSync(dirname(path), { recursive: true });
+          writeFileSync(path, `${content.join("\n")}\n`);
+          applied.push(`A ${relative(cwd, path)}`);
+          continue;
+        }
+        const del = /^\*\*\* Delete File: (.+)$/.exec(line);
+        if (del) {
+          const path = resolve(cwd, del[1].trim());
+          if (!existsSync(path)) throw new Error(`cannot delete missing file: ${path}`);
+          unlinkSync(path);
+          applied.push(`D ${relative(cwd, path)}`);
+          i += 1;
+          continue;
+        }
+        const upd = /^\*\*\* Update File: (.+)$/.exec(line);
+        if (upd) {
+          let path = resolve(cwd, upd[1].trim());
+          i += 1;
+          let moveTo: string | undefined;
+          const move = /^\*\*\* Move to: (.+)$/.exec(lines[i] ?? "");
+          if (move) {
+            moveTo = resolve(cwd, move[1].trim());
+            i += 1;
+          }
+          const ops: Array<{ anchor?: string; remove: string[]; add: string[] }> = [];
+          let op: { anchor?: string; remove: string[]; add: string[] } | undefined;
+          while (i < lines.length && !lineIsHeader(lines[i])) {
+            const l = lines[i];
+            if (l.startsWith("@@")) {
+              op = { anchor: l.slice(2).trim(), remove: [], add: [] };
+              ops.push(op);
+            } else if (l.startsWith("-")) {
+              if (!op) throw new Error(`'-' line outside a hunk at line ${i + 1}`);
+              op.remove.push(l.slice(1));
+            } else if (l.startsWith("+")) {
+              if (!op) throw new Error(`'+' line outside a hunk at line ${i + 1}`);
+              op.add.push(l.slice(1));
+            }
+            i += 1;
+          }
+          if (!ops.length) throw new Error("Update File section has no hunks");
+          const { file, text } = readToolFile(cwd, path);
+          let updated = text;
+          for (const o of ops) {
+            const searchParts = [o.anchor, ...o.remove].filter((p) => p !== undefined && p !== "");
+            if (!searchParts.length) throw new Error("empty hunk");
+            const search = searchParts.join("\n");
+            const idx = updated.indexOf(search);
+            if (idx < 0) {
+              throw new Error(`hunk not found in ${file}:\n${search.slice(0, 240)}`);
+            }
+            const replace = [o.anchor ?? "", ...o.add].filter((p) => p !== undefined).join("\n");
+            updated = updated.slice(0, idx) + replace + updated.slice(idx + search.length);
+          }
+          if (moveTo) {
+            mkdirSync(dirname(moveTo), { recursive: true });
+            writeFileSync(moveTo, updated);
+            unlinkSync(file);
+            applied.push(`M ${relative(cwd, file)} -> ${relative(cwd, moveTo)}`);
+          } else {
+            writeFileSync(file, updated);
+            applied.push(`U ${relative(cwd, file)}`);
+          }
+          continue;
+        }
+        i += 1;
+      }
+      if (!applied.length) throw new Error("patch contained no file operations");
+      const diff: DiffLine[] = [];
+      for (const l of String(a.patch ?? "").split("\n")) {
+        if (l.startsWith("+") && !l.startsWith("+++")) diff.push({ t: "add", s: l.slice(1) });
+        else if (l.startsWith("-") && !l.startsWith("---")) diff.push({ t: "del", s: l.slice(1) });
+      }
+      return { applied, _diff: diff };
+    },
+  });
+
+  reg({
+    name: "task",
+    description:
+      "Delegate a self-contained subtask to a focused subagent (own context, up to 8 steps, no nested tasks). " +
+      "Use for research or multi-step work you want isolated from the main conversation.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        description: { type: "string", description: "short (3-8 word) task label" },
+        prompt: { type: "string", description: "full instructions for the subagent" },
+      },
+      required: ["description", "prompt"],
+    },
+    execute: async (args) => {
+      const a = args as { description?: unknown; prompt?: unknown };
+      const prompt = String(a.prompt ?? "");
+      if (!prompt) throw new Error("task requires a prompt");
+      if (!opts.gate || !opts.llm || !opts.toolsProvider) {
+        throw new Error("task subagent is not wired in this context (chat only)");
+      }
+      const llm = typeof opts.llm === "function" ? opts.llm() : opts.llm;
+      const parent = opts.toolsProvider();
+      if (!parent) throw new Error("task subagent has no parent tool registry");
+      const subRegistry = new Registry(opts.gate);
+      for (const schema of parent.schemas()) {
+        if (schema.name === "task" || schema.name === "question") continue;
+        const def = parent.get(schema.name);
+        if (def) subRegistry.register(def);
+      }
+      if (opts.hooks) subRegistry.addHooks(opts.hooks);
+      const subLog = new SessionLog();
+      const loop = new AgentLoop({
+        llm,
+        tools: subRegistry,
+        log: subLog,
+        systemPrompt:
+          "You are a focused subagent of the AIH harness. Complete the assigned task with the available " +
+          "tools and finish with one concise final answer covering what was done and key findings.",
+        maxStepsPerTurn: 8,
+      });
+      const result = await loop.send(prompt);
+      const lastAssistant = [...subLog.all()]
+        .reverse()
+        .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
+      const answer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
+      return { description: String(a.description ?? ""), steps: result.steps, stopReason: result.stopReason, answer };
+    },
+  });
+}
+
+function lineIsHeader(line: string): boolean {
+  return (
+    line.startsWith("*** Add File:") ||
+    line.startsWith("*** Delete File:") ||
+    line.startsWith("*** Update File:") ||
+    line.startsWith("*** Move to:")
+  );
+}

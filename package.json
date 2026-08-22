@@ -1,0 +1,30 @@
+{
+  "name": "aih",
+  "version": "0.1.0",
+  "private": true,
+  "description": "App Intelligence Harness: a universal framework for making ordinary applications AI-assisted",
+  "type": "module",
+  "license": "MIT",
+  "workspaces": [
+    "core",
+    "mcp-server",
+    "cli"
+  ],
+  "scripts": {
+    "bootstrap": "npm install",
+    "build": "tsc -b",
+    "doctor": "bash scripts/doctor",
+    "check": "npm run build && bash scripts/check",
+    "test": "node core/dist/smoke.js && node mcp-server/dist/smoke.js && node cli/dist/smoke.js",
+    "test:core": "node core/dist/smoke.js",
+    "test:mcp": "node mcp-server/dist/smoke.js",
+    "test:cli": "node cli/dist/smoke.js",
+    "cli": "node cli/dist/index.js",
+    "bench": "bash scripts/bench",
+    "eval": "bash scripts/eval"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@aih/mcp-server",
+  "version": "0.1.0",
+  "description": "AIH access layer: expose any application as Context/Action primitives over MCP",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "aih-mcp-server": "dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "node dist/smoke.js",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

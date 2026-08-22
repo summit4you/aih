@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+printf 'AIH check: contract consistency\n'
+
+status=0
+
+for cmd in bootstrap doctor check test eval cli bench; do
+  if grep -q "  $cmd:" harness.yml && grep -q "\"$cmd\"" package.json; then
+    printf '  ok    command "%s" declared in harness.yml and package.json\n' "$cmd"
+  else
+    printf '  FAIL  command "%s" missing from harness.yml or package.json\n' "$cmd"
+    status=1
+  fi
+done
+
+for doc in instructions decisions tasks; do
+  if grep -q "$doc" harness.yml; then
+    printf '  ok    docs key "%s" declared\n' "$doc"
+  else
+    printf '  FAIL  docs key "%s" missing from harness.yml\n' "$doc"
+    status=1
+  fi
+done
+
+if grep -q "app_context" APP.md && grep -q "app_describe" skills/aih-app-integration/SKILL.md; then
+  printf '  ok    L0 primitives documented in APP.md and skill\n'
+else
+  printf '  FAIL  L0 primitive names inconsistent between APP.md and skill\n'
+  status=1
+fi
+
+exit "$status"

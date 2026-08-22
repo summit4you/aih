@@ -1,0 +1,26 @@
+export { SessionLog } from "./session-log.js";
+export type { SessionListener, SessionEventInput } from "./session-log.js";
+export { SessionStore } from "./session-store.js";
+export { AgentLoop } from "./agent-loop.js";
+export type { AgentLoopOptions } from "./agent-loop.js";
+export { ToolRegistry } from "./tool-registry.js";
+export type {
+  ToolHookInfo,
+  ToolHooks,
+  ToolInvocationResult,
+} from "./tool-registry.js";
+export { MockLLM, toolCall } from "./seams/llm.js";
+export type { LLMAdapter } from "./seams/llm.js";
+export { OpenAICompatibleLLM } from "./seams/llm-openai.js";
+export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
+export {
+  AutoApprove,
+  DenyAll,
+  PolicyGate,
+  RulesetGate,
+  deriveScope,
+  matchPattern,
+  targetOf,
+} from "./seams/permissions.js";
+export type { ApprovalGate, ApprovalRequest, PermissionRule } from "./seams/permissions.js";
+export type * from "./types.js";

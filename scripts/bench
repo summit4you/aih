@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+KEY="${AIH_API_KEY:?set AIH_API_KEY}"
+MODEL="${AIH_MODEL:-deepseek-v4-flash}"
+BASE_URL="${AIH_BASE_URL:-https://opencode.ai/zen/go/v1/chat/completions}"
+RUNS="${BENCH_RUNS:-3}"
+WITH_OPENCODE="${BENCH_WITH_OPENCODE:-1}"
+
+export AIH_API_KEY="$KEY" AIH_MODEL="$MODEL" AIH_BASE_URL="$BASE_URL"
+AIH_CLI=(node cli/dist/index.js)
+RES=".aih/bench.tsv"
+OUT=".aih/bench.last.out"
+mkdir -p .aih
+: > "$RES"
+
+now_ms() { date +%s%3N; }
+
+bench() {
+  local label="$1" expect="$2"; shift 2
+  local s e rc hit=0
+  s=$(now_ms)
+  timeout 180 "$@" > "$OUT" 2>&1 || true
+  rc=$?
+  e=$(now_ms)
+  grep -q "$expect" "$OUT" 2>/dev/null && hit=1
+  printf '%s\t%s\t%s\t%s\n' "$label" "$rc" "$((e-s))" "$hit" >> "$RES"
+  echo "done: $label rc=$rc $((e-s))ms hit=$hit"
+}
+
+echo "== AIH vs opencode benchmark (model: $MODEL, runs: $RUNS) =="
+bench boot_aih "toggle_todo" "${AIH_CLI[@]}" tools
+
+if command -v opencode >/dev/null 2>&1 && [ "$WITH_OPENCODE" = "1" ]; then
+  if [ ! -f opencode.json ]; then
+    echo "warn: no opencode.json in cwd; skipping opencode cases" >&2
+    WITH_OPENCODE=0
+  else
+    bench boot_oc "version" opencode --version
+  fi
+fi
+
+T1="只回复两个字：好的。不要调用任何工具。"
+for i in $(seq 1 "$RUNS"); do
+  bench "t1_aih_$i" "好的" "${AIH_CLI[@]}" run "$T1"
+  [ "$WITH_OPENCODE" = "1" ] && bench "t1_oc_$i" "好的" opencode run "$T1"
+done
+
+for i in $(seq 1 "$RUNS"); do
+  bench "t2_aih_$i" "bench$i" "${AIH_CLI[@]}" run "添加一条待办bench$i，然后列出所有待办并告诉我现在有几条" --yes
+  [ "$WITH_OPENCODE" = "1" ] && bench "t2_oc_$i" "bench$i" opencode run "添加一条待办bench$i，然后列出所有待办并告诉我现在有几条"
+done
+
+echo "== results (label | exit | wall_ms | expect_hit) =="
+cat "$RES"

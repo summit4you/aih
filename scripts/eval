@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+printf 'AIH eval: full handoff gate\n'
+printf '===========================\n\n'
+
+bash scripts/doctor
+printf '\n'
+
+if [ ! -d node_modules ]; then
+  printf '==> bootstrap\n'
+  npm run bootstrap
+  printf '\n'
+fi
+
+printf '==> check (build + contract consistency)\n'
+npm run check
+printf '\n'
+
+printf '==> test (smoke)\n'
+npm test
+
+printf '\neval passed: safe to hand off.\n'

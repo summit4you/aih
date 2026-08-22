@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+dist/
+dist-release/
+*.tsbuildinfo
+
+# 打包/安装脚本（本地生成，不入库）
+install
+scripts/package
+
+# 本地运行/会话数据
+.aih/
+start.sh
+
+# 内部设计文档（决策、路线图、横向对比，不入库）
+docs/

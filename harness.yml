@@ -1,0 +1,34 @@
+name: aih
+version: 0.1.0
+description: App Intelligence Harness - canonical commands and task-loop stages
+
+commands:
+  bootstrap: npm run bootstrap
+  doctor: npm run doctor
+  check: npm run check
+  test: npm test
+  eval: npm run eval
+  cli: npm run cli
+  bench: npm run bench
+
+docs:
+  instructions: APP.md
+  decisions: docs/decisions.md
+  tasks: tasks/
+
+task_loop:
+  - brief
+  - implement
+  - record-decisions
+  - check
+  - handoff
+
+layers:
+  L0-access: mcp-server/
+  L1-kernel: core/
+  L2-contract:
+    - APP.md
+    - harness.yml
+    - scripts/
+  L3-skills: skills/
+  cli: cli/

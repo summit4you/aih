@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "aih": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/aih/mcp-server/dist/index.js"],
+      "enabled": true
+    }
+  }
+}
