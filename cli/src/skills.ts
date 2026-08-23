@@ -1,6 +1,15 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { loadSkillRegistry } from "./config.js";
 
 export interface Skill {
   name: string;
@@ -153,3 +162,176 @@ Rules:
 - Keep it under 400 words.`,
   },
 ];
+
+// ---------------------------------------------------------------------------
+// External skill registry (opencode-compatible)
+//
+// A registry is a base URL that serves:
+//   GET {base}index.json          -> { "skills": [ { name, description?, files: string[], version? } ] }
+//   GET {base}{name}/{file}       -> file contents
+// `files` must include "SKILL.md". This mirrors opencode's skill discovery
+// protocol (see packages/opencode/src/skill/discovery.ts) so any opencode
+// registry can be used as-is.
+// ---------------------------------------------------------------------------
+
+export interface RemoteSkill {
+  name: string;
+  description?: string;
+  files: string[];
+  version?: string;
+  /** normalized registry base URL (always ends with "/") */
+  base: string;
+}
+
+export const DEFAULT_REGISTRY_TIMEOUT_MS = 10_000;
+
+/** Fetch a URL body as text with a timeout. Throws on HTTP error / timeout. */
+export async function fetchText(url: string, timeoutMs = DEFAULT_REGISTRY_TIMEOUT_MS): Promise<string> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+    return await res.text();
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`timed out after ${timeoutMs}ms fetching ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fetch and validate a registry's index.json. Returns the skills that are
+ * installable (have a name, a file list, and include SKILL.md).
+ */
+export async function fetchRegistryIndex(
+  base: string,
+  timeoutMs = DEFAULT_REGISTRY_TIMEOUT_MS,
+): Promise<RemoteSkill[]> {
+  const b = base.endsWith("/") ? base : `${base}/`;
+  const text = await fetchText(new URL("index.json", b).href, timeoutMs);
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`invalid JSON in registry index at ${b}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const list = (data as { skills?: unknown }).skills;
+  if (!Array.isArray(list)) throw new Error(`invalid registry index at ${b}: missing "skills" array`);
+  const out: RemoteSkill[] = [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    if (typeof r.name !== "string" || !r.name) continue;
+    if (!Array.isArray(r.files) || !r.files.includes("SKILL.md")) continue;
+    out.push({
+      name: r.name,
+      ...(typeof r.description === "string" && r.description ? { description: r.description } : {}),
+      files: r.files.filter((f): f is string => typeof f === "string"),
+      ...(typeof r.version === "string" && r.version ? { version: r.version } : {}),
+      base: b,
+    });
+  }
+  return out;
+}
+
+/**
+ * Download a registry skill into destDir, version-aware and atomic.
+ * If the skill is already present at the same version, it is a no-op.
+ * Returns the path to the installed SKILL.md.
+ */
+export async function installRemoteSkill(
+  skill: RemoteSkill,
+  destDir: string,
+  timeoutMs = DEFAULT_REGISTRY_TIMEOUT_MS,
+): Promise<string> {
+  const skillMd = join(destDir, "SKILL.md");
+  const versionFile = join(destDir, ".aih-version");
+  const version = skill.version;
+  const current =
+    existsSync(versionFile) && version !== undefined
+      ? readFileSync(versionFile, "utf8").trim()
+      : undefined;
+  if (version !== undefined && current === version && existsSync(skillMd)) {
+    return skillMd; // already up to date
+  }
+
+  const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const staging = `${destDir}.tmp-${token}`;
+  try {
+    for (const file of skill.files) {
+      const url = new URL(file, `${skill.base}${skill.name}/`).href;
+      const text = await fetchText(url, timeoutMs);
+      const dest = join(staging, file);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, text, "utf8");
+    }
+    if (!existsSync(join(staging, "SKILL.md"))) {
+      throw new Error(`registry skill "${skill.name}" is missing SKILL.md`);
+    }
+    if (version !== undefined) writeFileSync(join(staging, ".aih-version"), version, "utf8");
+
+    if (existsSync(destDir)) {
+      const backup = `${destDir}.old-${token}`;
+      renameSync(destDir, backup);
+      try {
+        renameSync(staging, destDir);
+      } catch (err) {
+        renameSync(backup, destDir); // restore on failure
+        throw err;
+      }
+      rmSync(backup, { recursive: true, force: true });
+    } else {
+      renameSync(staging, destDir);
+    }
+    return join(destDir, "SKILL.md");
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+/** Score remote skills against a query (same weighting as local searchSkills). */
+export function searchRemote(query: string, skills: RemoteSkill[]): RemoteSkill[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return [...skills];
+  const score = (s: RemoteSkill): number => {
+    const hay = `${s.name} ${s.description ?? ""}`.toLowerCase();
+    let n = 0;
+    for (const t of terms) {
+      if (s.name.toLowerCase().includes(t)) n += 3;
+      else if (hay.includes(t)) n += 1;
+    }
+    return n;
+  };
+  return skills
+    .map((s) => ({ s, n: score(s) }))
+    .filter(({ n }) => n > 0)
+    .sort((a, b) => b.n - a.n)
+    .map(({ s }) => s);
+}
+
+/**
+ * Resolve the active skill registry base URLs.
+ * Priority: explicit flag > AIH_SKILL_REGISTRY env (comma-separated) > aih.json skills.registry.
+ */
+export function resolveRegistryUrls(flag?: string): string[] {
+  const add = (out: string[], v: string | undefined) => {
+    if (!v) return;
+    for (const part of v.split(",").map((x) => x.trim()).filter(Boolean)) out.push(part);
+  };
+  if (flag) {
+    const out: string[] = [];
+    add(out, flag);
+    return [...new Set(out)];
+  }
+  const env = process.env.AIH_SKILL_REGISTRY;
+  if (env) {
+    const out: string[] = [];
+    add(out, env);
+    return [...new Set(out)];
+  }
+  return loadSkillRegistry();
+}

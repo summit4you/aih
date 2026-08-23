@@ -11,6 +11,13 @@ export type {
 } from "./tool-registry.js";
 export { MockLLM, toolCall } from "./seams/llm.js";
 export type { LLMAdapter } from "./seams/llm.js";
+export {
+  FINAL_STATE_GUARD,
+  TASK_CONTRACT_RULES,
+  GOAL_CONTRACT_TEMPLATE,
+  GOAL_VERDICT_SCHEMA,
+  buildGoalJudgePrompt,
+} from "./prompts.js";
 export { OpenAICompatibleLLM } from "./seams/llm-openai.js";
 export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
 export {

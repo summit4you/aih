@@ -8,9 +8,13 @@ dist-release/
 install
 scripts/package
 
-# 本地运行/会话数据
+# 本地运行/会话数据（provider 端点、密钥、窗口配置不入库）
 .aih/
 start.sh
+aih.json
+
+# 临时调试脚本（本地复现用，不入库）
+cli/repro-ctrlp.mjs
 
 # 内部设计文档（决策、路线图、横向对比，不入库）
 docs/

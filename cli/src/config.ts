@@ -6,7 +6,17 @@ import type { PermissionRule } from "@aih/core";
 export interface ProviderConfig {
   baseUrl?: string;
   model?: string;
+  /**
+   * Additional selectable models for this provider (beyond the primary
+   * `model`). All share the provider's baseUrl/headers/apiKeyEnv; each shows
+   * up as its own entry in the ctrl-p model picker / `aih models`.
+   */
+  models?: string[];
   apiKeyEnv?: string;
+  /** context window (max input tokens) for this provider's model */
+  contextWindow?: number;
+  /** extra request headers for this provider (e.g. client identity for rate-limit pools) */
+  headers?: Record<string, string>;
 }
 
 export interface McpServerConfig {
@@ -28,6 +38,10 @@ export interface AihConfig {
   /** multiple MCP servers (stdio) connected side-by-side and merged */
   mcpServers?: Record<string, McpServerConfig>;
   permissions?: PermissionRule[];
+  /** context window (max input tokens); per-provider value wins for that provider */
+  contextWindow?: number;
+  /** external skill registry (opencode-compatible index.json base URL(s)) */
+  skills?: { registry?: string | string[] };
 }
 
 export interface ConfigLayer {
@@ -45,6 +59,8 @@ export interface ResolvedLlm {
   baseUrl: ResolvedValue;
   apiKeyEnv: string;
   provider: string | undefined;
+  contextWindow: ResolvedValue;
+  headers: Record<string, string>;
   layers: ConfigLayer[];
 }
 
@@ -149,6 +165,41 @@ export function loadMcpServers(): Record<string, McpServerConfig> {
   return out;
 }
 
+/**
+ * Persist a single skill registry base URL into the first writable config file
+ * (project aih.json / .aih/config.json, else ~/.aih/config.json). Returns the path.
+ */
+export function saveSkillRegistry(url: string): string {
+  const candidates = [
+    join(process.cwd(), "aih.json"),
+    join(process.cwd(), ".aih", "config.json"),
+  ];
+  const path =
+    candidates.find((p) => existsSync(p)) ?? join(homedir(), ".aih", "config.json");
+  const cfg = readConfig(path);
+  cfg.skills = { ...(cfg.skills ?? {}), registry: url };
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  return path;
+}
+
+/**
+ * Merged skill registry base URLs across config layers (dedup, order-preserving).
+ * Each entry is an opencode-compatible registry root that serves `index.json`
+ * plus the skill files it lists.
+ */
+export function loadSkillRegistry(): string[] {
+  const out: string[] = [];
+  for (const layer of loadLayers()) {
+    const reg = layer.config.skills?.registry;
+    if (typeof reg === "string" && reg.trim()) out.push(reg.trim());
+    else if (Array.isArray(reg)) {
+      for (const u of reg) if (typeof u === "string" && u.trim()) out.push(u.trim());
+    }
+  }
+  return [...new Set(out)];
+}
+
 export function savePermissionRule(rule: PermissionRule): string {
   const candidates = [
     join(process.cwd(), "aih.json"),
@@ -167,12 +218,78 @@ export function savePermissionRule(rule: PermissionRule): string {
   return path;
 }
 
-export function resolveLlm(opts: {
-  flagModel?: string;
+/** One selectable model entry across all configured providers. */
+export interface ModelCatalogEntry {
+  /** provider name from aih.json (e.g. "qwen", "opencode") */
+  provider: string;
+  /** model id served by that provider */
+  model: string;
+  /** provider baseUrl for display */
+  baseUrl?: string;
+  /** context window advertised by this provider's config */
+  contextWindow?: number;
+  /** true if this entry matches the currently active provider+model */
+  active?: boolean;
+}
+
+/**
+ * Build the full model catalog across every provider defined in any config
+ * layer (later layers override same-name providers). Falls back to the
+ * top-level model when no providers are configured.
+ */
+export function loadModelCatalog(activeProvider?: string, activeModel?: string): ModelCatalogEntry[] {
+  const layers = loadLayers();
+  const mergedCfg = merged(layers);
+  const out: ModelCatalogEntry[] = [];
+  for (const [name, p] of Object.entries(mergedCfg.providers ?? {})) {
+    // A provider may expose several selectable models: the primary `model`
+    // plus any `models[]` extras. Each becomes its own catalog entry.
+    const modelIds = [
+      ...(p.model !== undefined ? [p.model] : []),
+      ...(p.models ?? []).filter((m) => m !== p.model),
+    ];
+    if (!modelIds.length) continue;
+    for (const mid of modelIds) {
+      out.push({
+        provider: name,
+        model: mid,
+        ...(p.baseUrl !== undefined ? { baseUrl: p.baseUrl } : {}),
+        ...(p.contextWindow !== undefined ? { contextWindow: p.contextWindow } : {}),
+        active:
+          activeProvider === name &&
+          (activeModel === undefined || mid === activeModel),
+      });
+    }
+  }
+  if (!out.length && mergedCfg.model) {
+    out.push({
+      provider: "(default)",
+      model: mergedCfg.model,
+      ...(mergedCfg.baseUrl !== undefined ? { baseUrl: mergedCfg.baseUrl } : {}),
+      ...(mergedCfg.contextWindow !== undefined
+        ? { contextWindow: mergedCfg.contextWindow }
+        : {}),
+      active: activeModel === undefined || activeModel === mergedCfg.model,
+    });
+  }
+  return out;
+}
+
+/** Lookup a named provider's own config (self-contained unit: baseUrl/model/headers/keyEnv). */
+export function providerEntry(name: string): ProviderConfig {
+  const cfg = merged(loadLayers());
+  const p = cfg.providers?.[name];
+  if (!p) throw new Error(`unknown provider "${name}" (not defined in any aih.json providers)`);
+  return p;
+}
+
+export function resolveLlm(opts: {  flagModel?: string;
   flagBaseUrl?: string;
   flagProvider?: string;
+  flagContextWindow?: string;
   envModel?: string;
   envBaseUrl?: string;
+  envContextWindow?: string;
 }): ResolvedLlm {
   const layers = loadLayers();
   const cfg = merged(layers);
@@ -208,5 +325,18 @@ export function resolveLlm(opts: {
     provider?.apiKeyEnv ??
     (providerName ? `AIH_${providerName.toUpperCase()}_API_KEY` : "AIH_API_KEY");
 
-  return { model, baseUrl, apiKeyEnv, provider: providerName, layers };
+  const headers = { ...(provider?.headers ?? {}) };
+
+  const contextWindow =
+    opts.flagContextWindow !== undefined
+      ? { value: opts.flagContextWindow, source: "flag --context-window" }
+      : opts.envContextWindow !== undefined
+        ? { value: opts.envContextWindow, source: "env AIH_CONTEXT_WINDOW" }
+        : provider?.contextWindow !== undefined
+          ? { value: String(provider.contextWindow), source: `providers.${providerName}.contextWindow` }
+          : fromLayers(layers, (c) =>
+              c.contextWindow !== undefined ? String(c.contextWindow) : undefined,
+          );
+
+  return { model, baseUrl, apiKeyEnv, provider: providerName, headers, contextWindow, layers };
 }

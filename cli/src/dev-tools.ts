@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ToolRegistry } from "@aih/core";
 import { lineDiff } from "./diff.js";
+import { buildChildEnv } from "./env-policy.js";
 
 const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
@@ -137,6 +138,7 @@ export function registerDevTools(
         code = await new Promise<number>((res) => {
           const child = spawn("/bin/sh", ["-c", String(a.command)], {
             cwd: dir,
+            env: buildChildEnv(),
             stdio: ["ignore", fd, fd],
           });
           const timer = setTimeout(() => {

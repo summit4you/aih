@@ -12,6 +12,7 @@ import {
   SessionLog,
   SessionStore,
   ToolRegistry,
+  buildGoalJudgePrompt,
   deriveScope,
   matchPattern,
   toolCall,
@@ -199,6 +200,60 @@ assert(
   "usage mapped from OpenAI-compatible response",
 );
 
+{
+  // provider config headers (client identity) are sent with every completion call
+  let seen: Record<string, string> = {};
+  const custom = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 0,
+    headers: { "user-agent": "opencode/1.17.11", "x-opencode-client": "cli" },
+    fetchImpl: (async (_url, init) => {
+      seen = { ...((init as RequestInit)?.headers as Record<string, string>) };
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "ok", tool_calls: [] } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch,
+  });
+  await custom.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(seen["user-agent"] === "opencode/1.17.11" && seen["x-opencode-client"] === "cli", "provider custom headers sent on the request");
+  assert(seen["authorization"] === "Bearer k" && seen["content-type"] === "application/json", "auth/content-type headers still present alongside custom ones");
+}
+
+{
+  // "{sid}" is stable across requests (session identity); "{rand}" is fresh per request.
+  const seen: Record<string, string>[] = [];
+  const sidLlm = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    model: "m",
+    retries: 0,
+    headers: { "x-opencode-session": "ses_{sid}", "x-opencode-request": "msg_{rand}" },
+    fetchImpl: (async (_url, init) => {
+      seen.push({ ...((init as RequestInit)?.headers as Record<string, string>) });
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "ok", tool_calls: [] } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch,
+  });
+  await sidLlm.complete({ messages: [{ role: "user", content: "1" }], tools: [] });
+  await sidLlm.complete({ messages: [{ role: "user", content: "2" }], tools: [] });
+  const opencodeId = (v: string, prefix: string) =>
+    new RegExp(`^${prefix}_[0-9a-f]{12}[0-9A-Za-z]{14}$`).test(v);
+  assert(
+    seen[0]["x-opencode-session"] === seen[1]["x-opencode-session"] &&
+      opencodeId(seen[0]["x-opencode-session"], "ses"),
+    "{sid} header is stable across requests AND matches opencode id format (12hex+14base62)",
+  );
+  assert(
+    seen[0]["x-opencode-request"] !== seen[1]["x-opencode-request"] &&
+      opencodeId(seen[0]["x-opencode-request"], "msg"),
+    "{rand} header is fresh per request AND matches opencode id format (12hex+14base62)",
+  );
+}
+
 function sseResponse(parts: string[]): Response {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -273,7 +328,7 @@ const compactScripted = new MockLLM([
     text: "calling echo",
     toolCalls: [toolCall("k1", "echo", { text: "hi" })],
     stopReason: "tool_use",
-    usage: { promptTokens: 900, completionTokens: 10, totalTokens: 910 },
+    usage: { promptTokens: 4500, completionTokens: 10, totalTokens: 4510 },
   },
   { text: "SUMMARY user asked to echo hi" },
   { text: "Done.", stopReason: "end_turn" },
@@ -283,9 +338,13 @@ const compactLoop = new AgentLoop({
   tools: compactTools,
   log: compactLog,
   systemPrompt: "sys",
-  contextWindow: 1000,
+  contextWindow: 5000,
   compactAt: 0.8,
 });
+// Seed an older "head" so there is something to summarize (the recent tail is
+// kept verbatim, mirroring opencode/MiMo's head/tail compaction).
+compactLog.append({ type: "user/message", turnId: "bulk", text: `older question: ${"context ".repeat(400)}` });
+compactLog.append({ type: "assistant/message", turnId: "bulk", text: `older answer: ${"detail ".repeat(400)}`, toolCalls: [] });
 const compactResult = await compactLoop.send("echo hi");
 assert(compactResult.stopReason === "end_turn", "compaction turn completes");
 assert(compactLog.all().some((e) => e.type === "compaction"), "proactive compaction recorded above threshold");
@@ -322,6 +381,64 @@ assert(
   "history preserved when summary is blank",
 );
 
+const manLog = new SessionLog();
+const manTools = new ToolRegistry(gate);
+manTools.register(echo);
+let manLastReq: ChatMessage[] | undefined;
+const manScripted = new MockLLM([
+  {
+    text: "calling echo",
+    toolCalls: [toolCall("m1", "echo", { text: "yo" })],
+    stopReason: "tool_use",
+    usage: { promptTokens: 120, completionTokens: 5, totalTokens: 125 },
+  },
+  { text: "Done.", stopReason: "end_turn" },
+  { text: "MANUAL SUMMARY keep the echo result" },
+  { text: "SECOND MANUAL SUMMARY" },
+]);
+const manLoop = new AgentLoop({
+  llm: {
+    complete: (req) => {
+      manLastReq = req.messages;
+      return manScripted.complete(req);
+    },
+  },
+  tools: manTools,
+  log: manLog,
+  systemPrompt: "sys",
+  contextWindow: 100000,
+  compactAt: 0.99,
+});
+await manLoop.send("echo yo");
+assert(!manLog.all().some((e) => e.type === "compaction"), "manual test setup: no auto compaction below threshold");
+for (let i = 0; i < 3; i += 1) {
+  manLog.append({ type: "user/message", turnId: "bulk", text: `filler note ${i}: ${"detail ".repeat(400)}` });
+}
+const manual = await manLoop.compactNow({ instructions: "keep every tool result verbatim" });
+assert(manual.applied === true, "compactNow applies a manual compaction");
+assert(manual.before > 0 && manual.after > 0 && manual.after < manual.before, `compactNow reports before/after sizes (${manual.before} -> ${manual.after})`);
+assert(manual.usage?.totalTokens === undefined || manual.usage.totalTokens > 0, "compactNow surfaces summarization usage when provided");
+assert(
+  (manLog.all().find((e) => e.type === "compaction") ?? { trigger: undefined }).trigger === "manual",
+  "manual compaction event carries trigger=manual",
+);
+const manReq = manLastReq ?? [];
+assert(
+  manReq.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Additional focus requested by the user: keep every tool result verbatim")),
+  "manual compact request carries the user's focus instructions",
+);
+const derivedAfterManual = manLog.deriveMessages("sys");
+assert(
+  derivedAfterManual.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("MANUAL SUMMARY")),
+  "derived messages contain the manual summary after compactNow",
+);
+assert(
+  !derivedAfterManual.some((m) => m.role === "user" && m.content === "echo yo"),
+  "pre-compaction messages are dropped from context after compactNow",
+);
+const noop = await manLoop.compactNow({ instructions: "" });
+assert(noop.applied === true, "second manual compaction still applies while history exists");
+
 const reactiveLog = new SessionLog();
 const reactiveTools = new ToolRegistry(gate);
 reactiveTools.register(echo);
@@ -334,6 +451,10 @@ const reactiveLlm = {
     return { text: "Done.", toolCalls: [], stopReason: "end_turn" as const };
   },
 };
+// Seed an older "head" so the reactive compaction has something to summarize
+// (a context error only makes sense once the context is large enough).
+reactiveLog.append({ type: "user/message", turnId: "bulk", text: `older question: ${"context ".repeat(2500)}` });
+reactiveLog.append({ type: "assistant/message", turnId: "bulk", text: `older answer: ${"detail ".repeat(2500)}`, toolCalls: [] });
 const reactive = await new AgentLoop({ llm: reactiveLlm, tools: reactiveTools, log: reactiveLog }).send("do it");
 assert(reactive.stopReason === "end_turn", "turn recovers after provider context error");
 assert(reactiveLog.all().some((e) => e.type === "compaction"), "reactive compaction recorded");
@@ -391,5 +512,33 @@ const truncStream = await truncStreamLlm.complete({
   onDelta: () => {},
 });
 assert(truncStream.finishReason === "length", "streaming finish_reason=length is surfaced on the response");
+
+{
+  // plan/read-only mode: unknown-tool errors steer the model back to build mode
+  const planTools = new ToolRegistry(gate);
+  planTools.planMode(true);
+  const missing = await planTools.invoke("write_file", { path: "x" }, { turnId: "t", inject: () => {} });
+  assert(!missing.ok, "plan mode rejects hidden (unregistered) write tools");
+  assert(
+    /read-only \(plan\) mode/i.test(missing.error ?? "") && /build mode/i.test(missing.error ?? ""),
+    "plan-mode unknown-tool error suggests switching to build mode",
+  );
+  const buildTools = new ToolRegistry(gate);
+  const missingBuild = await buildTools.invoke("write_file", { path: "x" }, { turnId: "t", inject: () => {} });
+  assert((missingBuild.error ?? "").startsWith("unknown tool: write_file"), "build mode keeps the plain unknown-tool error");
+}
+
+{
+  // prompt-layer borrowings from LongHorizon-Harness (prompts.ts)
+  const jp = buildGoalJudgePrompt("all tests pass");
+  assert(
+    jp.includes("all tests pass") && /state carrier/i.test(jp) && /evidence horizon/i.test(jp),
+    "goal judge prompt embeds the goal plus final-state guard and contract rules",
+  );
+  assert(
+    /unmet/.test(jp) && /met"\s*:\s*true\|false/.test(jp),
+    "judge prompt specifies the extended verdict schema",
+  );
+}
 
 console.log("\nAIH core smoke test passed.");

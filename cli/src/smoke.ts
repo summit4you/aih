@@ -58,8 +58,65 @@ assert(
   "json stream includes successful tool result",
 );
 
-const noKey = aih(["run", "hi"], { AIH_API_KEY: "", AIH_MODEL: "" });
+// Public (https) endpoint with zero credentials must still fail fast.
+const noKey = aih(
+  ["run", "hi"],
+  { AIH_API_KEY: "", AIH_MODEL: "m", AIH_BASE_URL: "https://api.openai.com/v1" },
+);
 assert(noKey.status === 1 && noKey.stderr.includes("no API key"), "missing API key fails fast with hint");
+
+// buildLlm must throw (not process.exit) so interactive callers can recover.
+{
+  const { buildLlm } = await import("./index.js");
+  const savedKey = process.env.AIH_API_KEY;
+  const savedBase = process.env.AIH_BASE_URL;
+  process.env.AIH_API_KEY = "";
+  process.env.AIH_BASE_URL = "https://api.openai.com/v1";
+  let threw = false;
+  let msg = "";
+  try {
+    buildLlm({ model: "m" });
+  } catch (e) {
+    threw = true;
+    msg = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (savedKey === undefined) delete process.env.AIH_API_KEY;
+    else process.env.AIH_API_KEY = savedKey;
+    if (savedBase === undefined) delete process.env.AIH_BASE_URL;
+    else process.env.AIH_BASE_URL = savedBase;
+  }
+  assert(threw && /no API key/i.test(msg), "buildLlm throws (not exits) when keyless on a public endpoint");
+}
+
+// Self-hosted endpoints (llama.cpp / Ollama / vLLM) run without auth — the
+// no-key gate must not reject them.
+{
+  const { buildLlm } = await import("./index.js");
+  const savedKey = process.env.AIH_API_KEY;
+  process.env.AIH_API_KEY = "";
+  let llm: unknown;
+  try {
+    llm = buildLlm({ model: "local-model", "base-url": "http://127.0.0.1:8081/v1" });
+  } finally {
+    if (savedKey === undefined) delete process.env.AIH_API_KEY;
+    else process.env.AIH_API_KEY = savedKey;
+  }
+  assert(
+    typeof (llm as { complete?: unknown })?.complete === "function",
+    "buildLlm allows a keyless local http endpoint (llama.cpp)",
+  );
+}
+{
+  // Loopback:1 refuses instantly — proves the gate is open and a request is attempted.
+  const keylessLocal = aih(
+    ["run", "hi"],
+    { AIH_API_KEY: "", AIH_MODEL: "m", AIH_BASE_URL: "http://127.0.0.1:1/v1" },
+  );
+  assert(
+    !keylessLocal.stderr.includes("no API key"),
+    "keyless local endpoint attempts a request instead of hitting the no-key gate",
+  );
+}
 
 rmSync(".aih/sessions", { recursive: true, force: true });
 const s1a = aih(["run", "first prompt alpha", "--mock", "--yes", "--session", "s1"]);
@@ -109,11 +166,189 @@ assert(
   "config reports model source",
 );
 
+// context window resolution: providers.<name> > global aih.json > env > flag (highest) > 128k default
+{
+  const cwDir = ".aih-smoke-cw";
+  rmSync(cwDir, { recursive: true, force: true });
+  mkdirSync(cwDir, { recursive: true });
+  writeFileSync(
+    `${cwDir}/aih.json`,
+    JSON.stringify({ model: "m1", contextWindow: 50000, providers: { p1: { model: "p1-model", contextWindow: 55555 } } }),
+  );
+  const runIn = (args: string[], env: Record<string, string> = {}) => {
+    const e = { ...process.env, ...env };
+    if (!("AIH_CONTEXT_WINDOW" in env)) delete e.AIH_CONTEXT_WINDOW;
+    return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: e, cwd: cwDir });
+  };
+
+  let r = runIn(["config", "--provider", "p1"]);
+  let cw = JSON.parse(r.stdout).contextWindow;
+  assert(
+    r.status === 0 && cw.value === 55555 && cw.source.includes("p1.contextWindow") && cw.effective === 55555,
+    "context window from providers.<name>.contextWindow",
+  );
+
+  r = runIn(["config"]);
+  cw = JSON.parse(r.stdout).contextWindow;
+  assert(
+    cw.value === 50000 && cw.effective === 50000,
+    "context window from global aih.json (no provider)",
+  );
+
+  r = runIn(["config"], { AIH_CONTEXT_WINDOW: "44444" });
+  cw = JSON.parse(r.stdout).contextWindow;
+  assert(
+    cw.value === 44444 && cw.source === "env AIH_CONTEXT_WINDOW" && cw.effective === 44444,
+    "env AIH_CONTEXT_WINDOW overrides aih.json",
+  );
+
+  r = runIn(["config", "--context-window", "33333"], { AIH_CONTEXT_WINDOW: "44444" });
+  cw = JSON.parse(r.stdout).contextWindow;
+  assert(
+    cw.value === 33333 && cw.source.includes("flag") && cw.effective === 33333,
+    "flag --context-window wins over env and config",
+  );
+
+  r = runIn(["config"], { AIH_CONTEXT_WINDOW: "bogus" });
+  cw = JSON.parse(r.stdout).contextWindow;
+  assert(cw.effective === 50000, "invalid AIH_CONTEXT_WINDOW falls through to the config tier");
+  rmSync(cwDir, { recursive: true, force: true });
+}
+
+// Live context-window detection (llama.cpp /slots): MIN slot n_ctx is the
+// effective per-request window; explicit flag/env still win; unreachable or
+// non-llama endpoints fall back silently.
+{
+  const { createServer } = await import("node:http");
+  const { probeContextWindow, resetWindowCache, detectedWindow } = await import("./window.js");
+  const { resolveContextWindow } = await import("./index.js");
+  const slotsSrv = createServer((req, res) => {
+    if (req.url === "/slots") {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify([
+          { id: 0, n_ctx: 8192 },
+          { id: 1, n_ctx: 4096 },
+          { id: 2, n_ctx: "bogus" },
+        ]),
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end("nope");
+  });
+  await new Promise<void>((r) => slotsSrv.listen(0, "127.0.0.1", () => r()));
+  const base = `http://127.0.0.1:${(slotsSrv.address() as { port: number }).port}/v1`;
+  const noSlotsSrv = createServer((_req, res) => {
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise<void>((r) => noSlotsSrv.listen(0, "127.0.0.1", () => r()));
+  const noSlotsBase = `http://127.0.0.1:${(noSlotsSrv.address() as { port: number }).port}/v1`;
+  resetWindowCache();
+  const probed = await probeContextWindow(base);
+  assert(probed === 4096, "probe reads /slots and takes MIN n_ctx (non-numeric entries skipped)");
+  assert(
+    (await probeContextWindow(base)) === 4096,
+    "probe result is cached (no second network call)",
+  );
+  assert(
+    resolveContextWindow({ model: "m", "base-url": base }) === 4096,
+    "detected window wins over aih.json config/default tier",
+  );
+  assert(
+    resolveContextWindow({ model: "m", "base-url": base, "context-window": "777" }) === 777,
+    "flag --context-window beats live detection",
+  );
+  const savedEnv = process.env.AIH_CONTEXT_WINDOW;
+  process.env.AIH_CONTEXT_WINDOW = "1234";
+  try {
+    assert(
+      resolveContextWindow({ model: "m", "base-url": base }) === 1234,
+      "AIH_CONTEXT_WINDOW beats live detection",
+    );
+  } finally {
+    if (savedEnv === undefined) delete process.env.AIH_CONTEXT_WINDOW;
+    else process.env.AIH_CONTEXT_WINDOW = savedEnv;
+  }
+  assert(detectedWindow("http://127.0.0.1:1/v1") === undefined, "unprobed endpoint: no detected window");
+  assert(
+    (await probeContextWindow("http://127.0.0.1:1/v1")) === undefined,
+    "unreachable endpoint: probe fails silently (no throw)",
+  );
+  assert(
+    (await probeContextWindow(noSlotsBase)) === undefined,
+    "endpoint without /slots: probe fails silently (fallback applies)",
+  );
+  slotsSrv.close();
+  noSlotsSrv.close();
+}
+
 const models = aih(["models"], { AIH_MODEL: "deepseek-v4-flash" });
 assert(
   models.status === 0 && models.stdout.includes("deepseek-v4-flash"),
   "models lists configured model",
 );
+
+// model catalog across providers (used by ctrl-p palette / /model picker)
+{
+  const catDir = ".aih-smoke-cat";
+  rmSync(catDir, { recursive: true, force: true });
+  mkdirSync(catDir, { recursive: true });
+  writeFileSync(
+    `${catDir}/aih.json`,
+    JSON.stringify({
+      defaultProvider: "alpha",
+      model: "m1",
+      providers: {
+        alpha: { baseUrl: "http://a.example/v1", model: "alpha-model", contextWindow: 32000 },
+        beta: { baseUrl: "http://b.example/v1", model: "beta-model" },
+        gamma: {
+          baseUrl: "http://g.example/v1",
+          model: "gamma-main",
+          models: ["gamma-free-1", "gamma-free-2"],
+        },
+      },
+    }),
+  );
+  const runIn = (args: string[]) => {
+    // strip ambient AIH_MODEL / AIH_BASE_URL so aih.json providers decide
+    const e = { ...process.env };
+    delete e.AIH_MODEL;
+    delete e.AIH_BASE_URL;
+    return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", cwd: catDir, env: e });
+  };
+
+  const cfg = runIn(["config"]);
+  const cfgJson = JSON.parse(cfg.stdout);
+  assert(cfgJson.provider === "alpha", "defaultProvider resolves from aih.json");
+  assert(cfgJson.model.value === "alpha-model", "provider model overrides top-level model");
+
+  // switching provider via --provider picks up that provider's model + context window
+  const switched = runIn(["config", "--provider", "beta"]);
+  const swJson = JSON.parse(switched.stdout);
+  assert(swJson.model.value === "beta-model", "--provider beta resolves beta-model");
+
+  // a provider's `models[]` extras each become their own catalog entry
+  const modelsOut = runIn(["models"]);
+  assert(
+    modelsOut.stdout.includes("gamma-main") &&
+      modelsOut.stdout.includes("gamma-free-1") &&
+      modelsOut.stdout.includes("gamma-free-2"),
+    "models[] extras are listed alongside the primary model",
+  );
+  // switching to an extra model keeps the provider's endpoint
+  const freeSwitch = runIn(["config", "--provider", "gamma", "--model", "gamma-free-1"]);
+  const freeJson = JSON.parse(freeSwitch.stdout);
+  assert(freeJson.model.value === "gamma-free-1", "--model picks a models[] extra");
+  assert(
+    String(freeJson.baseUrl?.value ?? "").includes("g.example"),
+    "models[] extra inherits the provider baseUrl",
+  );
+
+  rmSync(catDir, { recursive: true, force: true });
+}
+
 
 const skillsList = aih(["skills", "list"]);
 assert(
@@ -143,6 +378,133 @@ assert(
   skillsShowMissing.status === 1 && skillsShowMissing.stderr.includes("unknown skill"),
   "skills show rejects unknown name",
 );
+
+// --- external skill registry (opencode-compatible index.json) ---
+{
+  const http = await import("node:http");
+  const pathMod = await import("node:path");
+
+  const regContent = ".aih-smoke-reg-content";
+  const workDir = ".aih-smoke-reg-work";
+  rmSync(regContent, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true, force: true });
+  mkdirSync(`${regContent}/tui-design`, { recursive: true });
+  mkdirSync(workDir, { recursive: true });
+  writeFileSync(
+    `${regContent}/tui-design/SKILL.md`,
+    `---\nname: tui-design\ndescription: TUI UI design principles for terminal interfaces\n---\n# TUI Design\n\nWrap long lines and dim secondary text.\n`,
+  );
+  writeFileSync(
+    `${regContent}/index.json`,
+    JSON.stringify({
+      skills: [
+        {
+          name: "tui-design",
+          description: "TUI UI design principles for terminal interfaces",
+          files: ["SKILL.md"],
+          version: "1.0.0",
+        },
+        { name: "no-skill-md", description: "broken entry", files: ["README.md"], version: "1" },
+      ],
+    }),
+  );
+  // pre-create a project config so `skills registry <url>` writes here, not ~/.aih
+  writeFileSync(`${workDir}/aih.json`, "{}\n");
+
+  const root = pathMod.resolve(regContent);
+  const server = http.createServer((req, res) => {
+    const rel = decodeURIComponent((req.url ?? "/").split("?")[0]).replace(/^\/+/, "");
+    const file = pathMod.resolve(root, rel);
+    if (file !== root && !file.startsWith(root + pathMod.sep)) {
+      res.writeHead(403);
+      res.end("forbidden");
+      return;
+    }
+    if (!existsSync(file)) {
+      res.writeHead(404);
+      res.end("not found");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end(readFileSync(file, "utf8"));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const port = (server.address() as { port: number }).port;
+  const base = `http://127.0.0.1:${port}/`;
+
+  // NOTE: must use async spawn (not spawnSync) so this process's event loop
+  // stays free to serve the in-process HTTP registry while the CLI fetches it.
+  const { execFile } = await import("node:child_process");
+  const runIn = (args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> => {
+    const e = { ...process.env };
+    delete e.AIH_SKILL_REGISTRY;
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        [cli, ...args],
+        { encoding: "utf8", cwd: workDir, env: e },
+        (error, stdout, stderr) => {
+          const code = error ? (typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1) : 0;
+          resolve({ status: code, stdout: stdout ?? "", stderr: stderr ?? "" });
+        },
+      );
+    });
+  };
+
+  try {
+    const regSet = await runIn(["skills", "registry", base]);
+    assert(
+      regSet.status === 0 && regSet.stdout.includes("registry set to"),
+      "skills registry <url> persists the registry URL",
+    );
+    assert(
+      readFileSync(`${workDir}/aih.json`, "utf8").includes(base),
+      "registry URL written to the project aih.json",
+    );
+    const regShow = await runIn(["skills", "registry"]);
+    assert(regShow.status === 0 && regShow.stdout.includes(base), "skills registry shows the configured URL");
+
+    const find = await runIn(["skills", "find", "tui"]);
+    assert(
+      find.status === 0 && find.stdout.includes("tui-design") && find.stdout.includes("remote"),
+      "skills find surfaces remote registry matches",
+    );
+    assert(!find.stdout.includes("no-skill-md"), "registry entries without SKILL.md are filtered out");
+
+    const inst = await runIn(["skills", "install", "tui-design"]);
+    assert(
+      inst.status === 0 && existsSync(`${workDir}/.aih/skills/tui-design/SKILL.md`),
+      "skills install downloads a remote skill into .aih/skills",
+    );
+    assert(inst.stdout.includes("remote"), "remote install is labeled as remote");
+
+    const listAfter = await runIn(["skills", "list"]);
+    assert(
+      listAfter.stdout.includes("tui-design") && listAfter.stdout.includes("project"),
+      "installed remote skill is discovered with project scope",
+    );
+
+    rmSync(`${workDir}/.aih/skills/tui-design`, { recursive: true, force: true });
+    const findInstall = await runIn(["skills", "find", "terminal design", "--install"]);
+    assert(
+      findInstall.status === 0 && existsSync(`${workDir}/.aih/skills/tui-design/SKILL.md`),
+      "skills find --install auto-installs the top remote match",
+    );
+
+    const reinstall = await runIn(["skills", "install", "tui-design"]);
+    assert(reinstall.status === 0, "reinstalling the same version is a clean no-op");
+
+    const unknown = await runIn(["skills", "install", "does-not-exist"]);
+    assert(
+      unknown.status === 1 && unknown.stderr.includes("unknown skill"),
+      "installing an unknown remote skill fails with a clear error",
+    );
+  } finally {
+    server.close();
+    rmSync(regContent, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
 
 const devTools = aih(["tools", "--dev"]);
 assert(
@@ -236,10 +598,18 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
 
   const planRegistry = new ToolRegistry(gate);
   registerGeneralTools(planRegistry, { gate, cwd: workdir }, true);
+  const planNames = new Set(planRegistry.schemas().map((s) => s.name));
   assert(
-    !planRegistry.schemas().some((s) => s.name === "edit" || s.name === "apply_patch"),
+    !planNames.has("edit") && !planNames.has("apply_patch"),
     "plan mode hides write-kind general tools",
   );
+  // todo/remember mutate disk, so they are write-kind and must be hidden in plan mode
+  assert(
+    !planNames.has("todo") && !planNames.has("remember"),
+    "plan mode hides disk-mutating tools (todo, remember)",
+  );
+  // read-only tools stay available in plan mode
+  assert(planNames.has("glob") && planNames.has("grep"), "plan mode keeps read-only tools (glob, grep)");
   rmSync(workdir, { recursive: true, force: true });
 }
 
@@ -304,6 +674,256 @@ await srv.connect(new StdioServerTransport());
     multi.close();
     rmSync(mcpDir, { recursive: true, force: true });
   }
+}
+
+{
+  // shell environment policy: secrets never reach agent-executed commands
+  const { execFileSync } = (await import("node:child_process")) as {
+    execFileSync: (...args: unknown[]) => Buffer;
+  };
+  const out = String(
+    execFileSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          "const { buildChildEnv } = await import('./cli/dist/env-policy.js');",
+          "const env = buildChildEnv({ PATH: '/usr/bin', HOME: '/root', AIH_API_KEY: 'sk-secret', MY_TOKEN: 't', DB_PASSWORD: 'p', AWS_SECRET_ACCESS_KEY: 'x', LANG: 'C' });",
+          "console.log(JSON.stringify(env));",
+        ].join("\n"),
+      ],
+      { cwd: process.cwd() },
+    ),
+  );
+  const env = JSON.parse(out) as Record<string, string>;
+  assert(env.PATH === "/usr/bin" && env.HOME === "/root", "env policy keeps benign vars");
+  assert(
+    !("AIH_API_KEY" in env) && !("MY_TOKEN" in env) && !("DB_PASSWORD" in env) &&
+      !("AWS_SECRET_ACCESS_KEY" in env),
+    "env policy strips KEY/TOKEN/SECRET/PASSWORD vars from the child environment",
+  );
+  assert(env.LANG === "C", "env policy passes unrelated vars through");
+}
+
+{
+  // skills roster respects its context budget: shortens descriptions first,
+  // then omits skills entirely with a warning
+  const { withSkillRoster } = await import("./index.js");
+  const many = Array.from({ length: 200 }, (_, i) => ({
+    name: `skill-${i}`,
+    description: `d`.repeat(120),
+    scope: "project" as const,
+    body: "b",
+  }));
+  const out = withSkillRoster("BASE", many, 100_000); // budget = 2000 chars
+  assert(out.startsWith("BASE"), "roster keeps the base prompt");
+  assert(
+    out.length <= 2200,
+    "roster output stays within ~budget even with hundreds of skills",
+  );
+  assert(out.includes("hidden to stay within"), "roster warns about omitted skills");
+  const small = withSkillRoster(
+    "BASE",
+    [{ name: "s", description: "d", scope: "project" as const, body: "b" }],
+    100_000,
+  );
+  assert(small.includes("- s: d"), "small roster renders fully");
+}
+
+{
+  // onPromptInput debug seam surfaces the exact model-visible messages
+  const { AgentLoop, MockLLM, ToolRegistry, AutoApprove, toolCall } = await import("@aih/core");
+  const seen: number[] = [];
+  const loop = new AgentLoop({
+    llm: new MockLLM([
+      {
+        text: "",
+        toolCalls: [toolCall("c1", "echo", { text: "hi" })],
+        stopReason: "tool_use" as const,
+      },
+      { text: "done", stopReason: "end_turn" as const },
+    ]),
+    tools: new ToolRegistry(new AutoApprove()),
+    systemPrompt: "sys",
+    onPromptInput: (messages) => seen.push(messages.length),
+  });
+  await loop.send("hello");
+  assert(seen.length >= 2, "onPromptInput fires for every LLM request in a turn");
+}
+
+{
+  // end-to-end: run_cmd child processes see a filtered environment
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerDevTools } = await import("./dev-tools.js");
+  const registry2 = new ToolRegistry(new AutoApprove());
+  registerDevTools(registry2, process.cwd());
+  const res = await registry2.invoke(
+    "run_cmd",
+    { command: "node -e 'console.log(JSON.stringify({t:process.env.SMOKE_TOKEN,k:process.env.AIH_API_KEY,p:process.env.PATH}))'" },
+    { turnId: "smoke", inject: () => {} },
+  ) as { ok: boolean; result?: { stdout?: string }; error?: string };
+  assert(res.ok, "run_cmd e2e invocation succeeds");
+  const outEnv = JSON.parse(res.result?.stdout ?? "{}") as {
+    t?: string;
+    k?: string;
+    p?: string;
+  };
+  assert(outEnv.t === undefined && outEnv.k === undefined, "run_cmd hides SMOKE_TOKEN/AIH_API_KEY from children");
+  assert(!!outEnv.p, "run_cmd keeps PATH for children");
+}
+
+{
+  // bracketed paste (DEC 2004): multi-line pastes must be inserted as literal
+  // text, never interpreted as key presses (the ctrl+shift+v auto-submit bug)
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  tui.feed("\x1b[200~one\ntwo\rthree\x1b[201~");
+  assert(lines.length === 0, "paste alone never submits");
+  tui.feed("\r");
+  assert(
+    lines.length === 1 && lines[0] === "one two three",
+    "pasted newlines become spaces; real Enter submits once",
+  );
+}
+
+{
+  // paste payload split across stdin read-events (incl. a split end marker)
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  tui.feed("\x1b[200~hel");
+  tui.feed("lo\nwor");
+  tui.feed("ld\x1b[2");
+  tui.feed("01~");
+  tui.feed("\r");
+  assert(
+    lines.length === 1 && lines[0] === "hello world",
+    "paste reassembles across events, surviving a split end marker",
+  );
+}
+
+{
+  // pasting while the palette overlay is open must not select an entry
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  const pick = tui.pick("pick", [{ label: "alpha" }, { label: "beta" }]);
+  tui.feed("\x1b[200~ab\ncd\x1b[201~"); // must NOT commit the overlay
+  tui.feed("\x1b");
+  tui.feed("\x1b"); // double-Esc cancels
+  const outcome = await Promise.race([
+    pick,
+    new Promise((r) => setTimeout(() => r("timeout"), 400)),
+  ]);
+  assert(
+    JSON.stringify(outcome) === JSON.stringify({ kind: "cancel" }) && lines.length === 0,
+    "overlay paste does not select; double-Esc still cancels",
+  );
+}
+
+{
+  // theme: OSC 11 background query resolves light/dark; response bytes must not
+  // leak into the input
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  assert(tui.isDark() === true, "theme defaults to dark");
+  tui.feed("\x1b]11;rgb:ffffffff/ffffffff/ffffffff\x07");
+  assert(tui.isDark() === false, "OSC 11 white background resolves light theme");
+  tui.feed("\x1b]11;rgb:0e0e0e/0e0e0e/0e0e0e\x07");
+  assert(tui.isDark() === true, "OSC 11 black background resolves dark theme");
+  const sub: string[] = [];
+  const t2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => sub.push(l),
+  });
+  t2.feed("\x1b]11;rgb:ffffffff/ffffffff/ffffffff\x07");
+  t2.feed("hi");
+  t2.feed("\r");
+  assert(sub.length === 1 && sub[0] === "hi", "OSC 11 response bytes never typed as input");
+}
+
+{
+  // help dialog: `?` on an empty idle composer opens it; typed text then goes
+  // to the overlay (not the composer); double-Esc closes; input works after
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  tui.feed("?"); // open help (empty input)
+  tui.feed("x"); // would be composer text without the overlay
+  tui.feed("\x1b");
+  tui.feed("\x1b"); // close help
+  tui.feed("hi");
+  tui.feed("\r");
+  assert(lines.length === 1 && lines[0] === "hi", "help overlay traps typing; closes on double-Esc");
+  const l2: string[] = [];
+  const t2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => l2.push(l),
+  });
+  t2.feed("why?");
+  t2.feed("?");
+  t2.feed("\r");
+  assert(l2.length === 1 && l2[0] === "why??", "literal ? types normally in a non-empty composer");
+}
+
+{
+  // sparkline: 8 steps, flat series mid-scale, fewer than 2 points = none
+  const { Tui } = await import("./tui.js");
+  assert(Tui.sparkline([1, 2, 3, 4, 5, 6, 7, 8]) === "▁▂▃▄▅▆▇█", "sparkline maps range to 8 blocks");
+  assert(Tui.sparkline([4, 4, 4, 4]) === "▄▄▄▄", "sparkline flat series mid-scale");
+  assert(Tui.sparkline([10]) === "" && Tui.sparkline() === "", "sparkline needs ≥2 points");
+  assert(Tui.sparkline([1, 0, 2, 3]) === "▁▅█", "sparkline ignores non-positive points");
 }
 
 console.log("\nAIH cli smoke test passed.");

@@ -90,6 +90,8 @@ export type SessionEvent =
       type: "compaction";
       turnId: string;
       summary: string;
+      recent?: ChatMessage[];
+      trigger?: "auto" | "manual";
     }
   | {
       seq: number;

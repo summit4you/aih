@@ -1,6 +1,6 @@
 {
   "name": "@aih/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AIH command line: run/chat with any AIH app over MCP, opencode-style",
   "type": "module",
   "license": "MIT",
@@ -16,7 +16,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@aih/core": "*",
+    "@aih/core": "0.2.0",
     "@modelcontextprotocol/sdk": "^1.17.0"
   },
   "devDependencies": {

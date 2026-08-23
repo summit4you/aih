@@ -52,12 +52,21 @@ export class SessionLog {
   }
 
   deriveMessages(systemPrompt?: string): ChatMessage[] {
-    const messages: ChatMessage[] = [];
-    if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
     let compact: Extract<SessionEvent, { type: "compaction" }> | undefined;
     for (const event of this.#events) {
       if (event.type === "compaction") compact = event;
     }
+    // The compaction summary folds into the LEADING system message: some
+    // providers (llama.cpp's Qwen3 template) raise "System message must be at
+    // the beginning" for a system message anywhere after index 0.
+    const summary = compact?.summary;
+    const systemContent = summary
+      ? systemPrompt
+        ? `${systemPrompt}\n\n# Summary of the earlier conversation\n${summary}`
+        : `Summary of the earlier conversation:\n${summary}`
+      : systemPrompt;
+    const messages: ChatMessage[] = [];
+    if (systemContent) messages.push({ role: "system", content: systemContent });
     const pushMessage = (event: SessionEvent): void => {
       switch (event.type) {
         case "user/message":
@@ -95,10 +104,11 @@ export class SessionLog {
     for (const event of this.#events) {
       if (compact && event.seq < compact.seq) continue;
       if (event.type === "compaction") {
-        messages.push({
-          role: "system",
-          content: `Summary of the earlier conversation:\n${event.summary}`,
-        });
+        // summary is already folded into the leading system message; only the
+        // verbatim recent tail is replayed here.
+        if (event.recent) {
+          for (const m of event.recent) messages.push(m);
+        }
         continue;
       }
       pushMessage(event);

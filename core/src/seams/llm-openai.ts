@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type {
   ChatMessage,
   LLMRequest,
@@ -8,12 +9,42 @@ import type {
 } from "../types.js";
 import type { LLMAdapter } from "./llm.js";
 
+/**
+ * Generate a 26-char id body in opencode's exact format (src/id/id.ts `create()`):
+ *   12 hex chars = (Date.now() × 4096 + counter) big-endian, 6 bytes
+ *     - high 44 bits: millisecond timestamp
+ *     - low  12 bits: per-millisecond counter (0-4095, resets when ms changes)
+ *   + 14 random base62 chars (randomBytes(14) % 62)
+ * The counter guarantees distinct ids even when two are minted in the same ms.
+ */
+let idLastTs = 0;
+let idCounter = 0;
+function opencodeIDBody(): string {
+  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  let rand = "";
+  const bytes = randomBytes(14);
+  for (let i = 0; i < 14; i++) rand += chars[bytes[i] % 62];
+  const ts = Date.now();
+  if (ts !== idLastTs) {
+    idLastTs = ts;
+    idCounter = 0;
+  }
+  idCounter++;
+  const now = BigInt(ts) * BigInt(0x1000) + BigInt(idCounter);
+  const timeBytes = Buffer.alloc(6);
+  for (let i = 0; i < 6; i++) timeBytes[i] = Number((now >> BigInt(40 - 8 * i)) & BigInt(0xff));
+  return timeBytes.toString("hex") + rand;
+}
+
 export interface OpenAICompatibleOptions {
   baseUrl: string;
-  apiKey: string;
+  /** bearer key; optional for providers that authenticate by client identity (headers) */
+  apiKey?: string;
   model: string;
   fetchImpl?: typeof fetch;
   retries?: number;
+  /** extra request headers sent with every completion call (e.g. client identity) */
+  headers?: Record<string, string>;
 }
 
 interface OpenAIToolCall {
@@ -77,14 +108,29 @@ function parseArguments(raw: string): unknown {
 export class OpenAICompatibleLLM implements LLMAdapter {
   #options: OpenAICompatibleOptions;
   #fetch: typeof fetch;
+  /** Stable id minted once per client instance; "{sid}" headers keep it across requests. */
+  #sid: string;
 
   constructor(options: OpenAICompatibleOptions) {
     this.#options = options;
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#sid = opencodeIDBody();
   }
 
   async complete(req: LLMRequest): Promise<LLMResponse> {
     const { baseUrl, apiKey, model } = this.#options;
+    // Materialize header placeholders per request (opencode id format: 12 hex ts + 14 base62):
+    //  - "{sid}"  → a stable id minted once per client instance (session identity,
+    //               e.g. opencode's x-opencode-session — must not change mid-conversation
+    //               or the server loses its per-session state).
+    //  - "{rand}" → a fresh id on every request (request identity, e.g. x-opencode-request).
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(this.#options.headers ?? {})) {
+      let out = v;
+      if (out.includes("{sid}")) out = out.split("{sid}").join(this.#sid);
+      if (out.includes("{rand}")) out = out.split("{rand}").join(opencodeIDBody());
+      headers[k] = out;
+    }
     const normalized = baseUrl
       .replace(/\/$/, "")
       .replace(/\/chat\/completions$/, "");
@@ -116,7 +162,8 @@ export class OpenAICompatibleLLM implements LLMAdapter {
           method: "POST",
           headers: {
             "content-type": "application/json",
-            authorization: `Bearer ${apiKey}`,
+            ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+            ...headers,
           },
           body: payload,
           ...(req.signal ? { signal: req.signal } : {}),

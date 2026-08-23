@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -21,6 +22,10 @@ import {
   SessionLog,
   SessionStore,
   ToolRegistry,
+  FINAL_STATE_GUARD,
+  GOAL_CONTRACT_TEMPLATE,
+  TASK_CONTRACT_RULES,
+  buildGoalJudgePrompt,
   toolCall,
 } from "@aih/core";
 import type {
@@ -35,14 +40,29 @@ import { AutoApprove } from "@aih/core";
 import { connectBackend, connectMultiBackend } from "./mcp-backend.js";
 import type { McpBackend } from "./mcp-backend.js";
 import { DenyGate, SessionGate } from "./gate.js";
-import { loadPermissionRules, resolveLlm, resolveServers, savePermissionRule } from "./config.js";
+import {
+  loadModelCatalog,
+  loadPermissionRules,
+  providerEntry,
+  resolveLlm,
+  resolveServers,
+  savePermissionRule,
+  saveSkillRegistry,
+  type ModelCatalogEntry,
+} from "./config.js";
+import { detectedWindow, probeContextWindow } from "./window.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import {
   BUILTIN_SKILLS,
   discoverSkills,
+  fetchRegistryIndex,
+  installRemoteSkill,
   installSkill,
+  resolveRegistryUrls,
+  searchRemote,
   searchSkills,
+  type RemoteSkill,
   type Skill,
 } from "./skills.js";
 import { registerDevTools } from "./dev-tools.js";
@@ -83,8 +103,11 @@ Usage:
   aih session <list|show|rm|export|fork> [args]
                                fork: aih session fork [source] <target> [--from seq]
   aih stats                       token usage across saved sessions
-  aih skills <list|find|install|show> [args]
-                                  manage harness skills (SKILL.md packs)
+  aih skills <list|find|install|show|registry> [args]
+                                   manage skills (local + external registry)
+                                   find: aih skills find <query> [--install]
+                                   install: aih skills install <name> [--registry <url>]
+                                   registry: aih skills registry [url]
   aih config                      print effective configuration and sources
   aih models                      list configured providers/models
   aih init [dir]                  scaffold a new app harness
@@ -96,11 +119,15 @@ Options:
       --base-url <url>        OpenAI-compatible API base (env AIH_BASE_URL)
       --api-key <key>         API key (env AIH_API_KEY)
       --provider <name>       pick provider from aih.json providers
+      --context-window <n>    model context window in tokens
+                              (env AIH_CONTEXT_WINDOW > live /slots detection [llama.cpp] >
+                              aih.json providers.<name>.contextWindow / contextWindow)
   -s, --server "<command>"    MCP server launch command; defaults to the
                               bundled todo-app server. For multiple servers set
                               \"mcpServers\" in aih.json (tools merged, duplicates
                               renamed <server>_<tool>)
       --max-steps <n>         max steps per turn (default 50, safety valve only)
+      --debug-prompt          print the exact model-visible prompt input before each LLM call
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
       --no-stream             buffer full responses instead of streaming
@@ -122,14 +149,16 @@ Options:
   -v, --version               show version
 
 Configuration (precedence: flags > env > project aih.json > ~/.aih/config.json):
-  { "model", "baseUrl", "defaultProvider",
-    "providers": { "<name>": { "baseUrl", "model", "apiKeyEnv" } },
+  { "model", "baseUrl", "defaultProvider", "contextWindow"?,
+    "providers": { "<name>": { "baseUrl", "model", "apiKeyEnv", "contextWindow"? } },
     "mcpServers": { "<name>": { "command", "args?", "enabled?", "name?" } },
     "permissions": [ { "tool", "pattern?", "action": "allow|deny" } ] }
 
 Environment:
   AIH_MODEL, AIH_BASE_URL, AIH_API_KEY, AIH_RETRIES, NO_COLOR
-  AIH_CONTEXT_WINDOW (131072), AIH_COMPACT_AT (0.8), AIH_GOAL_ROUNDS (3)
+  AIH_CONTEXT_WINDOW (default 131072; live /slots detection [llama.cpp] beats aih.json
+    providers.<name>.contextWindow; explicit flag/env always wins),
+  AIH_COMPACT_AT (0.8), AIH_GOAL_ROUNDS (3)
   AIH_MEMORY_BUDGET (4000 chars of .aih/memory.md injected per turn)
   AIH_CMD_TIMEOUT_MS (120000 default run_cmd timeout)
 
@@ -139,6 +168,14 @@ Examples:
   aih chat --session work
   aih init my-app && cd my-app && npm run bootstrap
   aih config                                  # inspect effective settings
+
+Chat commands (inside the TUI):
+  ctrl-p              command palette (switch model, mode, compact, …)
+  /model              open the model picker overlay (all providers/models)
+  /model <p/m>        direct switch: "<provider>/<model>" or bare model id
+  /compact [focus]    summarize earlier context now (optionally steer the summary)
+  /usage              token totals + current context fill
+  /mode, /goal, /tools, /skills, /inject, /memory, /events, /clear
 `;
 
 interface ParsedArgs {
@@ -159,6 +196,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     "provider",
     "name",
     "from",
+    "context-window",
   ]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
@@ -204,6 +242,78 @@ function bool(flags: Record<string, string | boolean>, ...keys: string[]): boole
   return keys.some((k) => flags[k] === true || flags[k] === "true");
 }
 
+/** Built-in fallback context window (max input tokens) when nothing is configured. */
+export const DEFAULT_CONTEXT_WINDOW = 131072;
+
+/**
+ * True for self-hosted endpoints (llama.cpp / Ollama / vLLM on localhost, LAN,
+ * or plain http). These run without auth, so a keyless client is legitimate.
+ */
+function isLocalEndpoint(baseUrl: string | undefined): boolean {
+  try {
+    const u = new URL(baseUrl ?? "");
+    if (u.protocol === "http:") return true;
+    const h = u.hostname;
+    return (
+      h === "localhost" ||
+      h === "0.0.0.0" ||
+      h === "::" ||
+      h === "::1" ||
+      /\.(local|internal|lan)$/i.test(h) ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the model's context window for a command:
+ * `--context-window` > `AIH_CONTEXT_WINDOW` > live detection (llama.cpp `/slots`,
+ * min per-slot n_ctx) > aih.json (`providers.<name>.contextWindow` for the active
+ * provider, else global `contextWindow`) > default 128k.
+ * Non-numeric / non-positive values are treated as unset.
+ */
+export function resolveContextWindow(flags: Record<string, string | boolean>): number {
+  const resolved = resolveLlm({
+    flagModel: str(flags, "model"),
+    flagBaseUrl: str(flags, "base-url"),
+    flagProvider: str(flags, "provider"),
+    envModel: process.env.AIH_MODEL,
+    envBaseUrl: process.env.AIH_BASE_URL,
+  });
+  const num = (v: string | undefined): number | undefined => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  };
+  const fromFlag = num(str(flags, "context-window"));
+  if (fromFlag) return fromFlag;
+  const fromEnv = num(process.env.AIH_CONTEXT_WINDOW);
+  if (fromEnv) return fromEnv;
+  const live = detectedWindow(resolved.baseUrl.value);
+  if (live) return live;
+  const fromConfig = num(resolved.contextWindow.value);
+  if (fromConfig) return fromConfig;
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+/** Best-effort live window probe for the active endpoint (skipped in --mock). */
+async function probeWindow(flags: Record<string, string | boolean>): Promise<void> {
+  if (bool(flags, "mock")) return;
+  try {
+    const base = resolveLlm({
+      flagModel: str(flags, "model"),
+      flagBaseUrl: str(flags, "base-url"),
+      flagProvider: str(flags, "provider"),
+      envModel: process.env.AIH_MODEL,
+      envBaseUrl: process.env.AIH_BASE_URL,
+    }).baseUrl.value;
+    if (base) await probeContextWindow(base);
+  } catch {
+    // detection is best-effort only; configured values still apply
+  }
+}
+
 async function readPipedStdin(): Promise<string> {
   if (process.stdin.isTTY) return "";
   const chunks: Buffer[] = [];
@@ -211,7 +321,7 @@ async function readPipedStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
-function buildLlm(flags: Record<string, string | boolean>) {
+export function buildLlm(flags: Record<string, string | boolean>) {
   if (bool(flags, "mock")) {
     return new MockLLM([
       {
@@ -233,15 +343,17 @@ function buildLlm(flags: Record<string, string | boolean>) {
     str(flags, "api-key") ??
     process.env[resolved.apiKeyEnv] ??
     process.env.AIH_API_KEY;
-  if (!apiKey) {
-    console.error(
-      `error: no API key. Set ${resolved.apiKeyEnv} (or AIH_API_KEY), pass --api-key, or use --mock for an offline demo.`,
+  // Keyless is legitimate for: (a) providers carrying identity headers (opencode
+  // Zen free tier authenticates by client fingerprint), and (b) self-hosted
+  // endpoints (llama.cpp/Ollama/vLLM) that run without auth. Only a public
+  // endpoint with zero credentials is rejected up front.
+  if (!apiKey && Object.keys(resolved.headers).length === 0 && !isLocalEndpoint(resolved.baseUrl.value)) {
+    throw new Error(
+      `no API key for provider "${resolved.provider ?? "custom"}". Set ${resolved.apiKeyEnv} (or AIH_API_KEY), pass --api-key, or use --mock for an offline demo.`,
     );
-    process.exit(1);
   }
   if (!resolved.model.value) {
-    console.error("error: no model id. Set AIH_MODEL, --model, or model in aih.json.");
-    process.exit(1);
+    throw new Error("no model id. Set AIH_MODEL, --model, or model in aih.json.");
   }
   const retries = Number(process.env.AIH_RETRIES ?? "");
   return new OpenAICompatibleLLM({
@@ -249,6 +361,7 @@ function buildLlm(flags: Record<string, string | boolean>) {
     apiKey,
     model: resolved.model.value,
     ...(Number.isFinite(retries) ? { retries } : {}),
+    ...(Object.keys(resolved.headers).length > 0 ? { headers: resolved.headers } : {}),
   });
 }
 
@@ -264,6 +377,7 @@ function loadMemoryBlock(cwd = process.cwd()): string {
 
 function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [
@@ -271,9 +385,12 @@ function loadSystemPrompt(): string {
       "Follow its contract strictly; prefer read actions; write actions may require approval.",
       "",
       content.slice(0, 6000),
-    ].join("\n");
+    ].join("\n") + guard;
   }
-  return "You are an in-app assistant operating the connected application through its tools.";
+  return (
+    "You are an in-app assistant operating the connected application through its tools." +
+    guard
+  );
 }
 
 function makeBaseGate(flags: Record<string, string | boolean>): ApprovalGate {
@@ -317,11 +434,55 @@ function registerSkillTool(registry: ToolRegistry): Skill[] {
   return skills;
 }
 
-function withSkillRoster(prompt: string, skills: Skill[]): string {
+export function withSkillRoster(
+  prompt: string,
+  skills: Skill[],
+  ctxWindow?: number,
+): string {
   if (!skills.length) return prompt;
-  return `${prompt}\n\n## Skills\n${skills
-    .map((s) => `- ${s.name}: ${s.description} (call load_skill to activate)`)
-    .join("\n")}`;
+  // Context budget for the initial roster (Codex rule): at most 2% of the
+  // model's context window, or 8000 chars when the window is unknown.
+  const budget = Math.max(
+    1000,
+    Math.floor((ctxWindow && ctxWindow > 0 ? ctxWindow * 0.02 : 8000)),
+  );
+  const header = `\n\n## Skills\n`;
+  let lines = skills.map(
+    (s) => `- ${s.name}: ${s.description} (call load_skill to activate)`,
+  );
+  let body = lines.join("\n");
+  let omitted = false;
+  if (header.length + body.length > budget) {
+    // First shorten descriptions, front-loading the name so matching survives.
+    lines = skills.map((s) => {
+      const keep = Math.max(40, budget - header.length - skills.length * 40);
+      const d =
+        s.description.length > keep
+          ? `${s.description.slice(0, Math.max(0, keep - 1))}…`
+          : s.description;
+      return `- ${s.name}: ${d} (call load_skill to activate)`;
+    });
+    body = lines.join("\n");
+  }
+  if (header.length + body.length > budget) {
+    // Still over: omit trailing skills from the initial list and warn.
+    const kept: string[] = [];
+    let used = header.length;
+    for (const line of lines) {
+      const cost = line.length + 1;
+      if (used + cost > budget) {
+        omitted = true;
+        break;
+      }
+      kept.push(line);
+      used += cost;
+    }
+    body = kept.join("\n");
+  }
+  const warning = omitted
+    ? `\n(${skills.length - body.split("\n").length + 2} more skills hidden to stay within the roster context budget; use /skills to list all)`
+    : "";
+  return `${prompt}${header}${body}${warning}`;
 }
 
 function makeStdinAsk(question: string): Promise<string> {
@@ -536,14 +697,35 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     const trace = wireTrace(log, format);
     const streaming = format === "text" && !bool(flags, "no-stream") && !bool(flags, "mock");
 
+    let llm: ReturnType<typeof buildLlm>;
+    try {
+      llm = buildLlm(flags);
+    } catch (err) {
+      console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    await probeWindow(flags);
     const loop = new AgentLoop({
-      llm: buildLlm(flags),
+      llm,
       tools: registry,
       log,
-      systemPrompt: withSkillRoster(loadSystemPrompt(), skills) + loadMemoryBlock(),
+      systemPrompt:
+        withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) +
+        loadMemoryBlock(),
       maxStepsPerTurn: Number(str(flags, "max-steps") ?? 50) || 50,
-      contextWindow: Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 131072,
+      contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      ...(bool(flags, "debug-prompt")
+        ? {
+            onPromptInput: (messages) => {
+              process.stderr.write(
+                `\n[debug-prompt] ${messages.length} messages:\n` +
+                  JSON.stringify(messages, null, 2) +
+                  "\n",
+              );
+            },
+          }
+        : {}),
     });
 
     let result: Awaited<ReturnType<AgentLoop["send"]>>;
@@ -599,6 +781,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     for (const def of backendDefs) {
       if (agentMode === "build" || def.kind !== "write") registry.register(def);
     }
+    registry.planMode(agentMode === "plan");
     skills = registerSkillTool(registry);
     if (!bool(flags, "no-dev")) {
       registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan");
@@ -625,15 +808,22 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tools: registry,
       log,
       systemPrompt:
-        withSkillRoster(loadSystemPrompt(), skills) +
+        withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) +
           (agentMode === "plan" ? PLAN_PROMPT : "") +
           loadMemoryBlock(),
       maxStepsPerTurn: maxSteps,
-      contextWindow: Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 131072,
+      contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
     });
   }
-  let loop = makeLoop();
+  await probeWindow(flags);
+  let loop: AgentLoop;
+  try {
+    loop = makeLoop();
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
   const streaming = !bool(flags, "no-stream") && !bool(flags, "mock");
   let busy = false;
   let goalCondition = "";
@@ -667,6 +857,114 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           envBaseUrl: process.env.AIH_BASE_URL,
         }).provider ?? "custom";
 
+  /**
+   * Switch the active model/provider at runtime: update the resolution flags,
+   * refresh labels + context window and rebuild the loop (fresh LLM client).
+   */
+  async function applyModel(provider: string | undefined, modelId: string): Promise<void> {
+    const prevFlags = { model: flags["model"], provider: flags["provider"], baseUrl: flags["base-url"] };
+    const prevLabels = { model: modelLabel, provider: providerLabel };
+    flags["model"] = modelId;
+    flags["provider"] = provider ?? "";
+    // A named provider is a self-contained unit: pin its own endpoint at the flag
+    // level so stale launch-time env (AIH_BASE_URL/AIH_MODEL from start.sh) stops
+    // leaking into the target provider (e.g. switching qwen→llama.cpp while the
+    // session was launched against opencode Zen's https URL).
+    if (provider) {
+      const entry = providerEntry(provider);
+      if (entry.baseUrl) flags["base-url"] = entry.baseUrl;
+      else delete flags["base-url"];
+    } else {
+      delete flags["base-url"];
+    }
+    try {
+      await probeWindow(flags);
+      const re = resolveLlm({
+        flagModel: str(flags, "model"),
+        flagBaseUrl: str(flags, "base-url"),
+        flagProvider: str(flags, "provider") || undefined,
+        envModel: process.env.AIH_MODEL,
+        envBaseUrl: process.env.AIH_BASE_URL,
+      });
+      modelLabel = re.model.value ?? modelId;
+      providerLabel = re.provider ?? "custom";
+      usedTokens = 0;
+      loop = makeLoop();
+    } catch (err) {
+      // A failed switch (e.g. target provider has no API key) must not kill
+      // the session: roll back and report in-band.
+      flags["model"] = prevFlags.model;
+      flags["provider"] = prevFlags.provider;
+      if (prevFlags.baseUrl === undefined) delete flags["base-url"];
+      else flags["base-url"] = prevFlags.baseUrl;
+      modelLabel = prevLabels.model;
+      providerLabel = prevLabels.provider;
+      tui.pushError(
+        `model switch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** Open the command palette (ctrl-p / /commands). */
+  async function openPalette(): Promise<void> {
+    if (busy) {
+      tui.pushSystem("finish the current turn before opening the palette");
+      return;
+    }
+    type Command = { name: string; hint: string; run: () => void | Promise<void> };
+    const commands: Command[] = [
+      { name: "switch model", hint: "change provider/model", run: () => openModelPicker() },
+      { name: "mode build", hint: "full toolset (tab)", run: () => setMode("build") },
+      { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
+      { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
+      { name: "usage", hint: "/usage — token usage this session", run: () => handleLine("/usage") },
+      { name: "tools", hint: "/tools — connected tools & permissions", run: () => handleLine("/tools") },
+      { name: "skills", hint: "/skills — installed skill packs", run: () => handleLine("/skills") },
+      { name: "memory", hint: "/memory — project memory (.aih/memory.md)", run: () => handleLine("/memory") },
+      { name: "events", hint: "/events — session event log toggle", run: () => handleLine("/events") },
+      { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
+      { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
+      { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
+    ];
+    const entries = commands.map((c) => ({ label: c.name, hint: c.hint }));
+    const outcome = await tui.pick("Commands", entries);
+    if (outcome.kind === "select") await commands[outcome.index].run();
+  }
+
+  /** Open the model picker overlay listing every configured provider/model. */
+  async function openModelPicker(): Promise<void> {
+    if (bool(flags, "mock")) {
+      tui.pushSystem("model picker unavailable in --mock mode");
+      return;
+    }
+    const catalog = loadModelCatalog(
+      providerLabel === "custom" ? undefined : providerLabel,
+      modelLabel,
+    );
+    if (!catalog.length) {
+      tui.pushSystem(
+        'no models configured — add providers to aih.json:\n{\n  "providers": { "<name>": { "baseUrl": "...", "model": "..." } }\n}',
+      );
+      return;
+    }
+    const short = (u?: string): string =>
+      !u ? "" : u.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "") || u;
+    const entries = catalog.map((e: ModelCatalogEntry) => ({
+      label: `${e.provider}/${e.model}`,
+      ...(e.baseUrl ? { hint: short(e.baseUrl) } : {}),
+      ...(e.active ? { active: true } : {}),
+    }));
+    const outcome = await tui.pick("Switch model", entries);
+    if (outcome.kind !== "select") return;
+    const entry = catalog[outcome.index];
+    if (!entry || entry.active) return;
+    await applyModel(entry.provider === "(default)" ? undefined : entry.provider, entry.model);
+    tui.pushSystem(
+      `switched model to ${entry.provider}/${entry.model} (context window ${resolveContextWindow(flags)})`,
+    );
+  }
+
+
   const tui = new Tui({
     placeholder: 'Ask anything... "add a todo"',
     meta: () => ({ agent: agentMode, model: modelLabel, provider: providerLabel }),
@@ -681,23 +979,39 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     cancelTurn: () => loop.cancel(),
     onLine: handleLine,
     onTab: () => setMode(agentMode === "build" ? "plan" : "build"),
+    onPalette: () => {
+      void openPalette();
+    },
     completions: () => [
+      "/help",
+      "/commands",
       "/tools",
       "/mode",
       "/goal",
       "/memory",
       "/model",
+      "/models",
       "/usage",
+      "/compact",
       "/clear",
       "/inject",
       "/events",
       "/skills",
       ...skills.map((s) => `/${s.name}`),
     ],
-    ctxUsage: () => ({
-      used: usedTokens,
-      limit: Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 131072,
-    }),
+    ctxUsage: () => {
+      const trend = log
+        .all()
+        .filter((e) => e.type === "turn/end")
+        .map((e) => (e.type === "turn/end" ? (e.usage?.promptTokens ?? 0) : 0))
+        .filter((n) => n > 0)
+        .slice(-8);
+      return {
+        used: usedTokens,
+        limit: resolveContextWindow(flags),
+        trend,
+      };
+    },
   });
   void echoEvents;
   gate.attachTui(tui);
@@ -709,9 +1023,19 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.pushSystem("finish the current turn before switching mode");
       return;
     }
+    const prevMode = agentMode;
     agentMode = mode;
     rebuildRegistry();
-    loop = makeLoop();
+    try {
+      loop = makeLoop();
+    } catch (err) {
+      agentMode = prevMode;
+      rebuildRegistry();
+      tui.pushError(
+        `mode switch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
     tui.pushSystem(
       mode === "plan"
         ? "mode: plan — read-only (write tools hidden)"
@@ -727,7 +1051,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
      } else if (event.type === "assistant/message" && streaming === false && event.text) {
         tui.push({ role: "assistant", text: event.text });
       } else if (event.type === "compaction") {
-        const window = Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 131072;
+        if (event.trigger === "manual") return; // /compact prints its own detailed line
+        const window = resolveContextWindow(flags);
         const pct = usedTokens ? Math.round((usedTokens / window) * 100) : null;
         tui.pushSystem(
           pct !== null
@@ -743,6 +1068,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     text: ["█▀▀▀ ▀█▀ █ █", "█▄▄█  █  ███", "█  █ ▄█▄ █ █"].join("\n"),
   });
   tui.pushSystem(`app intelligence harness · v${VERSION}\n`);
+  tui.pushSystem(`type a message · /commands · ctrl-p palette`);
   if (sessionPath && log.all().length) {
     const events = log.all();
     tui.pushSystem(`resumed session ${sessionPath} (${events.length} events)`);
@@ -766,30 +1092,32 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     return promise;
   }
 
-  async function judgeGoal(): Promise<{ met: boolean; reason: string }> {
+  async function judgeGoal(): Promise<{ met: boolean; reason: string; unmet: string[] }> {
     const resp = await buildLlm(flags).complete({
       messages: [
         ...log.deriveMessages(),
-        {
-          role: "user",
-          content:
-            `You are an impartial progress judge. The stated goal is: "${goalCondition}".\n` +
-            "Decide ONLY from the conversation above whether the goal has been fully achieved.\n" +
-            'Reply with exactly one line of JSON: {"met": true|false, "reason": "<one short line>"}',
-        },
+        { role: "user", content: buildGoalJudgePrompt(goalCondition) },
       ],
       tools: [],
     });
     const met = /"met"\s*:\s*(true|false)/.exec(resp.text)?.[1] === "true";
     const reason =
       /"reason"\s*:\s*"([^"]*)"/.exec(resp.text)?.[1] ?? resp.text.slice(0, 200);
-    return { met, reason };
+    // Optional extended schema: list of criteria still unmet (empty when met).
+    let unmet: string[] = [];
+    try {
+      const parsed = JSON.parse(resp.text.slice(resp.text.indexOf("{"), resp.text.lastIndexOf("}") + 1));
+      if (Array.isArray(parsed?.unmet)) unmet = parsed.unmet.map(String).slice(0, 5);
+    } catch {
+      /* one-line regex fallback above already covers the minimal schema */
+    }
+    return { met, reason, unmet };
   }
 
   async function runGoalCheck(): Promise<void> {
     if (!goalCondition) return;
     for (;;) {
-      let verdict: { met: boolean; reason: string };
+      let verdict: { met: boolean; reason: string; unmet: string[] };
       try {
         verdict = await judgeGoal();
       } catch (err) {
@@ -813,13 +1141,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       goalRoundsLeft -= 1;
+      const unmetNote = verdict.unmet.length
+        ? `\n[goal] Unverified criteria: ${verdict.unmet.join("; ")}\n` +
+          `Verify each against real persisted state (read the file, run the check) — do not re-claim completion without fresh evidence.\n`
+        : "";
       tui.pushSystem(
         `↻ goal check: not yet met — ${verdict.reason} (auto-continuing, ${goalRoundsLeft} left)`,
       );
       const started = Date.now();
       try {
         await evalTurn(
-          `[goal] The goal "${goalCondition}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
+          `${unmetNote}[goal] The goal "${goalCondition}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
         );
         saveSession(sessionPath, log);
         const dur = Date.now() - started;
@@ -904,6 +1236,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.pushSystem(`event echo ${echoEvents ? "on" : "off"}`);
       return;
     }
+    if (input === "/help") {
+      tui.openHelp();
+      return;
+    }
     if (input === "/skills") {
       const rows = skills.map(
         (s) => `${`/${s.name}`.padEnd(20)} ${s.scope.padEnd(8)} ${s.description}`,
@@ -928,7 +1264,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           total += u.totalTokens;
         }
       }
-      const limit = Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 131072;
+      const limit = resolveContextWindow(flags);
       tui.pushSystem(
         [
           `turns: ${ends.length}`,
@@ -964,7 +1300,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       goalCondition = cond;
       goalRoundsLeft = Number(process.env.AIH_GOAL_ROUNDS ?? "") || 3;
       tui.pushSystem(
-        `goal set: ${cond}\nafter each turn an independent judge checks it and auto-continues if unmet (up to ${goalRoundsLeft} extra rounds)`,
+        `goal set: ${cond}\nafter each turn an independent judge checks acceptance criteria against real evidence and auto-continues if unmet (up to ${goalRoundsLeft} extra rounds)\n` +
+          `tip — structure it as:\n${GOAL_CONTRACT_TEMPLATE}`,
       );
       return;
     }
@@ -991,30 +1328,65 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.pushSystem("context injected; lands on next turn");
       return;
     }
+    if (input === "/compact" || input.startsWith("/compact ")) {
+      if (busy) {
+        tui.pushSystem("finish the current turn before compacting");
+        return;
+      }
+      const focus = input === "/compact" ? "" : input.slice("/compact ".length).trim();
+      if (focus.length > 2000) {
+        tui.pushSystem("focus text too long (max 2000 chars)");
+        return;
+      }
+      tui.pushSystem(focus ? `compacting context (focus: ${focus})...` : "compacting context...");
+      try {
+        const r = await loop.compactNow({ instructions: focus || undefined });
+        if (!r.applied) {
+          tui.pushSystem("nothing to compact — the summary came back empty; history kept");
+          return;
+        }
+        usedTokens = r.after;
+        if (sessionPath) saveSession(sessionPath, log);
+        const limit = resolveContextWindow(flags);
+        const pct = limit ? Math.round(Math.min(1, r.after / limit) * 100) : null;
+        const drop = r.before > 0 ? Math.round(((r.before - r.after) / r.before) * 100) : 0;
+        tui.pushSystem(
+          `compacted: ~${r.before} → ~${r.after} tokens (-${drop}%)\ncontext now ${r.after}/${limit}${pct !== null ? ` (${pct}%)` : ""} — earlier messages summarized, full history stays in the session log`,
+        );
+      } catch (err) {
+        tui.pushSystem(`compact failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
     if (input === "/model") {
-      tui.pushSystem(
-        `current model: ${modelLabel} (${providerLabel})\nusage: /model <provider/model>`,
-      );
+      void openModelPicker();
       return;
     }
     if (input.startsWith("/model ")) {
       const id = input.slice("/model ".length).trim();
       if (!id) {
-        tui.pushSystem("usage: /model <provider/model>");
+        tui.pushSystem("usage: /model <provider/model> — or run /model for the picker");
         return;
       }
-      flags["model"] = id;
-      const re = resolveLlm({
-        flagModel: str(flags, "model"),
-        flagBaseUrl: str(flags, "base-url"),
-        flagProvider: str(flags, "provider"),
-        envModel: process.env.AIH_MODEL,
-        envBaseUrl: process.env.AIH_BASE_URL,
-      });
-      modelLabel = id;
-      providerLabel = re.provider ?? "custom";
-      loop = makeLoop();
-      tui.pushSystem(`switched model to ${id}`);
+      // "<provider>/<model>" picks that provider; bare id keeps the current provider
+      const slash = id.indexOf("/");
+      const provider = slash > 0 ? id.slice(0, slash) : undefined;
+      const modelId = slash > 0 ? id.slice(slash + 1) : id;
+      try {
+        await applyModel(provider, modelId);
+        tui.pushSystem(`switched model to ${provider ? `${provider}/` : ""}${modelId}`);
+      } catch (err) {
+        tui.pushError(err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+    if (input === "/commands") {
+      void openPalette();
+      return;
+    }
+    if (input === "/models" || input.startsWith("/models ")) {
+      if (!bool(flags, "mock")) await openModelPicker();
+      else tui.pushSystem("model picker unavailable in --mock mode");
       return;
     }
     const skillMatch = /^\/([\w-]+)$/.exec(input);
@@ -1028,7 +1400,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input.startsWith("/")) {
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /mode /goal /tools /model /usage /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /skills /inject /events /clear /exit`,
       );
       return;
     }
@@ -1260,8 +1632,10 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
     flagModel: str(flags, "model"),
     flagBaseUrl: str(flags, "base-url"),
     flagProvider: str(flags, "provider"),
+    flagContextWindow: str(flags, "context-window"),
     envModel: process.env.AIH_MODEL,
     envBaseUrl: process.env.AIH_BASE_URL,
+    envContextWindow: process.env.AIH_CONTEXT_WINDOW,
   });
   const servers = resolveServers({
     flagServer: str(flags, "server"),
@@ -1279,6 +1653,11 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
         provider: llm.provider,
         apiKeyEnv: llm.apiKeyEnv,
         apiKeySet,
+        contextWindow: {
+          ...llm.contextWindow,
+          value: llm.contextWindow.value !== undefined ? Number(llm.contextWindow.value) : undefined,
+          effective: resolveContextWindow(flags),
+        },
         servers: servers.servers,
         serverSource: servers.label,
         sessionsDir: join(process.cwd(), SESSIONS_DIR),
@@ -1292,10 +1671,32 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
   );
 }
 
-function cmdSkills(action: string, args: string[]): void {
+async function cmdSkills(
+  action: string,
+  args: string[],
+  flags: Record<string, string | boolean>,
+): Promise<void> {
   const skills = discoverSkills();
-  const scopeLabel = (s: Skill): string =>
-    s.scope === "builtin" ? "builtin" : s.scope;
+  const scopeLabel = (s: Skill): string => (s.scope === "builtin" ? "builtin" : s.scope);
+  const registryFlag = str(flags, "registry");
+  const projectSkillsDir = join(process.cwd(), ".aih", "skills");
+
+  // Fetch the merged remote index across all configured registries (best-effort).
+  const fetchRemote = async (): Promise<RemoteSkill[]> => {
+    const bases = resolveRegistryUrls(registryFlag);
+    const out: RemoteSkill[] = [];
+    for (const base of bases) {
+      try {
+        out.push(...(await fetchRegistryIndex(base)));
+      } catch (err) {
+        console.error(
+          `warning: registry ${base} unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return out;
+  };
+
   if (action === "list" || (!action && !args.length)) {
     console.log(`${"name".padEnd(18)} ${"scope".padEnd(8)} description`);
     for (const s of skills) {
@@ -1303,41 +1704,103 @@ function cmdSkills(action: string, args: string[]): void {
     }
     return;
   }
+
+  if (action === "registry") {
+    const url = args[0];
+    if (url) {
+      const path = saveSkillRegistry(url);
+      console.log(`registry set to ${url} (${path})`);
+      return;
+    }
+    const urls = resolveRegistryUrls(registryFlag);
+    if (!urls.length) {
+      console.log("no skill registry configured (set via `aih skills registry <url>` or aih.json skills.registry)");
+      return;
+    }
+    for (const u of urls) console.log(u);
+    return;
+  }
+
   if (action === "find") {
-    const query = args.join(" ");
-    const hits = searchSkills(query, skills);
-    if (!hits.length) {
-      console.log(`no skills match "${query}"`);
+    const wantInstall = args.includes("--install") || bool(flags, "install");
+    const query = args.filter((a) => a !== "--install").join(" ");
+    const local = searchSkills(query, skills);
+    const remote = await fetchRemote();
+    const remoteHits = searchRemote(query, remote);
+
+    const anyLocal = local.length > 0;
+    const anyRemote = remoteHits.length > 0;
+    if (!anyLocal && !anyRemote) {
+      console.log(`no skills match "${query}"${remote.length ? " (checked registry)" : ""}`);
       return;
     }
     console.log(`${"score".padEnd(6)} ${"name".padEnd(18)} ${"scope".padEnd(8)} description`);
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    for (const s of hits) {
+    for (const s of local) {
       const n = terms.reduce(
-        (acc, t) => acc + (s.name.toLowerCase().includes(t) ? 3 : `${s.description}`.toLowerCase().includes(t) ? 1 : 0),
+        (acc, t) =>
+          acc + (s.name.toLowerCase().includes(t) ? 3 : `${s.description}`.toLowerCase().includes(t) ? 1 : 0),
         0,
       );
-      console.log(
-        `${String(n).padEnd(6)} ${s.name.padEnd(18)} ${scopeLabel(s).padEnd(8)} ${s.description}`,
+      console.log(`${String(n).padEnd(6)} ${s.name.padEnd(18)} ${scopeLabel(s).padEnd(8)} ${s.description}`);
+    }
+    for (const s of remoteHits) {
+      const n = terms.reduce(
+        (acc, t) =>
+          acc + (s.name.toLowerCase().includes(t) ? 3 : `${s.description ?? ""}`.toLowerCase().includes(t) ? 1 : 0),
+        0,
       );
+      console.log(`${String(n).padEnd(6)} ${s.name.padEnd(18)} ${"remote".padEnd(8)} ${s.description ?? ""}`);
+    }
+
+    if (wantInstall) {
+      if (!remoteHits.length) {
+        console.error(`error: --install requested but no remote skill matches "${query}"`);
+        process.exit(1);
+      }
+      const top = remoteHits[0];
+      const destDir = join(projectSkillsDir, top.name);
+      const file = await installRemoteSkill(top, destDir);
+      console.log(`installed ${top.name} (remote) -> ${file}`);
+    } else if (remoteHits.length) {
+      console.log(`\ninstall with: aih skills install ${remoteHits[0].name}`);
     }
     return;
   }
+
   if (action === "install") {
     const name = args[0];
     if (!name) {
-      console.error("error: usage: aih skills install <builtin-name>");
+      console.error("error: usage: aih skills install <name> [--registry <url>]");
       process.exit(1);
     }
-    try {
-      const file = installSkill(name);
-      console.log(`installed ${name} -> ${file}`);
-    } catch (err) {
-      console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+    // 1) local builtin
+    if (BUILTIN_SKILLS.some((b) => b.name === name)) {
+      try {
+        const file = installSkill(name);
+        console.log(`installed ${name} -> ${file}`);
+      } catch (err) {
+        console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+      return;
     }
+    // 2) remote registry
+    const remote = await fetchRemote();
+    const match = remote.find((s) => s.name === name);
+    if (match) {
+      const destDir = join(projectSkillsDir, name);
+      const file = await installRemoteSkill(match, destDir);
+      console.log(`installed ${name} (remote) -> ${file}`);
+      return;
+    }
+    console.error(
+      `error: unknown skill "${name}" (not a builtin, and not in any configured registry)`,
+    );
+    process.exit(1);
     return;
   }
+
   if (action === "show") {
     const name = args[0];
     const s = skills.find((x) => x.name === name);
@@ -1349,7 +1812,7 @@ function cmdSkills(action: string, args: string[]): void {
     console.log(s.body);
     return;
   }
-  console.error(`error: unknown skills action: ${action} (use list|find|install|show)`);
+  console.error(`error: unknown skills action: ${action} (use list|find|install|show|registry)`);
   process.exit(1);
 }
 
@@ -1368,9 +1831,17 @@ function cmdModels() {
     process.env.AIH_MODEL ?? cfg.model ?? "-",
     process.env.AIH_BASE_URL ?? cfg.baseUrl ?? "-",
   ]);
-  const providers = (cfg.providers ?? {}) as Record<string, { model?: string; baseUrl?: string }>;
+  const providers = (cfg.providers ?? {}) as Record<
+    string,
+    { model?: string; models?: string[]; baseUrl?: string }
+  >;
   for (const [name, p] of Object.entries(providers)) {
-    rows.push([name, p.model ?? "-", p.baseUrl ?? "-"]);
+    const ids = [
+      ...(p.model !== undefined ? [p.model] : []),
+      ...(p.models ?? []).filter((m) => m !== p.model),
+    ];
+    if (!ids.length) ids.push("-");
+    for (const mid of ids) rows.push([name, mid, p.baseUrl ?? "-"]);
   }
   console.log(`${"provider".padEnd(20)} ${"model".padEnd(28)} base-url`);
   for (const [provider, model, baseUrl] of rows) {
@@ -1504,7 +1975,7 @@ async function main() {
     case "stats":
       return cmdStats();
     case "skills":
-      return cmdSkills(positionals[0] ?? "", positionals.slice(1));
+      return cmdSkills(positionals[0] ?? "", positionals.slice(1), flags);
     case "config":
       return cmdConfig(flags);
     case "models":
@@ -1536,15 +2007,31 @@ function latestSessionNameOrExit(): string {
   return latest;
 }
 
-main().catch((err) => {
-  const cause =
-    err instanceof Error && err.cause
-      ? ` [cause: ${String(
-          (err.cause as { code?: string }).code ??
-            (err.cause as { message?: string }).message ??
-            err.cause,
-        )}]`
-      : "";
-  console.error(`✗ ${err instanceof Error ? err.message : String(err)}${cause}`);
-  process.exit(1);
-});
+function isDirectRun(): boolean {
+  // Node resolves the main module through symlinks (import.meta.url is the
+  // real path) while process.argv[1] keeps the invoked path — compare both
+  // in real form so symlinked installs (npm bin, /usr/local/bin/aih) work.
+  if (!process.argv[1]) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (process.argv[1] === self) return true;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(self);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  main().catch((err) => {
+    const cause =
+      err instanceof Error && err.cause
+        ? ` [cause: ${String(
+            (err.cause as { code?: string }).code ??
+              (err.cause as { message?: string }).message ??
+              err.cause,
+          )}]`
+        : "";
+    console.error(`✗ ${err instanceof Error ? err.message : String(err)}${cause}`);
+    process.exit(1);
+  });
+}

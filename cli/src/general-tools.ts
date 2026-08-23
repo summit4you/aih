@@ -249,7 +249,7 @@ export function registerGeneralTools(
     description:
       "Replace the session todo list (task tracking). Pass the full list with statuses " +
       "pending | in_progress | completed | cancelled; at most one in_progress.",
-    kind: "read",
+    kind: "write",
     permission: "allow",
     parameters: {
       type: "object",

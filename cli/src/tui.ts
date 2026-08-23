@@ -1,4 +1,4 @@
-import { bold, blue, cyan, dim, green, italic, magenta, red, underline, yellow } from "./ui.js";
+import { accent, bold, blue, cyan, danger, dim, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
 
@@ -12,6 +12,7 @@ export interface ToolView {
   args: string;
   callId: string;
   ok?: boolean;
+  error?: string;
   diff?: DiffLine[];
   truncated?: number;
   output?: string;
@@ -37,17 +38,54 @@ export interface TuiOptions {
   busy(): boolean;
   cancelTurn?(): void;
   onLine(line: string): void;
-  ctxUsage?(): { used: number; limit: number };
+  ctxUsage?(): { used: number; limit: number; trend?: number[] };
   completions?(): string[];
   onTab?(): void;
+  /** open the command palette (ctrl-p) */
+  onPalette?(): void;
 }
+
+/** One selectable entry in a TUI overlay picker. */
+export interface PickerEntry {
+  /** primary label (left side of the row) */
+  label: string;
+  /** dimmer detail shown on the right / second line */
+  hint?: string;
+  /** marker for the currently-active entry */
+  active?: boolean;
+}
+
+/** Result of a dismissed overlay picker. */
+export type PickerOutcome =
+  | { kind: "select"; index: number }
+  | { kind: "cancel" };
 
 const CSI = "\x1b[";
 const HIDE = `${CSI}?25l`;
 const SHOW = `${CSI}?25h`;
-const BOX_BG = `${CSI}48;5;236m`;
+const BOX_BG = `${CSI}48;5;236m`; // dark-theme surface (near-black)
+const LIGHT_BG = `${CSI}48;5;254m`; // light-theme surface (near-white)
+const REV = `${CSI}7m`; // reverse video: selection that works on any theme
 const RESET = `${CSI}0m`;
+// Terminal background report (OSC 11), 16-bit RRRR/GGGG/BBBB, BEL or ST terminated.
+const OSC11_BG =
+  /^\x1b]11;rgb:([0-9a-fA-F]{4,8})\/([0-9a-fA-F]{4,8})\/([0-9a-fA-F]{4,8})(?:\x07|\x1b\\)/;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Show the spinner only after this much busy time (avoids a flash for fast ops).
+const SPINNER_DELAY_MS = 200;
+
+// Content of the read-only help dialog (? with empty input, /help, palette).
+// Kept short enough for the dialog width; each line is clipped anyway.
+const HELP_LINES: string[] = [
+  bold("keys"),
+  "    enter send · esc clear · esc escape twice cancels the turn",
+  "    up/down recall history · tab complete · ctrl-p command palette",
+  "    ? help (empty input) · mouse scroll/click",
+  bold("state"),
+  "    ▶ running   ✓ ok   ✗ failed   ● active model",
+  bold("commands"),
+  "    /skills · /usage · /compact · /help · /exit",
+];
 
 const TOOL_ICONS: Record<string, string> = {
   bash: "$",
@@ -77,16 +115,11 @@ const TOOL_ICONS: Record<string, string> = {
   load_skill: "→",
 };
 
-const AMBIGUOUS_WIDE = new Set([
-  0x2299, 0x23f9, 0x25a3, 0x25c8, 0x2699, 0x26a0, 0x2705, 0x2717, 0x2753, 0x276f,
-]);
-const CJK_LOCALE = /zh|ja|ko|_sc|_tc/i.test(
-  `${process.env.LANG ?? ""} ${process.env.LC_ALL ?? ""} ${process.env.LC_CTYPE ?? ""}`,
-);
-
+// East Asian Ambiguous symbols (❯⚠⊙▣✗…): mainstream terminals render them at
+// 1 column even under CJK locales — counting them as 2 made rows 1-2 columns
+// short of their padded width (box right edges misaligned). Treat as 1.
 function wide(ch: string): boolean {
   const c = ch.codePointAt(0)!;
-  if (CJK_LOCALE && AMBIGUOUS_WIDE.has(c)) return true;
   return (
     (c >= 0x1100 && c <= 0x115f) ||
     (c >= 0x2e80 && c <= 0x303e) ||
@@ -252,13 +285,41 @@ export class Tui {
   #qbuf = "";
   #queue: string[] = [];
   #pendingExit = false;
+  #overlay: {
+    title: string;
+    entries: PickerEntry[];
+    filtered: number[];
+    query: string;
+    sel: number;
+    /** true = read-only help dialog (no filtering, Enter just closes) */
+    help?: boolean;
+    resolve: (outcome: PickerOutcome) => void;
+  } | null = null;
+  /** Theme: derived from the terminal background (OSC 11), forced via AIH_THEME. */
+  #dark = true;
 
-  constructor(opts: TuiOptions) {
+constructor(opts: TuiOptions) {
     this.#opts = opts;
   }
 
-  start(): void {
+ /** Current theme (test/UI hook). */
+ isDark(): boolean {
+    return this.#dark;
+  }
+
+ /** Background surface for input box / user rows / panel, by theme. */
+ #surface(): string {
+    return this.#dark ? BOX_BG : LIGHT_BG;
+  }
+
+ start(): void {
     if (!process.stdin.isTTY) throw new Error("Tui requires a TTY");
+    // Resolve the terminal theme: AIH_THEME=light|dark forces it, otherwise
+    // ask the terminal for its background color (OSC 11) and fall back to the
+    // dark theme if it does not answer.
+    const forced = (process.env.AIH_THEME ?? "").toLowerCase();
+    if (forced === "light") this.#dark = false;
+    else if (forced !== "dark") process.stdout.write("\x1b]11;?\x07");
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on("data", (data: Buffer) => this.#feed(data.toString("utf8")));
@@ -268,7 +329,10 @@ export class Tui {
     });
     process.on("exit", this.#restore);
     this.#running = true;
-    process.stdout.write(`${CSI}?1049h${CSI}?1000h${CSI}?1006h`);
+    // ?1049 alt screen, ?1000 mouse, ?1006 SGR mouse, ?2004 bracketed paste —
+    // pastes arrive wrapped in ESC[200~…ESC[201~ so their newlines are never
+    // mistaken for Enter presses.
+    process.stdout.write(`${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`);
     this.#timer = setInterval(this.#tick, 120);
     this.#paint();
   }
@@ -282,7 +346,7 @@ export class Tui {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?1049l${SHOW}`);
+    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`);
   }
 
   requestPaint(): void {
@@ -299,8 +363,11 @@ export class Tui {
     if (!this.#running) return;
     if (this.#opts.busy()) {
       if (!this.#busySince) this.#busySince = Date.now();
-      this.#frame = (this.#frame + 1) % SPINNER.length;
-      this.requestPaint();
+      // Delay the spinner (and its repaint loop) for fast operations.
+      if (Date.now() - this.#busySince >= SPINNER_DELAY_MS) {
+        this.#frame = (this.#frame + 1) % SPINNER.length;
+        this.requestPaint();
+      }
     } else {
       this.#busySince = 0;
       if (this.#queue.length && !this.#confirm) {
@@ -312,7 +379,7 @@ export class Tui {
   };
 
   #restore = (): void => {
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?1049l${SHOW}`);
+    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`);
   };
 
   push(item: TuiItem): void {
@@ -357,6 +424,10 @@ export class Tui {
     if (idx >= 0) {
       const view = this.#items[idx].tool!;
       view.ok = ok;
+      if (!ok && typeof result === "object" && result !== null) {
+        const e = (result as { error?: unknown }).error;
+        if (typeof e === "string" && e) view.error = e;
+      }
       if (ok && result && typeof result === "object") {
         const d = (result as { _diff?: unknown })._diff;
         if (Array.isArray(d) && d.length) {
@@ -468,6 +539,186 @@ export class Tui {
     this.requestPaint();
   }
 
+  /** True while a modal overlay picker is open. */
+  overlayOpen(): boolean {
+    return this.#overlay !== null;
+  }
+
+  /**
+   * Open a modal fuzzy-filter picker overlay (ctrl-p palette / model switcher).
+   * Resolves with the chosen entry index, or "cancel" on Esc/ctrl-c.
+   */
+  pick(title: string, entries: PickerEntry[]): Promise<PickerOutcome> {
+    if (this.#overlay) {
+      return Promise.resolve({ kind: "cancel" });
+    }
+    this.#overlay = {
+      title,
+      entries,
+      filtered: entries.map((_, i) => i),
+      query: "",
+      sel: Math.max(
+        0,
+        entries.findIndex((e) => e.active),
+      ),
+      resolve: () => {},
+    };
+    this.requestPaint();
+    return new Promise((resolve) => {
+      this.#overlay!.resolve = resolve;
+    });
+  }
+
+  #closeOverlay(outcome: PickerOutcome): void {
+    const ov = this.#overlay;
+    if (!ov) return;
+    this.#overlay = null;
+    ov.resolve(outcome);
+    this.requestPaint();
+  }
+
+  #applyOverlayFilter(): void {
+    const ov = this.#overlay!;
+    if (ov.help) {
+      // read-only dialog: no filtering, selection stays at the top
+      ov.filtered = ov.entries.map((_, i) => i);
+      ov.sel = 0;
+      return;
+    }
+    const q = ov.query.toLowerCase().trim();
+    if (!q) {
+      ov.filtered = ov.entries.map((_, i) => i);
+    } else {
+      // subsequence match against "label hint" so "qs" finds "switch model"
+      const hits: number[] = [];
+      for (let i = 0; i < ov.entries.length; i += 1) {
+        const hay = `${ov.entries[i].label} ${ov.entries[i].hint ?? ""}`.toLowerCase();
+        let pos = 0;
+        for (const c of q) {
+          pos = hay.indexOf(c, pos);
+          if (pos < 0) break;
+          pos += 1;
+        }
+        if (pos >= 0) hits.push(i);
+      }
+      ov.filtered = hits;
+    }
+    ov.sel = Math.min(ov.sel, Math.max(0, ov.filtered.length - 1));
+    if (!ov.filtered.includes(ov.sel)) {
+      ov.sel = 0;
+    }
+  }
+
+  #overlaySeq(ch: string): void {
+    if (ch === "\x1b") {
+      const now = Date.now();
+      if (this.#held === "\x1b" && now - this.#escAt < 500) {
+        this.#held = "";
+        this.#closeOverlay({ kind: "cancel" });
+        return;
+      }
+      this.#escAt = now;
+      this.#held = "\x1b";
+      return;
+    }
+    if (!this.#held) return;
+    if (this.#held === "\x1b" && (ch === "[" || ch === "O")) {
+      this.#held += ch;
+      this.#escAt = 0;
+      return;
+    }
+    this.#held += ch;
+    if (/[A-Za-z~]/.test(ch)) {
+      const kind = this.#held.slice(2);
+      this.#held = "";
+      switch (kind) {
+        case "A": // up
+          this.#overlayMove(-1);
+          break;
+        case "B": // down
+          this.#overlayMove(1);
+          break;
+        case "200~": // bracketed paste start
+          this.#inPaste = true;
+          break;
+        case "201~": // bracketed paste end
+          this.#inPaste = false;
+          break;
+        default: // other sequences (mouse, pgup…) just close nothing — ignore
+          break;
+      }
+    }
+  }
+
+  /** Open the read-only help dialog (keybindings / states / commands). */
+  openHelp(): void {
+    if (this.#overlay) return;
+    this.#overlay = {
+      title: "help",
+      entries: [{ label: "help" }],
+      filtered: [0],
+      query: "",
+      sel: 0,
+      help: true,
+      resolve: () => {},
+    };
+    this.requestPaint();
+  }
+
+  #overlayMove(delta: number): void {
+    const ov = this.#overlay!;
+    if (!ov.filtered.length) return;
+    ov.sel = Math.min(ov.filtered.length - 1, Math.max(0, ov.sel + delta));
+    this.requestPaint();
+  }
+
+  #overlayKey(ch: string): void {
+    const ov = this.#overlay!;
+    switch (ch) {
+      case "\x1b": // bare Esc (raw mode delivers it as a lone byte here)
+      case "\x03":
+        this.#closeOverlay({ kind: "cancel" });
+        return;
+      case "\r":
+      case "\n":
+        if (ov.help) {
+          this.#closeOverlay({ kind: "cancel" });
+          return;
+        }
+        if (ov.filtered.length) {
+          const index = ov.filtered[ov.sel] ?? 0;
+          this.#closeOverlay({ kind: "select", index });
+        }
+        return;
+      case "\x7f":
+        if (ov.query) {
+          ov.query = ov.query.slice(0, -1);
+          this.#applyOverlayFilter();
+          this.requestPaint();
+        }
+        return;
+      case "\x15":
+        if (ov.query) {
+          ov.query = "";
+          this.#applyOverlayFilter();
+          this.requestPaint();
+        }
+        return;
+      default: {
+        // arrow keys arrive as ESC [ A/B — #feed splits them, so handle
+        // the final letter only when it follows an ESC-[ prefix
+        if (ch === "A" || ch === "B" || ch === "C" || ch === "D") return; // handled in #escape
+        if (ch === "\x0e") { this.#overlayMove(1); return; } // ctrl-n
+        if (ch === "\x10") { this.#overlayMove(-1); return; } // ctrl-p moves within the palette
+        if (ch >= " ") {
+          ov.query += ch;
+          this.#applyOverlayFilter();
+          this.requestPaint();
+        }
+      }
+    }
+  }
+
   #escAt = 0;
   #lastBareEscAt = 0;
 
@@ -482,46 +733,149 @@ export class Tui {
     this.requestPaint();
   }
 
-  #feed(data: string): void {
+  #inPaste = false;
+
+  /** Bracketed paste (DEC 2004): while `#inPaste` is set — between the
+   *  ESC[200~ and ESC[201~ markers — every payload byte is inserted as literal
+   *  text instead of acting as a key press, so a multi-line paste can never
+   *  look like Enter presses (no submits, no overlay selection, no question
+   *  answers, no confirm). The markers themselves are ordinary escape
+   *  sequences for the reassembly machine below (see #escape / #overlaySeq),
+   *  which also keeps them working if split across stdin read events. This
+   *  mirrors how opencode/opentui deliver paste as one literal-text event to
+   *  the editor widget. */
+ #feed(data: string): void {
+    // The OSC 11 background-query answer (requested in start()) arrives on
+    // stdin and must be consumed as data, never typed as keystrokes.
+    const m = OSC11_BG.exec(data);
+    if (m) {
+      // Each channel may be 4–8 hex digits (16–32 bits); normalize to 0–1
+      // by its own width so luminance is width-agnostic.
+      const norm = (hex: string) => parseInt(hex, 16) / (Math.pow(16, hex.length) - 1);
+      const r = norm(m[1]);
+      const g = norm(m[2]);
+      const b = norm(m[3]);
+      this.#dark = 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5;
+      data = data.slice(m[0].length);
+    }
     for (const ch of data) this.#char(ch);
   }
 
- #char(ch: string): void {
-    if (this.#question) {
-      const done = this.#question;
-      if (ch === "\r" || ch === "\n") {
-        this.#question = null;
-        const answer = this.#qbuf;
-        this.#qbuf = "";
-        this.requestPaint();
-        done.resolve(answer);
-      } else if (ch === "\x03") {
-        this.#question = null;
-        this.#qbuf = "";
-        this.requestPaint();
-        done.reject(new Error("user cancelled the question"));
-      } else if (ch === "\x7f") {
-        this.#qbuf = this.#qbuf.slice(0, -1);
-        this.requestPaint();
-      } else if (ch >= " ") {
-        this.#qbuf += ch;
-        this.requestPaint();
-      }
+  #pasteWs = false;
+
+  /** Insert one bracketed-paste payload byte into the active text context. */
+  #pasteChar(ch: string): void {
+    let t = "";
+    if (ch === "\r" || ch === "\n" || ch === "\t") {
+      if (this.#pasteWs) return; // collapse CRLF / repeated line breaks to one space
+      this.#pasteWs = true;
+      t = " "; // composer is single-line
+    } else if (ch >= " " && ch !== "\x7f") {
+      this.#pasteWs = false;
+      t = ch;
+    } else {
       return;
     }
-    if (this.#confirm) {
-      const done = this.#confirm;
-      this.#confirm = null;
-      if (ch === "y" || ch === "Y") {
-        done("once");
-      } else if (ch === "a" || ch === "A") {
-        done("always");
-      } else if (ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03") {
-        done("deny");
-      } else {
-        this.#confirm = done;
-      }
+    if (!t) return;
+    if (this.#confirm) return; // a paste must never answer y/a/n
+    if (this.#overlay) {
+      this.#overlay.query += t;
+      this.#applyOverlayFilter();
+      this.requestPaint();
       return;
+    }
+    if (this.#question) {
+      this.#qbuf += t;
+      this.requestPaint();
+      return;
+    }
+    this.#edit = this.#edit.slice(0, this.#cursor) + t + this.#edit.slice(this.#cursor);
+    this.#cursor += 1;
+    this.requestPaint();
+  }
+
+  /** Test hook: feed raw key bytes exactly as the stdin data handler would. */
+  feed(data: string): void {
+    this.#feed(data);
+  }
+
+ #char(ch: string): void {
+    // Bracketed-paste payload bytes: always literal text — except ESC and
+    // mid-sequence bytes, which must reach the escape machine so the
+    // ESC[201~ terminator can complete even mid-paste.
+    if (this.#inPaste && ch !== "\x1b" && !this.#held) {
+      this.#pasteChar(ch);
+      return;
+    }
+    if (ch === "\x10" && !this.#overlay) {
+      this.#opts.onPalette?.();
+      return;
+    }
+    // `?` opens help only on an empty, idle composer — in any other state it
+    // is a perfectly ordinary question mark.
+    if (
+      ch === "?" &&
+      !this.#overlay &&
+      !this.#question &&
+      !this.#confirm &&
+      this.#edit === ""
+    ) {
+      this.openHelp();
+      return;
+    }
+    if (this.#overlay) {
+      if (ch === "\x1b" || this.#held) {
+        this.#overlaySeq(ch);
+        return;
+      }
+      if (this.#inPaste) {
+        this.#pasteChar(ch);
+        return;
+      }
+      this.#overlayKey(ch);
+      return;
+    }
+    if (this.#question) {
+      if (this.#inPaste && (ch === "\x1b" || this.#held)) {
+        // let the paste terminator sequence complete via the escape machine
+      } else {
+        const done = this.#question;
+        if (ch === "\r" || ch === "\n") {
+          this.#question = null;
+          const answer = this.#qbuf;
+          this.#qbuf = "";
+          this.requestPaint();
+          done.resolve(answer);
+        } else if (ch === "\x03") {
+          this.#question = null;
+          this.#qbuf = "";
+          this.requestPaint();
+          done.reject(new Error("user cancelled the question"));
+        } else if (ch === "\x7f") {
+          this.#qbuf = this.#qbuf.slice(0, -1);
+          this.requestPaint();
+        } else if (ch >= " ") {
+          this.#qbuf += ch;
+          this.requestPaint();
+        }
+        return;
+      }
+    }
+    if (this.#confirm) {
+      if (!(this.#inPaste && (ch === "\x1b" || this.#held))) {
+        const done = this.#confirm;
+        this.#confirm = null;
+        if (ch === "y" || ch === "Y") {
+          done("once");
+        } else if (ch === "a" || ch === "A") {
+          done("always");
+        } else if (ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03") {
+          done("deny");
+        } else {
+          this.#confirm = done;
+        }
+        return;
+      }
     }
     if (ch === "\x1b") {
       const now = Date.now();
@@ -650,6 +1004,12 @@ export class Tui {
       return;
     }
     switch (kind) {
+      case "200~": // bracketed paste start
+        this.#inPaste = true;
+        break;
+      case "201~": // bracketed paste end
+        this.#inPaste = false;
+        break;
       case "A":
         if (this.#history.length) {
           if (this.#histCursor < 0) this.#histCursor = this.#history.length - 1;
@@ -710,6 +1070,7 @@ export class Tui {
   }
 
   #clickAt(row: number): void {
+    if (this.#overlay) return; // modal is open: never toggle transcript items beneath it
     if (!this.#bodyUnitIdx.length) return;
     const view = this.#viewHeight();
     if (row < 1 || row > view) return;
@@ -861,10 +1222,10 @@ export class Tui {
     const t = g.items[0].tool!;
     const icon = TOOL_ICONS[t.name] ?? "⚙";
     if (!this.#groupOpen.get(g.start)) {
-      return [this.#clip(`${icon} ${t.name} ×${g.items.length}${dim("   click to expand")}`, this.#bodyCols())];
+      return [this.#clip(`${icon} ${accent(t.name)} ×${g.items.length}${muted("   click to expand")}`, this.#bodyCols())];
     }
     const rows = g.items.map((it) => this.#toolRow(it));
-    rows.push(this.#clip(dim("   click to collapse"), this.#bodyCols()));
+    rows.push(this.#clip(muted("   click to collapse"), this.#bodyCols()));
     return rows;
   }
 
@@ -876,7 +1237,7 @@ export class Tui {
     return null;
   }
 
-  #panelCtx(): { used: number; limit: number } | null {
+  #panelCtx(): { used: number; limit: number; trend?: number[] } | null {
     const u = this.#opts.ctxUsage?.();
     if (!u || !(u.limit > 0)) return null;
     return u;
@@ -899,7 +1260,19 @@ export class Tui {
     return Math.min(32, Math.max(24, this.#cols >> 2));
   }
 
-  static readonly PANEL_GAP = 3;
+ static readonly PANEL_GAP = 3;
+
+  /** Inline sparkline of recent per-turn prompt tokens (8 steps/cell, skill §5). */
+  static sparkline(trend?: number[]): string {
+    const v = (trend ?? []).filter((x) => typeof x === "number" && x > 0).slice(-8);
+    if (v.length < 2) return "";
+    const BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    const lo = Math.min(...v);
+    const hi = Math.max(...v);
+    return v
+      .map((x) => BLOCKS[hi === lo ? 3 : Math.round(((x - lo) / (hi - lo)) * 7)])
+      .join("");
+  }
 
   #bodyCols(): number {
     const pw = this.#panelWidth();
@@ -907,8 +1280,17 @@ export class Tui {
   }
 
   #panelSeg(content: string | undefined, pw: number): string {
+    const bg = this.#surface();
     const s = `  ${this.#clip(content ?? "", Math.max(1, pw - 2))}`;
-    return BOX_BG + s.split(RESET).join(RESET + BOX_BG) + RESET;
+    return bg + s.split(RESET).join(RESET + bg) + RESET;
+  }
+
+  #progressBar(pct: number, width: number): string {
+    const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+    const bar = "█".repeat(filled) + "░".repeat(width - filled);
+    if (pct >= 95) return danger(bar);
+    if (pct >= 80) return warn(bar);
+    return success(bar);
   }
 
   #panelLines(pw: number): string[] {
@@ -917,31 +1299,49 @@ export class Tui {
     if (ctx) {
       const used = Math.min(ctx.used, ctx.limit);
       const pct = Math.round((used / ctx.limit) * 100);
-      lines.push(bold("CONTEXT"));
-      lines.push(`${this.#fmtTok(ctx.used)} tokens`);
-      lines.push(`${pct}% used`);
-      lines.push(`limit ${this.#fmtTok(ctx.limit)}`);
+      lines.push(accent(bold("CONTEXT")));
+      const bw = Math.min(12, Math.max(8, pw - 8));
+      lines.push(this.#progressBar(pct, bw));
+      const spark = Tui.sparkline(ctx.trend);
+      lines.push(muted(`${this.#fmtTok(used)} / ${this.#fmtTok(ctx.limit)} · ${pct}%${spark ? `  ${spark}` : ""}`));
+      if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));
     }
     const todos = this.#panelTodos();
     if (todos && todos.some((t) => t.status !== "completed")) {
-      if (lines.length) lines.push("");
+      if (lines.length) {
+        lines.push("");
+        lines.push(dim("─".repeat(Math.min(pw - 2, 24))));
+      }
       const done = todos.filter((t) => t.status === "completed").length;
-      lines.push(bold(`TODO ${done}/${todos.length}`));
+      lines.push(accent(bold(`TODO ${done}/${todos.length}`)));
+      // Wrap todo content to fit the panel (opencode uses wrapMode="word").
+      // Available width = pw - 2 (padding) - 2 (icon + space) = pw - 4.
+      const cw = Math.max(4, pw - 4);
       for (const t of todos) {
-        if (t.status === "in_progress") lines.push(`${yellow(bold("›"))} ${bold(t.content)}`);
-        else if (t.status === "completed") lines.push(`${green("x")} ${dim(t.content)}`);
-        else if (t.status === "cancelled") lines.push(`${dim("-")} ${dim(t.content)}`);
-        else lines.push(`${dim("·")} ${t.content}`);
+        const icon =
+          t.status === "in_progress" ? warn(bold("▶"))
+          : t.status === "completed" ? success("✓")
+          : t.status === "cancelled" ? muted("✕")
+          : muted("○");
+        const styled =
+          t.status === "in_progress" ? bold(t.content)
+          : t.status === "completed" || t.status === "cancelled" ? muted(t.content)
+          : t.content;
+        const wrapped = wrapStyled(styled, cw);
+        lines.push(`${icon} ${wrapped[0] ?? ""}`);
+        for (let i = 1; i < wrapped.length; i += 1) {
+          lines.push(`${" ".repeat(2)}${wrapped[i]}`);
+        }
       }
     }
     return lines;
   }
 
   #todoRow(t: TodoItem): string {
-    if (t.status === "in_progress") return `   ${yellow(bold("> "))}${bold(t.content)}`;
-    if (t.status === "completed") return `   ${green("x ")}${dim(t.content)}`;
-    if (t.status === "cancelled") return `   ${dim("- ")}${dim(t.content)}`;
-    return `   ${dim("· ")}${t.content}`;
+    if (t.status === "in_progress") return `   ${warn(bold("▶ "))}${bold(t.content)}`;
+    if (t.status === "completed") return `   ${success("✓ ")}${muted(t.content)}`;
+    if (t.status === "cancelled") return `   ${muted("✕ ")}${muted(t.content)}`;
+    return `   ${muted("○ ")}${t.content}`;
   }
 
     #block(item: TuiItem): string[] {
@@ -969,6 +1369,9 @@ export class Tui {
       case "tool": {
         const rows = [this.#toolRow(item)];
         const t = item.tool;
+        if (t && t.ok === false && t.error) {
+          for (const line of this.#wrap(t.error, this.#bodyCols())) rows.push(this.#clip(`   ${red(line)}`, this.#bodyCols()));
+        }
         if (t && typeof t.output === "string" && t.output.trim()) {
           const all = t.output.replace(/\r\n?/g, "\n").split("\n");
           const shown = t.expanded ? all : all.slice(0, 3);
@@ -1001,27 +1404,28 @@ export class Tui {
   #toolRow(item: TuiItem): string {
     const t = item.tool;
     if (!t) return this.#clip(item.text, this.#bodyCols());
-    const icon = TOOL_ICONS[t.name] ?? "⚙";
-    const args = t.args ? ` ${dim(t.args)}` : "";
+    const args = t.args ? ` ${muted(t.args)}` : "";
     if (t.ok === undefined) {
-      return this.#clip(`${cyan("~")} ${t.name}${args}`, this.#bodyCols());
+      return this.#clip(`${warn("▶")} ${t.name}${args}`, this.#bodyCols());
     }
     if (t.ok) {
-      return this.#clip(`${icon} ${t.name}${args}`, this.#bodyCols());
+      return this.#clip(`${success("✓")} ${t.name}${args}`, this.#bodyCols());
     }
-    return this.#clip(`${red("⚠ ")} ${red(`${t.name} failed`)}${args}`, this.#bodyCols());
+    return this.#clip(`${danger("✗")} ${danger(`${t.name} failed`)}${args}`, this.#bodyCols());
   }
 
   #userRow(line: string): string {
+    const bg = this.#surface();
     const inner = Math.max(1, this.#bodyCols() - 2);
     const raw = `${cyan("┃")} ${this.#clip(line, inner)}`;
-    return BOX_BG + raw.split(RESET).join(RESET + BOX_BG) + RESET;
+    return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #boxLine(content: string, width: number): string {
+    const bg = this.#surface();
     const inner = Math.max(1, width - 2);
     const raw = `${cyan("┃")} ${this.#clip(content, inner)}`;
-    return BOX_BG + raw.split(RESET).join(RESET + BOX_BG) + RESET;
+    return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #ghost(): string {
@@ -1117,32 +1521,38 @@ export class Tui {
 
   #metaContent(): string {
     const m = this.#opts.meta();
-    const agent = m.agent === "plan" ? yellow(m.agent) : cyan(m.agent);
-    return `${agent}${dim(" · ")}${m.model}${dim(" · ")}${dim(m.provider)}`;
+    const agent = m.agent === "plan" ? warn(bold(m.agent)) : accent(bold(m.agent));
+    return `${agent}${muted(" · ")}${m.model}${muted(" · ")}${muted(m.provider)}`;
   }
 
   #hintsRow(width: number): string {
     const usage = this.#usageText();
-    const left = dim(`${this.#opts.cwd}   tab complete · / commands · exit quit`);
+    // Contextual footer: only what is actionable right now (progressive disclosure).
+    let hint: string;
+    if (this.#confirmText) hint = "y once · a always · n deny";
+    else if (this.#question) hint = "enter answer · esc cancel";
+    else if (this.#opts.busy()) hint = "esc escape twice to cancel · enter queues";
+    else hint = "? help · /commands · ctrl-p palette · tab complete";
+    const left = dim(`${this.#opts.cwd}   ${hint}`);
     if (!usage) return this.#clip(left, width);
     const right = usage;
     const pad = Math.max(1, width - cols(left) - cols(right) - 1);
     return this.#clip(`${left}${" ".repeat(Math.min(pad, 200))}${right}`, width);
   }
 
- #statusRow(width: number): string {
+  #statusRow(width: number): string {
     const b = this.#opts.statusBadge?.() ?? null;
-    const badge = b ? `${b.ok ? green(b.glyph) : red(b.glyph)} ${dim(b.label)}` : "";
+    const badge = b ? `${b.ok ? success(b.glyph) : danger(b.glyph)} ${muted(b.label)}` : "";
     const pending = this.#confirmText
-      ? `${red(bold("⚠ APPROVAL PENDING"))}  `
+      ? `${danger(bold("⚠ APPROVAL PENDING"))}  `
       : this.#question
-        ? `${yellow(bold("❓ AWAITING ANSWER"))}  `
+        ? `${warn(bold("❓ AWAITING ANSWER"))}  `
         : "";
     const l =
       pending +
-      (badge ? `${badge}${dim("  ")}` : "") +
-      (this.#opts.statusLeft ? dim(this.#opts.statusLeft) : "");
-    const r = this.#opts.statusRight ? dim(this.#opts.statusRight) : "";
+      (badge ? `${badge}${muted("  ")}` : "") +
+      (this.#opts.statusLeft ? muted(this.#opts.statusLeft) : "");
+    const r = this.#opts.statusRight ? muted(this.#opts.statusRight) : "";
     const pad = Math.max(1, width - cols(l) - cols(r) - 1);
     return this.#clip(`${l}${" ".repeat(Math.min(pad, 200))}${r}`, width);
   }
@@ -1169,6 +1579,78 @@ export class Tui {
       i += ch.length;
     }
     return out + " ".repeat(Math.max(0, width - n));
+  }
+
+  #paletteBox(leftW: number): { lines: string[]; width: number } {
+    const ov = this.#overlay!;
+    // W is the total display width including both border columns; every row is
+    // clipped/padded to exactly W so left/right borders always line up.
+    const W = Math.max(40, Math.min(64, leftW - 4));
+    const maxRows = Math.max(3, Math.min(12, this.#rows - 10));
+    const rows: string[] = [];
+    for (const fi of ov.filtered) {
+      const e = ov.entries[fi];
+      const mark = e.active ? green("●") : " ";
+      const label = e.active ? bold(cyan(e.label)) : e.label;
+      const hint = e.hint ? `  ${dim(e.hint)}` : "";
+      rows.push(`${mark} ${label}${hint}`);
+    }
+    if (!rows.length) rows.push(dim("no matching entries"));
+    const top = Math.max(0, Math.min(ov.sel - (maxRows >> 1), Math.max(0, rows.length - maxRows)));
+    const visible = rows.slice(top, top + maxRows);
+    // every row is exactly W display columns wide (border chars included)
+    const box: string[] = [];
+    if (ov.help) {
+      // read-only help dialog: title + static sections, no selection/filter
+      box.push(cyan(`╭─${"─".repeat(W - 3)}╮`));
+      const titleInner = ` ${bold("help")}`;
+      box.push(
+        `${cyan("│")}${titleInner}${" ".repeat(Math.max(1, W - 2 - cols(titleInner)))}${cyan("│")}`,
+      );
+      box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
+      for (const h of HELP_LINES) {
+        const cl = this.#clip(h, W - 4);
+        box.push(`${cyan("│")} ${cl}${" ".repeat(Math.max(1, W - 4 - cols(cl)))}${cyan("│")}`);
+      }
+      const footer = dim("enter or esc — close");
+      box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
+      const fcl = this.#clip(footer, W - 4);
+      box.push(`${cyan("│")} ${fcl}${" ".repeat(Math.max(1, W - 4 - cols(fcl)))}${cyan("│")}`);
+      box.push(cyan(`╰─${"─".repeat(W - 3)}╯`));
+      return { lines: box, width: W };
+    }
+    box.push(cyan(`╭─${"─".repeat(W - 3)}╮`));
+    const titleInner = ` ${bold(ov.title)}`;
+    box.push(
+      `${cyan("│")}${titleInner}${" ".repeat(Math.max(1, W - 2 - cols(titleInner)))}${cyan("│")}`,
+    );
+    const filterContent = ov.query ? ov.query : this.#clip(dim("(type to filter)"), W - 12);
+    const filterInner = ` ${dim("filter: ")}${filterContent}`;
+    box.push(
+      `${cyan("│")}${filterInner}${" ".repeat(Math.max(1, W - 2 - cols(filterInner)))}${cyan("│")}`,
+    );
+    box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
+    for (let i = 0; i < visible.length; i += 1) {
+      const isSel = i === ov.sel;
+      const line = visible[i];
+     if (isSel) {
+        // selection row: reverse video (theme-proof) with the same geometry as
+        // the │…│ rows — content clipped to W-3, padded, right border aligned.
+        const content = this.#clip(restyle(line, (t) => cyan(t)), W - 3);
+        const used = 1 + cols(content);
+        const pad = " ".repeat(Math.max(1, W - 3 - used));
+        box.push(`${REV} ${content}${pad}${RESET}${cyan("│")}`);
+      } else {
+        const cl = this.#clip(line, W - 4);
+        box.push(`${cyan("│")} ${cl}${" ".repeat(Math.max(1, W - 4 - cols(cl)))}${cyan("│")}`);
+      }
+    }
+    const footer = dim("↑↓ select · enter confirm · esc close · type to filter");
+    box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
+    const fcl = this.#clip(footer, W - 4);
+    box.push(`${cyan("│")} ${fcl}${" ".repeat(Math.max(1, W - 4 - cols(fcl)))}${cyan("│")}`);
+    box.push(cyan(`╰─${"─".repeat(W - 3)}╯`));
+    return { lines: box, width: W };
   }
 
   #paint(): void {
@@ -1207,24 +1689,48 @@ export class Tui {
       rows.push(row(this.#clip(body[this.#scrollTop + i] ?? "", leftW)));
     }
 
+    if (this.#overlay) {
+      // centered modal: horizontally centered over the full window width,
+      // vertically over the body area; right panel border stays put.
+      const { lines: box, width: bw } = this.#paletteBox(leftW);
+      const padLeft = Math.max(0, ((leftW - bw) >> 1));
+      // center over the full window minus the ~9-row input/footer block
+      const freeRows = Math.max(box.length, this.#rows - 9);
+      const padTop = Math.max(0, ((freeRows - box.length) >> 1));
+      for (let i = 0; i < view; i += 1) {
+        const bi = i - padTop;
+        const content =
+          bi >= 0 && bi < box.length
+            ? " ".repeat(padLeft) + box[bi]
+            : "";
+        rows[i] = row(content);
+      }
+    }
+
     const il = this.#inputLayout(leftW);
     let firstLine: string;
     if (this.#question || this.#confirmText) {
       firstLine = il.lines[0];
     } else {
       const busyNow = this.#opts.busy();
-      const prompt = busyNow
-        ? `${cyan(SPINNER[this.#frame])} `
-        : `${cyan("❯")} `;
-      firstLine = prompt + (il.segs[0] ?? "");
+      // Spinner appears only after the delay (fast ops show a stable prompt).
+      const spinnerUp =
+        busyNow &&
+        !!this.#busySince &&
+        Date.now() - this.#busySince >= SPINNER_DELAY_MS;
+      const prompt = spinnerUp
+        ? `${accent(SPINNER[this.#frame])} `
+        : `${accent("❯")} `;
+      const seg0 = il.segs[0] ?? "";
+      firstLine = prompt + (seg0.startsWith("/") ? accent("/") + seg0.slice(1) : seg0);
       if (!this.#edit && !busyNow) {
-        firstLine = prompt + dim(this.#opts.placeholder);
-      } else if (busyNow && this.#busySince) {
-        firstLine += `  ${dim(`${Math.floor((Date.now() - this.#busySince) / 1000)}s`)}`;
+        firstLine = prompt + muted(this.#opts.placeholder);
+      } else if (spinnerUp) {
+        firstLine += `  ${muted(`${Math.floor((Date.now() - this.#busySince!) / 1000)}s`)}`;
       }
       if (!busyNow && il.lines.length === 1 && this.#cursor === 0) {
         const g = this.#ghost();
-        if (g) firstLine += dim(`${g}  (Tab to accept)`);
+        if (g) firstLine += muted(`${g}  (Tab to accept)`);
       }
     }
 

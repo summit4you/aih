@@ -16,6 +16,14 @@ export const magenta = (s: string) => paint(s, "35");
 export const italic = (s: string) => paint(s, "3");
 export const underline = (s: string) => paint(s, "4");
 
+// Semantic tokens — prefer these over raw colors for app-level meaning.
+export const accent = cyan; // primary / interactive (prompts, links, active)
+export const success = green; // done / ok
+export const warn = yellow; // in-progress / caution
+export const danger = red; // failed / denied
+export const muted = dim; // secondary / meta
+export const info = blue; // secondary accent
+
 export function toolTrace(name: string, args: unknown): string {
   return `${cyan("⚙")} ${bold(name)} ${dim(JSON.stringify(args))}`;
 }

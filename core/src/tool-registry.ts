@@ -43,6 +43,8 @@ export class ToolRegistry {
   #tools = new Map<string, ToolDefinition>();
   #gate: ApprovalGate;
   #callHistory: string[] = [];
+  /** set in read-only/plan mode: unknown-tool errors steer the model back to build mode */
+  #planHint = false;
   #hookBefore: Array<(info: ToolHookInfo) => Promise<void> | void> = [];
   #hookAfter: Array<
     (info: ToolHookInfo, outcome: ToolInvocationResult) => Promise<ToolInvocationResult | void> | ToolInvocationResult | void
@@ -50,6 +52,12 @@ export class ToolRegistry {
 
   constructor(gate: ApprovalGate) {
     this.#gate = gate;
+  }
+
+  /** Enable the plan/read-only hint on unknown-tool errors (write tools are hidden in this mode). */
+  planMode(hint = true): this {
+    this.#planHint = hint;
+    return this;
   }
 
   addHooks(hooks: ToolHooks): this {
@@ -85,7 +93,14 @@ export class ToolRegistry {
   ): Promise<ToolInvocationResult> {
     const def = this.#tools.get(name);
     if (!def) {
-      return { ok: false, error: `unknown tool: ${name}`, permission: "n/a" };
+      return {
+        ok: false,
+        error: this.#planHint
+          ? `unknown tool: ${name} — not available in the current read-only (plan) mode; ` +
+            `write-capable tools are hidden there. Ask the user to switch to build mode (Tab or \`/mode build\`) to use it.`
+          : `unknown tool: ${name}`,
+        permission: "n/a",
+      };
     }
 
     const decision =
