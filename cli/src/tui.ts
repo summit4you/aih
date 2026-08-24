@@ -124,9 +124,28 @@ const TOOL_ICONS: Record<string, string> = {
 // East Asian Ambiguous symbols (❯⚠⊙▣✗…): mainstream terminals render them at
 // 1 column even under CJK locales — counting them as 2 made rows 1-2 columns
 // short of their padded width (box right edges misaligned). Treat as 1.
-function wide(ch: string): boolean {
+// Emoji-presentation dingbats (U+2700–U+27BF) that terminals render 2 cells
+// wide. Text-presentation ones the TUI uses as icons (✓ U+2713, ✕ U+2715,
+// ✗ U+2717, ✱ U+2731, ❯ U+276F) are deliberately excluded so they stay 1 cell.
+const EMOJI_DINGBAT = new Set<number>([
+  0x2702, 0x2705, 0x2708, 0x2709, 0x270a, 0x270b, 0x270c, 0x270d, 0x270f,
+  0x2712, 0x2714, 0x2716, 0x271d, 0x2721, 0x2728, 0x2733, 0x2734, 0x2744,
+  0x2747, 0x274c, 0x274e, 0x2753, 0x2754, 0x2755, 0x2757, 0x2763, 0x2764,
+  0x2795, 0x2796, 0x2797, 0x27a1, 0x27bf,
+]);
+
+/**
+ * Display width of one code point in terminal cells: 0 (zero-width), 1, or 2.
+ * CJK + emoji-presentation symbols are 2; variation selectors / ZWJ /
+ * combining marks are 0; everything else is 1.
+ */
+function width(ch: string): number {
   const c = ch.codePointAt(0)!;
-  return (
+  if (
+    (c >= 0xfe00 && c <= 0xfe0f) || c === 0x200b || c === 0x200c || c === 0x200d ||
+    (c >= 0x0300 && c <= 0x036f) || (c >= 0x20d0 && c <= 0x20ff)
+  ) return 0;
+  if (
     (c >= 0x1100 && c <= 0x115f) ||
     (c >= 0x2e80 && c <= 0x303e) ||
     (c >= 0x3041 && c <= 0x33ff) ||
@@ -138,16 +157,19 @@ function wide(ch: string): boolean {
     (c >= 0xfe30 && c <= 0xfe4f) ||
     (c >= 0xff00 && c <= 0xff60) ||
     (c >= 0xffe0 && c <= 0xffe6) ||
-    (c >= 0x1f300 && c <= 0x1f64f) ||
-    (c >= 0x1f900 && c <= 0x1f9ff) ||
-    (c >= 0x20000 && c <= 0x3fffd)
-  );
+    (c >= 0x20000 && c <= 0x3fffd) ||
+    (c >= 0x1f000 && c <= 0x1faff) || // emoji & pictographs
+    (c >= 0x2b00 && c <= 0x2bff) ||   // misc symbols & arrows (⭐ ⭕ …)
+    (c >= 0x2600 && c <= 0x26ff) ||   // misc symbols (⚙ ⚠ ☀ …)
+    EMOJI_DINGBAT.has(c)              // emoji dingbats (✅ ❌ ❓ …)
+  ) return 2;
+  return 1;
 }
 
 function cols(text: string): number {
   const plain = text.replace(/\x1b\[[0-9;]*m/g, "");
   let n = 0;
-  for (const ch of plain) n += wide(ch) ? 2 : 1;
+  for (const ch of plain) n += width(ch);
   return n;
 }
 
@@ -163,7 +185,7 @@ function wrapStyled(s: string, limit: number): string[] {
       continue;
     }
     for (const ch of tk) {
-      const w = wide(ch) ? 2 : 1;
+      const w = width(ch);
       if (n + w > limit && n > 0) {
         out.push(cur + (open ? RESET : ""));
         cur = open;
@@ -196,6 +218,80 @@ function inlineMd(s: string): string {
   s = s.replace(/\|/g, " · ");
   s = s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => codes[Number(i)] ?? "");
   return s;
+}
+
+// --- markdown table rendering (opencode/mimo-code style bordered text table) ---
+
+function splitTableRow(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  return t.split("|").map((c) => c.trim());
+}
+
+function isSeparatorRow(line: string): boolean {
+  const t = line.trim();
+  if (!t.includes("-") || !t.includes("|")) return false;
+  const cells = splitTableRow(t);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+function isTableRow(line: string): boolean {
+  return (line.trim().match(/\|/g) ?? []).length >= 2;
+}
+
+function padStyled(s: string, w: number): string {
+  return s + " ".repeat(Math.max(0, w - cols(s)));
+}
+
+function maxCellLines(cells: string[][]): number {
+  return Math.max(0, ...cells.map((c) => c.length));
+}
+
+/**
+ * Render a parsed markdown table (rows of cell strings) as a bordered text
+ * table: content-fit columns (CJK-aware), 1-space cell padding, box-drawing
+ * borders, header row bold, long cells word-wrapped. Total width ≤ W.
+ */
+function renderTable(rows: string[][], W: number): string[] {
+  const nCols = Math.max(1, ...rows.map((r) => r.length));
+  const norm = rows.map((r) => {
+    const c = r.slice(0, nCols);
+    while (c.length < nCols) c.push("");
+    return c;
+  });
+  const ideal = Array.from({ length: nCols }, (_, c) =>
+    Math.max(1, ...norm.map((r) => cols(inlineMd(r[c])))),
+  );
+  const budget = Math.max(nCols, W - 3 * nCols - 1);
+  let colW = ideal.slice();
+  const sum = colW.reduce((a, b) => a + b, 0);
+  if (sum > budget) {
+    const scale = budget / sum;
+    colW = ideal.map((w) => Math.max(3, Math.round(w * scale)));
+    let s = colW.reduce((a, b) => a + b, 0);
+    while (s > budget) {
+      const idx = colW.indexOf(Math.max(...colW));
+      if (colW[idx] <= 3) break;
+      colW[idx] -= 1;
+      s -= 1;
+    }
+  }
+  const wrapped = norm.map((r) => r.map((cell, c) => wrapStyled(inlineMd(cell), colW[c])));
+  const bar = (l: string, m: string, r: string) =>
+    dim(l + colW.map((w) => "─".repeat(w + 2)).join(m) + r);
+  const line = (cells: string[]) =>
+    `${dim("│")} ${cells.map((c, i) => padStyled(c, colW[i])).join(dim(" │ "))}${dim(" │")}`;
+  const out: string[] = [bar("┌", "┬", "┐")];
+  const h = maxCellLines(wrapped[0]);
+  for (let i = 0; i < h; i += 1) out.push(line(wrapped[0].map((cell, c) => bold(cell[i] ?? ""))));
+  out.push(bar("├", "┼", "┤"));
+  for (let r = 1; r < norm.length; r += 1) {
+    const n = maxCellLines(wrapped[r]);
+    for (let i = 0; i < n; i += 1) out.push(line(wrapped[r].map((cell, c) => cell[i] ?? "")));
+  }
+  out.push(bar("└", "┴", "┘"));
+  return out;
 }
 
 function restyle(s: string, fn: (t: string) => string): string {
@@ -1193,7 +1289,7 @@ constructor(opts: TuiOptions) {
           let cut = 0;
           let n = 0;
           while (cut < rest.length) {
-            const w = wide(rest[cut]) ? 2 : 1;
+            const w = width(rest[cut]);
             if (n + w > avail) break;
             n += w;
             cut += 1;
@@ -1222,42 +1318,69 @@ constructor(opts: TuiOptions) {
         out.push(`${" ".repeat(pw)}${body[i]}`);
       }
     };
-    let inCode = false;
-    for (const raw of text.replace(/\r\n?/g, "\n").split("\n")) {
-      if (/^\s*```/.test(raw)) {
-        inCode = !inCode;
-        continue;
-      }
-      const t = raw.replace(/\s+$/, "");
-      if (!t.trim()) {
-        out.push("");
-        continue;
-      }
-      if (inCode) {
-        out.push(...wrapStyled(highlightCode(t), limit));
-        continue;
-      }
+    const renderLine = (t: string): void => {
       const h = /^(#{1,6})\s+(.*)$/.exec(t);
       if (h) {
         out.push(...wrapStyled(bold(inlineMd(h[2].trim())), limit));
-        continue;
+        return;
       }
       if (/^\s*([-*_])\1{2,}\s*$/.test(t)) {
         out.push(dim("─".repeat(Math.min(limit, 48))));
-        continue;
+        return;
       }
       const q = /^\s*>\s?(.*)$/.exec(t);
       if (q) {
         prefixed(yellow(italic("> ")), q[1], (b) => yellow(italic(b)));
-        continue;
+        return;
       }
       const li = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(t);
       if (li) {
         const marker = /^\d/.test(li[1]) ? cyan(`${li[1]} `) : blue("•");
         prefixed(marker, li[2]);
-        continue;
+        return;
       }
       out.push(...wrapStyled(inlineMd(t), limit));
+    };
+    const lines = text.replace(/\r\n?/g, "\n").split("\n");
+    let inCode = false;
+    let i = 0;
+    while (i < lines.length) {
+      const raw = lines[i];
+      if (/^\s*```/.test(raw)) {
+        inCode = !inCode;
+        i += 1;
+        continue;
+      }
+      const t = raw.replace(/\s+$/, "");
+      if (!t.trim()) {
+        out.push("");
+        i += 1;
+        continue;
+      }
+      if (inCode) {
+        out.push(...wrapStyled(highlightCode(t), limit));
+        i += 1;
+        continue;
+      }
+      // Markdown table: a run of pipe rows that includes a `|---|` separator.
+      if (isTableRow(t)) {
+        const block: string[] = [];
+        let j = i;
+        while (j < lines.length && isTableRow(lines[j].replace(/\s+$/, ""))) {
+          block.push(lines[j].replace(/\s+$/, ""));
+          j += 1;
+        }
+        if (block.some(isSeparatorRow)) {
+          const rows = block.filter((l) => !isSeparatorRow(l)).map(splitTableRow);
+          if (rows.length) {
+            out.push(...renderTable(rows, limit));
+            i = j;
+            continue;
+          }
+        }
+      }
+      renderLine(t);
+      i += 1;
     }
     while (out.length && !out[0].trim()) out.shift();
     while (out.length && !out[out.length - 1].trim()) out.pop();
@@ -1593,7 +1716,7 @@ constructor(opts: TuiOptions) {
     let line = "";
     let w = 0;
     for (const ch of text) {
-      const cw = wide(ch) ? 2 : 1;
+      const cw = width(ch);
       if (w + cw > limit && line) {
         const sp = line.lastIndexOf(" ");
         const brk = sp > 0 ? sp : line.length;
@@ -1695,7 +1818,7 @@ constructor(opts: TuiOptions) {
     return this.#clip(`${l}${" ".repeat(Math.min(pad, 200))}${r}`, width);
   }
 
-  #clip(line: string, width: number): string {
+  #clip(line: string, limit: number): string {
     let out = "";
     let n = 0;
     let i = 0;
@@ -1710,13 +1833,13 @@ constructor(opts: TuiOptions) {
       }
       const cp = line.codePointAt(i)!;
       const ch = String.fromCodePoint(cp);
-      const w = wide(ch) ? 2 : 1;
-      if (n + w > width) break;
+      const w = width(ch);
+      if (n + w > limit) break;
       out += ch;
       n += w;
       i += ch.length;
     }
-    return out + " ".repeat(Math.max(0, width - n));
+    return out + " ".repeat(Math.max(0, limit - n));
   }
 
   #paletteBox(leftW: number): { lines: string[]; width: number } {

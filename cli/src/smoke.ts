@@ -1101,4 +1101,66 @@ await srv.connect(new StdioServerTransport());
   rmSync(goalDir, { recursive: true, force: true });
 }
 
+// --- TUI markdown table rendering: bordered, column-aligned, CJK-aware ---
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const table = [
+    "核对完成。",
+    "| 组 | 文件 | roadmap 依据 |",
+    "|---|---|---|",
+    "| **A. Workflow 引擎** | `cli/src/workflow.ts`（新）、`cli/src/index.ts` 部分 | #6 / #33「✅ v0.2 已交付」 |",
+    "| **B. 写后格式化** | `cli/src/formatter.ts`（新） | #27「✅ v0.2 已交付」 |",
+  ].join("\n");
+  tui.pushDelta(table);
+  const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  // Must mirror tui.ts `width()` so the alignment assertion is consistent.
+  const width = (ch: string): number => {
+    const c = ch.codePointAt(0)!;
+    if ((c >= 0xfe00 && c <= 0xfe0f) || c === 0x200d) return 0;
+    if (
+      (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0x303e) ||
+      (c >= 0x3041 && c <= 0x33ff) || (c >= 0x3400 && c <= 0x4dbf) ||
+      (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xa000 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x20000 && c <= 0x3fffd) ||
+      (c >= 0x1f000 && c <= 0x1faff) || (c >= 0x2600 && c <= 0x26ff) ||
+      [0x2705, 0x274c, 0x2753].includes(c)
+    ) return 2;
+    return 1;
+  };
+  const cols = (s: string): number => {
+    let n = 0;
+    for (const ch of s) n += width(ch);
+    return n;
+  };
+  assert(width("✅") === 2, "✅ (U+2705 emoji) is 2 cells wide");
+  assert(width("✓") === 1 && width("✗") === 1 && width("❯") === 1, "text-presentation icons (✓ ✗ ❯) stay 1 cell");
+  assert(width("\ufe0f") === 0, "variation selector (U+FE0F) is zero-width");
+  const lines = tui.transcriptLines().map(plain);
+  const tableLines = lines.slice(lines.findIndex((l) => l.includes("┌")));
+  assert(tableLines.length > 0, "markdown table renders as a bordered block");
+  assert(tableLines[0].includes("┌") && tableLines[0].includes("┬") && tableLines[0].includes("┐"), "table top border has corners + junctions");
+  assert(tableLines.some((l) => l.includes("├") && l.includes("┼") && l.includes("┤")), "table header separator row present");
+  assert(tableLines[tableLines.length - 1].includes("└") && tableLines[tableLines.length - 1].includes("┴"), "table bottom border present");
+  const contentRows = tableLines.filter((l) => !/^[┌├└─┬┼┴┐┤┘\s]+$/.test(l));
+  assert(contentRows.length > 0 && contentRows.every((l) => l.includes("│")), "content rows have column separators");
+  assert(tableLines.every((l) => !l.includes(" · ")), "table pipes are NOT mangled into ' · '");
+  const joined = tableLines.join("\n");
+  assert(joined.includes("组") && joined.includes("roadmap") && joined.includes("依据"), "header cells preserved");
+  assert(joined.includes("Workflow") && joined.includes("引擎") && joined.includes("cli/src/workflow.ts"), "data cells preserved (bold + code, wrap-tolerant)");
+  assert(joined.includes("cli/src/formatter.ts"), "second data row cell preserved");
+  const widths = tableLines.map((l) => cols(l));
+  assert(new Set(widths).size === 1, `all table rows align to one display width (${widths[0]})`);
+}
+
 console.log("\nAIH cli smoke test passed.");
