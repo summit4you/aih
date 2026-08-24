@@ -703,6 +703,65 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   const hookDenied = await registryHooks.invoke("calc", { veto: true }, { turnId: "t", inject: () => {} });
   assert(!hookDenied.ok && (hookDenied.error ?? "").includes("hook vetoed"), "before hook can veto a call");
 
+  // D#11: builtin redaction + timing hooks
+  const { redactSecrets, countSecrets, builtinHooks, composeHooks } = await import("./hooks.js");
+  const r1 = redactSecrets({ stdout: "token=sk-abcdef1234567890 done" }) as Record<string, unknown>;
+  assert(String(r1.stdout).includes("[REDACTED]") && !String(r1.stdout).includes("sk-abcdef1234567890"), "redactSecrets masks sk- tokens");
+  const r2 = redactSecrets("ghp_ABCDEFGHIJKLMNOP1234567890") as string;
+  assert(r2.includes("[REDACTED]") && !r2.includes("ghp_ABCDEFGHIJKLMNOP1234567890"), "redactSecrets masks ghp_ tokens");
+  const r3 = redactSecrets("password: hunter2secretvalue") as string;
+  assert(r3.includes("[REDACTED]") && !r3.includes("hunter2secretvalue"), "redactSecrets masks key=value secrets");
+  assert(redactSecrets("hello world") === "hello world", "redactSecrets leaves non-secret text alone");
+  assert(redactSecrets({ a: 1, b: [true, "xoxb-1234567890abcdef"] }) !== undefined, "redactSecrets recurses into arrays/objects");
+  assert(countSecrets("sk-abcdef1234567890") >= 1, "countSecrets counts secret shapes");
+  assert(countSecrets("no secrets here") === 0, "countSecrets is 0 for clean text");
+
+  const regHooks = new ToolRegistry(new AutoApprove());
+  regHooks.register({
+    name: "leaky",
+    description: "d",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => ({ stdout: "api_key=abcd1234efgh5678ijkl", n: 7 }),
+  });
+  regHooks.addHooks(builtinHooks());
+  const hookResult = (await regHooks.invoke("leaky", {}, { turnId: "t", inject: () => {} })) as {
+    ok: boolean;
+    result?: { stdout?: string; n?: number; duration_ms?: number; redacted?: number };
+  };
+  assert(hookResult.ok, "builtin hook invocation succeeds");
+  assert(!!hookResult.result?.stdout && hookResult.result.stdout.includes("[REDACTED]"), "result stdout is redacted");
+  assert(!!hookResult.result?.stdout && !hookResult.result.stdout.includes("abcd1234efgh5678ijkl"), "raw secret is gone from result");
+  assert(typeof hookResult.result?.duration_ms === "number" && hookResult.result!.duration_ms! >= 0, "duration_ms attached (>=0)");
+  assert((hookResult.result?.redacted ?? 0) >= 1, "redacted counter present");
+  assert(hookResult.result?.n === 7, "non-string fields untouched");
+
+  // composeHooks: builtin (redact+timing) then a custom after — both apply in order
+  const regCompose = new ToolRegistry(new AutoApprove());
+  regCompose.register({
+    name: "leaky2",
+    description: "d",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => ({ stdout: "token=sk-zzzzzzzzzzzzzzzz" }),
+  });
+  regCompose.addHooks(
+    composeHooks([
+      builtinHooks(),
+      { after: (_i, o) => ({ ...o, result: { ...((o.result as object) ?? {}), tagged: true } }) },
+    ]),
+  );
+  const composed = (await regCompose.invoke("leaky2", {}, { turnId: "t", inject: () => {} })) as {
+    ok: boolean;
+    result?: { stdout?: string; tagged?: boolean; duration_ms?: number };
+  };
+  assert(composed.ok, "composed hooks invocation succeeds");
+  assert(!!composed.result?.stdout && composed.result.stdout.includes("[REDACTED]"), "redaction applied in composition");
+  assert(composed.result?.tagged === true, "custom after hook still runs after builtin");
+  assert(typeof composed.result?.duration_ms === "number", "timing still present in composition");
+
   const planRegistry = new ToolRegistry(gate);
   registerGeneralTools(planRegistry, { gate, cwd: workdir }, true);
   const planNames = new Set(planRegistry.schemas().map((s) => s.name));
@@ -877,6 +936,98 @@ await srv.connect(new StdioServerTransport());
   };
   assert(outEnv.t === undefined && outEnv.k === undefined, "run_cmd hides SMOKE_TOKEN/AIH_API_KEY from children");
   assert(!!outEnv.p, "run_cmd keeps PATH for children");
+}
+
+{
+  // T#22: keep_output persists the FULL (uncapped) output to a file
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerDevTools } = await import("./dev-tools.js");
+  const { mkdtempSync, readFileSync: rfs } = await import("node:fs");
+  const { tmpdir: tdir } = await import("node:os");
+  const { join: j } = await import("node:path");
+  const work = mkdtempSync(j(tdir(), "aih-keepout-"));
+  try {
+    const reg = new ToolRegistry(new AutoApprove());
+    registerDevTools(reg, work);
+    // 60KB of output: exceeds the 32KB in-band cap.
+    const r = (await reg.invoke(
+      "run_cmd",
+      { command: "node -e 'console.log(\"x\".repeat(60*1024))'", keep_output: true },
+      { turnId: "smoke", inject: () => {} },
+    )) as { ok: boolean; result?: { truncated?: boolean; stdout?: string; output_file?: string; output_bytes?: number }; error?: string };
+    assert(r.ok, `keep_output run succeeds (${r.error ?? "none"})`);
+    assert(r.result?.truncated === true, "in-band stdout is still capped (truncated=true)");
+    assert((r.result?.stdout ?? "").length <= 32 * 1024, "in-band stdout capped at 32KB");
+    const file = r.result?.output_file;
+    assert(!!file && file.startsWith(work), "output_file is under the working dir");
+    const full = rfs(file!, "utf8");
+    assert(full.length === 60 * 1024 + 1, `output_file holds the FULL 60KB (got ${full.length})`);
+    assert(r.result?.output_bytes === 60 * 1024 + 1, "output_bytes reports the full size");
+    // explicit output_path honored
+    const r2 = (await reg.invoke(
+      "run_cmd",
+      { command: "echo hello-keep", keep_output: true, output_path: "custom/out.txt" },
+      { turnId: "smoke", inject: () => {} },
+    )) as { ok: boolean; result?: { output_file?: string }; error?: string };
+    assert(r2.ok && r2.result?.output_file === j(work, "custom", "out.txt"), "output_path is honored");
+    assert(rfs(j(work, "custom", "out.txt"), "utf8") === "hello-keep\n", "explicit output_path content is correct");
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+{
+  // D#12: sandbox seam — pluggable run_cmd backend (local default, registry, env/override)
+  const {
+    localBackend,
+    bwrapBackend,
+    remoteBackend,
+    registerSandboxBackend,
+    getSandboxBackend,
+    listSandboxBackends,
+    resolveSandboxBackend,
+  } = await import("./sandbox.js");
+  assert(localBackend.name === "local" && bwrapBackend.name === "bwrap" && remoteBackend.name === "remote", "built-in backends named");
+  assert(listSandboxBackends().includes("local") && listSandboxBackends().includes("bwrap") && listSandboxBackends().includes("remote"), "registry lists built-ins");
+  // local backend actually runs a command
+  const lr = await localBackend.run({ command: "echo hello-sandbox", cwd: process.cwd(), env: { ...process.env } as NodeJS.ProcessEnv, timeoutMs: 10000 });
+  assert(lr.code === 0 && lr.output.includes("hello-sandbox") && lr.timed_out === false, "local backend runs and captures output");
+  // default resolution is local
+  const prev = process.env.AIH_SANDBOX;
+  delete process.env.AIH_SANDBOX;
+  try {
+    assert(resolveSandboxBackend().name === "local", "default backend is local");
+    // env selection
+    process.env.AIH_SANDBOX = "bwrap";
+    assert(resolveSandboxBackend().name === "bwrap", "AIH_SANDBOX env selects bwrap");
+    // per-call override wins over env
+    assert(resolveSandboxBackend("local").name === "local", "per-call override wins over env");
+    // unknown name falls back to local (never breaks a turn)
+    assert(resolveSandboxBackend("does-not-exist").name === "local", "unknown backend falls back to local");
+    // custom backend registration
+    const custom = { name: "echoer", run: async () => ({ code: 0, timed_out: false, output: "custom-ran" }) };
+    registerSandboxBackend("echoer", custom);
+    assert(getSandboxBackend("echoer")?.name === "echoer", "custom backend registered");
+    assert(resolveSandboxBackend("echoer").name === "echoer", "custom backend resolvable");
+    const cr = await resolveSandboxBackend("echoer").run({ command: "x", cwd: ".", env: {} as NodeJS.ProcessEnv, timeoutMs: 1000 });
+    assert(cr.output === "custom-ran", "custom backend executes");
+  } finally {
+    if (prev === undefined) delete process.env.AIH_SANDBOX;
+    else process.env.AIH_SANDBOX = prev;
+  }
+  // run_cmd exposes the sandbox param and reports the backend used
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerDevTools } = await import("./dev-tools.js");
+  const reg = new ToolRegistry(new AutoApprove());
+  registerDevTools(reg, process.cwd());
+  const schema = reg.schemas().find((s) => s.name === "run_cmd");
+  const props = (schema?.parameters as { properties?: Record<string, unknown> }).properties;
+  assert(!!schema && props !== undefined && "sandbox" in props, "run_cmd schema exposes sandbox param");
+  const r3 = (await reg.invoke("run_cmd", { command: "echo via-sandbox" }, { turnId: "smoke", inject: () => {} })) as {
+    ok: boolean;
+    result?: { stdout?: string; sandbox?: string };
+  };
+  assert(r3.ok && !!r3.result?.stdout && r3.result.stdout.includes("via-sandbox") && r3.result?.sandbox === "local", "run_cmd reports the sandbox backend used");
 }
 
 {
@@ -1817,6 +1968,49 @@ await srv.connect(new StdioServerTransport());
   } finally {
     cleanup();
     rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+{
+  // E#18: named agent profiles (--as <name>) — config load + rules + prompt
+  const { loadAgentProfile, listAgentProfiles } = await import("./config.js");
+  const { RulesetGate, DenyAll } = await import("@aih/core");
+  const { mkdtempSync: mkd, writeFileSync: wfs } = await import("node:fs");
+  const { tmpdir: td } = await import("node:os");
+  const { join: jj } = await import("node:path");
+  const profDir = mkd(jj(td(), "aih-profiles-"));
+  const prevCwd = process.cwd();
+  try {
+    wfs(
+      jj(profDir, "aih.json"),
+      JSON.stringify({
+        agents: {
+          readonly: {
+            prompt: "You are a read-only reviewer.",
+            permissions: [{ tool: "write_file", action: "deny" }],
+          },
+          permissive: { permissions: [{ tool: "run_cmd", action: "allow" }] },
+        },
+      }),
+    );
+    process.chdir(profDir);
+    const names = listAgentProfiles();
+    assert(names.includes("readonly") && names.includes("permissive"), "listAgentProfiles finds configured profiles");
+    const ro = loadAgentProfile("readonly");
+    assert(!!ro && ro.prompt === "You are a read-only reviewer.", "loadAgentProfile returns prompt");
+    assert(!!ro && ro.permissions?.length === 1 && ro.permissions[0].action === "deny", "loadAgentProfile returns permissions");
+    assert(loadAgentProfile("nope") === undefined, "unknown profile is undefined");
+    // profile rules applied on top of base: write_file denied, run_cmd still ask->base
+    const gate = new RulesetGate(new DenyAll(), [
+      { tool: "todo", pattern: "*", action: "allow" },
+      ...(ro?.permissions ?? []),
+    ]);
+    assert(gate.evaluate({ tool: "todo", kind: "write", args: {} }) === "allow", "base allow rule still applies");
+    assert(gate.evaluate({ tool: "write_file", kind: "write", args: { path: "/x" } }) === "deny", "profile deny rule applies");
+    assert(gate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === undefined, "unmatched tool falls through to base gate");
+  } finally {
+    process.chdir(prevCwd);
+    rmSync(profDir, { recursive: true, force: true });
   }
 }
 

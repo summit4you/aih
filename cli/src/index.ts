@@ -45,6 +45,8 @@ import { DenyGate, SessionGate } from "./gate.js";
 import {
   loadModelCatalog,
   loadPermissionRules,
+  loadAgentProfile,
+  listAgentProfiles,
   providerEntry,
   loadPrices,
   resolveLlm,
@@ -64,6 +66,7 @@ import {
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
+import { builtinHooks, composeHooks } from "./hooks.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import {
@@ -153,6 +156,8 @@ Options:
       --max-steps <n>         max steps per turn (default: unlimited; opt-in safety valve)
       --goal <condition>      run: judge-verified auto-continuation until the
                               condition holds (bounded by AIH_GOAL_ROUNDS, default 3)
+  -a, --as <name>             run a named agent profile (E#18): its permission rules
+                              + optional prompt line apply for this run (see aih agents)
       --debug-prompt          print the exact model-visible prompt input before each LLM call
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
@@ -165,6 +170,8 @@ Options:
   -f, --format text|json      run output: human text or NDJSON event stream
       --no-audit              do not append tool calls to .aih/tool-audit.jsonl
                                (on by default; every invocation is recorded with ok/error)
+      --no-redact             do not scrub secret shapes (API keys/tokens) from tool
+                               results (redaction is on by default; timing always on)
      --session <name>        name a session (stored at .aih/sessions/<name>.jsonl);
                                without it, each launch starts a fresh auto-named
                                session and persists it unless --ephemeral is given
@@ -234,6 +241,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     "goal",
     "port",
     "url",
+    "as",
+    "a",
   ]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
@@ -435,11 +444,32 @@ function makeBaseGate(flags: Record<string, string | boolean>): ApprovalGate {
 }
 
 export function makeSessionGate(flags: Record<string, string | boolean>): SessionGate {
+  const base = loadPermissionRules();
+  // E#18: `--as <name>` selects a named agent profile — its permission rules
+  // are appended AFTER the base ruleset (last-match-wins, so the profile can
+  // tighten or loosen per-tool behavior for this run).
+  const asName = str(flags, "as") ?? str(flags, "a");
+  const profile = asName ? loadAgentProfile(asName) : undefined;
+  if (asName && !profile) {
+    const known = listAgentProfiles().join(", ") || "(none configured)";
+    process.stderr.write(
+      `warning: unknown agent profile "${asName}" — falling back to base permissions (known: ${known})\n`,
+    );
+  }
+  const rules = profile?.permissions ? [...base, ...profile.permissions] : base;
   return new SessionGate(
     makeBaseGate(flags),
-    loadPermissionRules(),
+    rules,
     (rule) => savePermissionRule(rule),
   );
+}
+
+/** E#18 — the extra system-prompt line for the active `--as` profile (or ""). */
+export function agentProfilePrompt(flags: Record<string, string | boolean>): string {
+  const asName = str(flags, "as") ?? str(flags, "a");
+  if (!asName) return "";
+  const profile = loadAgentProfile(asName);
+  return profile?.prompt ? `\n\n[agent profile: ${asName}] ${profile.prompt}` : "";
 }
 
 export function registerSkillTool(registry: ToolRegistry): Skill[] {
@@ -558,7 +588,13 @@ function auditHooks(cwd: string) {
   };
 }
 
+/**
+ * D#11 — built-in hooks (redaction + timing) + the default tool-audit
+ * consumer. Order matters: builtin hooks run FIRST so the audit log sees the
+ * redacted result. Redaction is on by default; `--no-redact` disables it.
+ */
 export function attachAudit(registry: ToolRegistry, flags: Record<string, string | boolean>, cwd = process.cwd()): void {
+  if (!bool(flags, "no-redact")) registry.addHooks(builtinHooks());
   if (!bool(flags, "no-audit")) registry.addHooks(auditHooks(cwd));
 }
 
@@ -577,7 +613,13 @@ export function registerLocalTools(
       llm: () => buildLlm(flags),
       toolsProvider: () => registry,
       ask: (q) => (tuiRef.current ? tuiRef.current.askQuestion(q) : makeStdinAsk(q)),
-      ...(bool(flags, "no-audit") ? {} : { hooks: auditHooks(process.cwd()) }),
+      // D#11: builtin hooks (redaction+timing) first, then the audit consumer.
+      // Compose the after-waterfall manually (spread would drop the builtin
+      // `after` when audit is enabled).
+      hooks: composeHooks([
+        ...(bool(flags, "no-redact") ? [] : [builtinHooks()]),
+        ...(bool(flags, "no-audit") ? [] : [auditHooks(process.cwd())]),
+      ]),
     },
     hideWrites,
   );
@@ -756,7 +798,8 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       log,
       systemPrompt:
         withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) +
-        loadMemoryBlock(),
+        loadMemoryBlock() +
+        agentProfilePrompt(flags),
       maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
@@ -924,7 +967,7 @@ async function cmdWorkflow(
         llm,
         tools: registry,
         log,
-        systemPrompt: withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) + loadMemoryBlock(),
+        systemPrompt: withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) + loadMemoryBlock() + agentProfilePrompt(flags),
         maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
         contextWindow: resolveContextWindow(flags),
         compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
@@ -1026,7 +1069,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       systemPrompt:
         withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) +
           (agentMode === "plan" ? PLAN_PROMPT : "") +
-          loadMemoryBlock(),
+          loadMemoryBlock() +
+          agentProfilePrompt(flags),
       maxStepsPerTurn: maxSteps,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
@@ -1146,6 +1190,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
       { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
       { name: "usage", hint: "/usage — token usage this session", run: () => handleLine("/usage") },
+      { name: "fork session", hint: "/fork <target> [--from seq] — branch a session", run: () => handleLine("/fork") },
       { name: "tools", hint: "/tools — connected tools & permissions", run: () => handleLine("/tools") },
       { name: "skills", hint: "/skills — installed skill packs", run: () => handleLine("/skills") },
       { name: "memory", hint: "/memory — project memory (.aih/memory.md)", run: () => handleLine("/memory") },
@@ -1226,6 +1271,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/compact",
       "/checkpoint",
       "/restore",
+      "/fork",
       "/dream",
       "/distill",
       "/vivid",
@@ -1627,6 +1673,65 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       );
       return;
     }
+    // D#10: /fork — branch the current (or latest) session into a new session file
+    // from an event boundary. The source file is left untouched (append-only).
+    if (input === "/fork" || input.startsWith("/fork ")) {
+      if (busy) {
+        tui.pushSystem("finish the current turn before forking");
+        return;
+      }
+      const arg = input === "/fork" ? "" : input.slice("/fork ".length).trim();
+      if (!arg) {
+        tui.pushSystem("usage: /fork <target> [--from seq]");
+        return;
+      }
+      const parts = arg.split(/\s+/);
+      const target = parts[0];
+      let from = 0;
+      for (let i = 1; i < parts.length; i++) {
+        if (parts[i] === "--from" && parts[i + 1]) {
+          const v = Number.parseInt(parts[i + 1], 10);
+          if (!Number.isFinite(v) || v < 0) {
+            tui.pushSystem(`bad --from seq: ${parts[i + 1]}`);
+            return;
+          }
+          from = v;
+          break;
+        }
+      }
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(target)) {
+        tui.pushSystem(`invalid target name: ${target}`);
+        return;
+      }
+      // source: the current session if persisted, else the latest saved one
+      const src = sessionPath ? basename(sessionPath).replace(/\.jsonl$/, "") : latestSessionName();
+      if (!src) {
+        tui.pushSystem("no source session to fork (no saved sessions yet)");
+        return;
+      }
+      const srcPath = join(SESSIONS_DIR, `${src}.jsonl`);
+      if (!existsSync(srcPath)) {
+        tui.pushSystem(`no such source session: ${src}`);
+        return;
+      }
+      const dstPath = join(SESSIONS_DIR, `${target}.jsonl`);
+      if (existsSync(dstPath)) {
+        tui.pushSystem(`session already exists: ${target} (rm it first)`);
+        return;
+      }
+      const srcLog = SessionLog.fromEvents(readSessionEvents(src));
+      const forked = srcLog.fork(from);
+      if (forked.all().length === 0) {
+        tui.pushSystem(`nothing to fork (source has no events with seq >= ${from})`);
+        return;
+      }
+      saveSession(dstPath, forked);
+      tui.pushSystem(
+        `forked ${src} (from seq ${from}) -> ${target} (${forked.all().length} events)\n` +
+          `resume it later with: aih chat --session ${target}`,
+      );
+      return;
+    }
     if (input === "/tools") {
       const rows: string[] = [];
       for (const schema of registry.schemas()) {
@@ -1836,7 +1941,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input.startsWith("/")) {
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /skills /inject /events /clear /exit`,
       );
       return;
     }
@@ -2406,6 +2511,24 @@ function mergedConfig(layers: Array<{ config: any }>): any {
   return out;
 }
 
+/** E#18 — list configured named agent profiles (`aih agents`). */
+function cmdAgents() {
+  const names = listAgentProfiles();
+  if (names.length === 0) {
+    console.log("no agent profiles configured");
+    console.log('add them to aih.json: { "agents": { "<name>": { "prompt": "...", "permissions": [...] } } }');
+    console.log("then run with: aih run --as <name> \"...\"  (or aih chat --as <name>)");
+    return;
+  }
+  console.log(`${"profile".padEnd(24)} prompt`.padEnd(60) + "permissions");
+  for (const n of names) {
+    const p = loadAgentProfile(n);
+    const perms = (p?.permissions ?? []).map((r) => `${r.tool}:${r.action}`).join(", ");
+    console.log(`${n.padEnd(24)} ${(p?.prompt ?? "-").slice(0, 34).padEnd(36) + ""} ${perms || "-"}`);
+  }
+  console.log("\nselect one with: aih run --as <name> \"...\"");
+}
+
 function cmdInit(positionals: string[], flags: Record<string, string | boolean>) {
   const dir = positionals[0] ?? ".";
   const name = str(flags, "name") ?? basename(dir === "." ? process.cwd() : dir);
@@ -2577,6 +2700,8 @@ async function main() {
       return cmdConfig(flags);
     case "models":
       return cmdModels();
+    case "agents":
+      return cmdAgents();
     case "init":
       return cmdInit(positionals, flags);
     case "workflow":

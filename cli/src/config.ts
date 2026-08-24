@@ -72,6 +72,21 @@ export interface AihConfig {
   prices?: Record<string, { input: number; output: number }>;
   /** external skill registry (opencode-compatible index.json base URL(s)) */
   skills?: { registry?: string | string[] };
+  /**
+   * E#18 — named agent profiles: `--as <name>` selects one. A profile carries
+   * its own permission rules (applied on top of the base ruleset) and an
+   * optional extra system-prompt line. e.g.
+   *   { "agents": { "readonly": { "prompt": "You are read-only.",
+   *        "permissions": [{ "tool": "*", "action": "deny" }] } }
+   */
+  agents?: Record<string, AgentProfile>;
+}
+
+export interface AgentProfile {
+  /** extra system-prompt line injected for this profile (optional) */
+  prompt?: string;
+  /** permission rules for this profile (appended after the base ruleset) */
+  permissions?: PermissionRule[];
 }
 
 export interface ConfigLayer {
@@ -162,6 +177,26 @@ export function loadPermissionRules(): PermissionRule[] {
     for (const rule of layer.config.permissions ?? []) out.push(rule);
   }
   return out;
+}
+
+/** E#18 — load the named agent profile `name` (merged across layers; later
+ *  layers override per-key). Returns undefined if the profile is unknown. */
+export function loadAgentProfile(name: string): AgentProfile | undefined {
+  let out: AgentProfile | undefined;
+  for (const { config } of loadLayers()) {
+    const p = config.agents?.[name];
+    if (p) out = { ...out, ...p, permissions: [...(out?.permissions ?? []), ...(p.permissions ?? [])] };
+  }
+  return out;
+}
+
+/** E#18 — list the configured agent profile names (for `aih agents`). */
+export function listAgentProfiles(): string[] {
+  const names = new Set<string>();
+  for (const { config } of loadLayers()) {
+    for (const n of Object.keys(config.agents ?? {})) names.add(n);
+  }
+  return [...names].sort();
 }
 
 export interface ResolvedServer {

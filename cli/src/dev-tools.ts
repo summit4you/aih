@@ -1,12 +1,11 @@
-import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import type { ToolRegistry } from "@aih/core";
 import { lineDiff } from "./diff.js";
 import { buildChildEnv } from "./env-policy.js";
 import { formatAfterWrite } from "./formatter.js";
+import { resolveSandboxBackend } from "./sandbox.js";
 
 const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
@@ -114,7 +113,9 @@ export function registerDevTools(
     name: "run_cmd",
     description:
       `Run a shell command in the workspace; returns merged stdout+stderr. Timeout default ${Math.round(CMD_TIMEOUT_DEFAULT_MS / 1000)}s ` +
-      "(pass timeout_ms up to 600s for installs). Backgrounded children (cmd &) keep running after return.",
+      "(pass timeout_ms up to 600s for installs). Backgrounded children (cmd &) keep running after return. " +
+      "Set keep_output=true to persist the FULL (uncapped) output to a file for external inspection (T#22). " +
+      "Pick an execution sandbox via `sandbox` (local | bwrap | remote; D#12) — default local.",
     kind: "write",
     permission: "ask",
     parameters: {
@@ -123,65 +124,57 @@ export function registerDevTools(
         command: { type: "string", description: "command to run via sh -c" },
         cwd: { type: "string", description: "working directory" },
         timeout_ms: { type: "number", description: `timeout in ms (default ${CMD_TIMEOUT_DEFAULT_MS}, max ${CMD_TIMEOUT_MAX_MS})` },
+        keep_output: { type: "boolean", description: "persist the full (uncapped) output to .aih/outputs/ and return output_file (T#22)" },
+        output_path: { type: "string", description: "explicit path for the kept output (overrides the default .aih/outputs/ location)" },
+        sandbox: { type: "string", description: "execution backend: local (default) | bwrap | remote (D#12 sandbox seam)" },
       },
       required: ["command"],
     },
     execute: async (args) => {
-      const a = args as { command?: unknown; cwd?: unknown; timeout_ms?: unknown };
+      const a = args as {
+        command?: unknown;
+        cwd?: unknown;
+        timeout_ms?: unknown;
+        keep_output?: unknown;
+        output_path?: unknown;
+        sandbox?: unknown;
+      };
       const dir = safePath(cwd, String(a.cwd ?? "."));
       const timeoutMs = Math.min(
         CMD_TIMEOUT_MAX_MS,
         Math.max(1000, Number(a.timeout_ms ?? CMD_TIMEOUT_DEFAULT_MS) || CMD_TIMEOUT_DEFAULT_MS),
       );
-      const logPath = join(tmpdir(), `aih-cmd-${randomUUID()}.log`);
-      const fd = openSync(logPath, "w");
-      let code = 1;
-      let killed = false;
-      try {
-        code = await new Promise<number>((res) => {
-          const child = spawn("/bin/sh", ["-c", String(a.command)], {
-            cwd: dir,
-            env: buildChildEnv(),
-            stdio: ["ignore", fd, fd],
-          });
-          const timer = setTimeout(() => {
-            killed = true;
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              /* already gone */
-            }
-          }, timeoutMs);
-          child.on("error", () => {
-            clearTimeout(timer);
-            res(127);
-          });
-          child.on("close", (c) => {
-            clearTimeout(timer);
-            res(c ?? 1);
-          });
-        });
-      } finally {
-        closeSync(fd);
+      // D#12: run through the selected sandbox backend (default local).
+      const backend = resolveSandboxBackend(a.sandbox ? String(a.sandbox) : undefined);
+      const { code, timed_out: killed, output } = await backend.run({
+        command: String(a.command),
+        cwd: dir,
+        env: buildChildEnv(),
+        timeoutMs,
+      });
+      // T#22: keep_output persists the FULL (uncapped) output for external viewing.
+      let outputFile: string | undefined;
+      if (a.keep_output === true) {
+        const dest = a.output_path
+          ? safePath(cwd, String(a.output_path))
+          : join(cwd, ".aih", "outputs", `cmd-${Date.now()}-${randomUUID().slice(0, 8)}.log`);
+        try {
+          mkdirSync(resolve(dest, ".."), { recursive: true });
+          writeFileSync(dest, output);
+          outputFile = dest;
+        } catch {
+          /* keep_output is best-effort; the in-band stdout below still returns */
+        }
       }
-      let output = "";
-      try {
-        output = readFileSync(logPath, "utf8");
-      } catch {
-        output = "";
-      }
-      try {
-      unlinkSync(logPath);
-    } catch {
-      /* already gone */
-    }
       const capped = output.length > MAX_OUT;
       return {
-        code: killed ? 124 : code,
+        code,
         timed_out: killed,
         stdout: output.slice(0, MAX_OUT),
         stderr: "",
         truncated: capped,
+        sandbox: backend.name,
+        ...(outputFile ? { output_file: outputFile, output_bytes: Buffer.byteLength(output) } : {}),
       };
     },
   });

@@ -14,6 +14,7 @@ export interface ToolInvocationResult {
 
 const DOOM_LOOP_ASK_AT = 3;
 const DOOM_LOOP_DENY_AT = 6;
+let hookCallSeq = 0;
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
@@ -29,6 +30,9 @@ export interface ToolHookInfo {
   args: unknown;
   kind: string;
   turnId?: string;
+  /** Unique id for this invocation — lets before/after hooks correlate a call
+   *  even under concurrent (parallel read) dispatch. */
+  callId: string;
 }
 
 export interface ToolHooks {
@@ -146,6 +150,7 @@ export class ToolRegistry {
       args,
       kind: def.kind,
       ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
+      callId: `${Date.now().toString(36)}-${(++hookCallSeq).toString(36)}`,
     };
 
     for (const before of this.#hookBefore) {
