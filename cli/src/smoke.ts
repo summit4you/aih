@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   resolvePrice,
@@ -21,10 +21,24 @@ function assert(cond: boolean, msg: string): void {
   console.log(`ok: ${msg}`);
 }
 
-function aih(args: string[], env: Record<string, string> = {}) {
+function aih(args: string[], env: Record<string, string> = {}, cwd?: string) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: "utf8",
     env: { ...process.env, ...env },
+    ...(cwd ? { cwd } : {}),
+  });
+}
+
+// Like aih(), but with AIH_MODEL/AIH_BASE_URL stripped so config-file values
+// are what get resolved (the dev shell exports real provider env vars).
+function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string) {
+  const e: NodeJS.ProcessEnv = { ...process.env, ...env };
+  delete e.AIH_MODEL;
+  delete e.AIH_BASE_URL;
+  return spawnSync(process.execPath, [cli, ...args], {
+    encoding: "utf8",
+    env: e,
+    ...(cwd ? { cwd } : {}),
   });
 }
 
@@ -1435,6 +1449,375 @@ await srv.connect(new StdioServerTransport());
   // empty input → clean no-op
   const empty = extractDreamMaterial([[]] as never);
   assert(empty.corrections.length === 0 && empty.flows.length === 0 && formatDreamMaterial(empty).includes("nothing notable"), "empty sessions → nothing notable");
+}
+
+// --- P2#9: /vivid concise (plain) render mode -------------------------------
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  assert(!tui.isPlain(), "vivid (plain render) defaults off");
+  tui.push({ role: "user", text: "hello" });
+  tui.push({ role: "assistant", text: "world" });
+  const vivid = tui.transcriptLines().join("\n");
+  assert(vivid.includes("┃"), "default render keeps the user-row border (┃)");
+  tui.setPlain(true);
+  assert(tui.isPlain(), "setPlain(true) toggles on");
+  const plain = tui.transcriptLines().join("\n");
+  assert(plain.includes("hello") && plain.includes("world"), "plain render still shows the text");
+  assert(!plain.includes("┃"), "plain render drops the user-row border");
+  assert(!plain.includes("\x1b[48"), "plain render drops the surface background");
+  tui.setPlain(false);
+  assert(!tui.isPlain(), "setPlain(false) toggles back off");
+}
+
+// --- P2#9: config $schema injection (editor autocompletion) -----------------
+{
+  const { mkdtempSync: mkd } = await import("node:fs");
+  const { tmpdir: tdir } = await import("node:os");
+  const { join: j } = await import("node:path");
+  const proj = mkd(j(tdir(), "aih-schema-proj-"));
+  try {
+    const out = aihClean(["config", "--schema"], {}, proj);
+    const schema = JSON.parse(out.stdout);
+    assert(schema.$id?.endsWith("aih.schema.json"), "config --schema prints a valid AIH schema");
+    assert(
+      schema.properties?.model && schema.properties?.providers && schema.properties?.mcpServers,
+      "schema covers model/providers/mcpServers",
+    );
+    const cfg = JSON.parse(aihClean(["config"], {}, proj).stdout);
+    assert(
+      cfg.schema?.endsWith("aih.schema.json") && cfg.schemaFile?.endsWith("aih.schema.json"),
+      "aih config exposes the $schema URL + local file path",
+    );
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+  }
+}
+
+// --- P2#9: Max Mode — parallel subagents + best-of-N judge ------------------
+{
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerGeneralTools } = await import("./general-tools.js");
+  const { mapOrdered, parseJudgeVerdict, runSubagent } = await import("./maxmode.js");
+
+  // Pure helpers first.
+  const pv = parseJudgeVerdict('{"best": 2, "reason": "most complete"}', 3);
+  assert(pv.best === 2 && pv.reason === "most complete", "parseJudgeVerdict reads best+reason");
+  assert(parseJudgeVerdict('{"best": 9}', 3).best === 0, "parseJudgeVerdict clamps out-of-range to 0");
+  assert(parseJudgeVerdict("no json here", 3).best === 0, "parseJudgeVerdict falls back to 0 on garbage");
+
+  // mapOrdered: results in input order regardless of completion order.
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const out = await mapOrdered(
+    [() => delay(30).then(() => "slow"), () => delay(5).then(() => "fast"), () => delay(10).then(() => "mid")],
+    2,
+  );
+  assert(out.join(",") === "slow,fast,mid", "mapOrdered returns results in input order");
+
+  // Concurrency is actually bounded (limit=2 over 4 jobs).
+  {
+    let inflight = 0;
+    let maxInflight = 0;
+    await mapOrdered(
+      Array.from({ length: 4 }, () => async () => {
+        inflight += 1;
+        maxInflight = Math.max(maxInflight, inflight);
+        await delay(10);
+        inflight -= 1;
+        return true;
+      }),
+      2,
+    );
+    assert(maxInflight === 2, `mapOrdered caps in-flight jobs at the limit (observed ${maxInflight})`);
+  }
+
+  // Routing LLM: subagent calls (tools present) answer per-candidate; the
+  // judge call (no tools) picks an index.
+  const makeLlm = (judgeBest: number) => {
+    let sub = 0;
+    return {
+      complete: async (req: { tools: unknown[] }) => {
+        if (req.tools.length === 0) {
+          return { text: JSON.stringify({ best: judgeBest, reason: "judge says so" }), toolCalls: [], stopReason: "end_turn" as const };
+        }
+        const i = sub++;
+        return { text: `answer-${i}`, toolCalls: [], stopReason: "end_turn" as const };
+      },
+    };
+  };
+
+  const parent = new ToolRegistry(new AutoApprove());
+  parent.register({
+    name: "echo",
+    description: "echo",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: { text: { type: "string" } }, required: [] },
+    execute: async (args: unknown) => ({ echoed: args }),
+  });
+
+  const gate = new AutoApprove();
+  const registry = new ToolRegistry(gate);
+  registerGeneralTools(registry, { gate, llm: makeLlm(1), toolsProvider: () => parent, cwd: "/tmp" });
+  assert(Boolean(registry.get("best_of_n")), "best_of_n tool is registered");
+
+  const r = (await registry.invoke(
+    "best_of_n",
+    { description: "pick", prompt: "answer this", n: 3 },
+    { turnId: "t", inject: () => {} },
+  )) as { ok: boolean; result?: { best: number; n: number; candidates: Array<{ ok: boolean; answer: string }>; answer: string }; error?: string };
+  assert(r.ok, `best_of_n runs (error: ${r.error ?? "none"})`);
+  assert(r.result!.n === 3 && r.result!.candidates.length === 3, "best_of_n runs N=3 candidates");
+  assert(r.result!.candidates.every((c) => c.ok), "all candidates succeeded");
+  assert(r.result!.best === 1 && r.result!.answer === "answer-1", "judge picks candidate 1 and its answer is returned");
+
+  // n is clamped to [1,8].
+  const r2 = (await registry.invoke(
+    "best_of_n",
+    { description: "pick", prompt: "answer this", n: 99 },
+    { turnId: "t", inject: () => {} },
+  )) as { ok: boolean; result?: { n: number }; error?: string };
+  assert(r2.ok && r2.result!.n === 8, "best_of_n clamps n to 8");
+
+  // All-fail path: judge is skipped, best=-1 → tool error.
+  const failingLlm = {
+    complete: async () => {
+      throw new Error("provider down");
+    },
+  };
+  const registryFail = new ToolRegistry(gate);
+  registerGeneralTools(registryFail, { gate, llm: failingLlm, toolsProvider: () => parent, cwd: "/tmp" });
+  const rf = (await registryFail.invoke(
+    "best_of_n",
+    { description: "pick", prompt: "answer this", n: 2 },
+    { turnId: "t", inject: () => {} },
+  )) as { ok: boolean; error?: string };
+  assert(!rf.ok && /all candidates failed/.test(rf.error ?? ""), "best_of_n reports all-candidates-failed when every subagent errors");
+
+  // runSubagent excludes task/question/best_of_n (no recursion) but keeps tools.
+  const { ToolRegistry: Reg2 } = await import("@aih/core");
+  const parent2 = new Reg2(new AutoApprove());
+  parent2.register({
+    name: "echo2",
+    description: "echo2",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: { text: { type: "string" } }, required: [] },
+    execute: async () => ({ ok: 1 }),
+  });
+  parent2.register({
+    name: "question",
+    description: "q",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => "q",
+  });
+  const sub = await runSubagent({ gate, llm: makeLlm(0), toolsProvider: () => parent2 }, "do it");
+  assert(sub.answer === "answer-0", "runSubagent returns the subagent's final answer");
+}
+
+// --- P2#9: XDG data-dir resolution (paths.ts + config/skills wiring) --------
+{
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { resolveAihPaths, userAihDirs } = await import("./paths.js");
+
+  // Pure resolution (env-injected, no disk needed).
+  assert(
+    resolveAihPaths({ AIH_HOME: "/x", XDG_DATA_HOME: "/xdg", HOME: "/h" }).user === "/x",
+    "AIH_HOME wins over XDG_DATA_HOME and default",
+  );
+  assert(
+    resolveAihPaths({ XDG_DATA_HOME: "/xdg", HOME: "/h" }).user === "/xdg/aih",
+    "XDG_DATA_HOME/aih is used when AIH_HOME is unset",
+  );
+  assert(
+    resolveAihPaths({ HOME: "/h" }).user === "/h/.local/share/aih",
+    "default is ~/.local/share/aih (XDG base dir)",
+  );
+
+  // Legacy ~/.aih compat: honored only while the XDG dir does not exist yet.
+  const home = mkdtempSync(join(tmpdir(), "aih-xdg-"));
+  try {
+    mkdirSync(join(home, ".aih"), { recursive: true });
+    const legacyOnly = resolveAihPaths({ HOME: home });
+    assert(
+      legacyOnly.user === join(home, ".aih") && legacyOnly.usingLegacy === true,
+      "existing legacy ~/.aih is honored while the XDG dir is absent",
+    );
+    mkdirSync(join(home, ".local", "share", "aih"), { recursive: true });
+    const both = resolveAihPaths({ HOME: home });
+    assert(
+      both.user === join(home, ".local", "share", "aih") && both.usingLegacy === false,
+      "once the XDG dir exists it wins over legacy ~/.aih",
+    );
+    const dirs = userAihDirs({ HOME: home });
+    assert(
+      dirs.length === 2 && dirs[0] === join(home, ".local", "share", "aih") && dirs[1] === join(home, ".aih"),
+      "userAihDirs lists primary first, legacy second (deduped)",
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // Subprocess: AIH_HOME drives the user config + skills + --global install.
+  const home2 = mkdtempSync(join(tmpdir(), "aih-xdg-cfg-"));
+  const project = mkdtempSync(join(tmpdir(), "aih-xdg-proj-"));
+  try {
+    const userCfg = join(home2, "config.json");
+    writeFileSync(userCfg, JSON.stringify({ model: "xdg-model-1", contextWindow: 4242 }) + "\n");
+    // a user skill under the XDG-resolved dir
+    mkdirSync(join(home2, "skills", "xdg-skill"), { recursive: true });
+    writeFileSync(
+      join(home2, "skills", "xdg-skill", "SKILL.md"),
+      "---\nname: xdg-skill\ndescription: a user skill in the XDG dir\n---\nbody\n",
+    );
+
+    // Run from the empty project dir (no aih.json) with the dev shell's
+    // AIH_MODEL/AIH_BASE_URL stripped, so the AIH_HOME config.json is the only
+    // model source.
+    const cfgOut = aihClean(["config"], { AIH_HOME: home2, HOME: home2 }, project);
+    const cfg = JSON.parse(cfgOut.stdout);
+    assert(
+      cfg.model?.value === "xdg-model-1" && cfg.model?.source === userCfg,
+      "aih config resolves model from the AIH_HOME config.json",
+    );
+    assert(
+      Array.isArray(cfg.configLayers) && cfg.configLayers.includes(userCfg),
+      "aih config lists the AIH_HOME layer",
+    );
+
+    const listOut = aih(["skills", "list"], { AIH_HOME: home2, HOME: home2 }, project);
+    assert(listOut.stdout.includes("xdg-skill") && listOut.stdout.includes("user"), "aih skills list finds the XDG user skill");
+
+    const inst = aih(["skills", "install", "app-tour", "--global"], { AIH_HOME: home2, HOME: home2 }, project);
+    assert(inst.status === 0 && existsSync(join(home2, "skills", "app-tour", "SKILL.md")), "skills install --global lands in the XDG dir");
+    assert(!existsSync(join(project, ".aih", "skills", "app-tour")), "--global install does not touch the project dir");
+  } finally {
+    rmSync(home2, { recursive: true, force: true });
+    rmSync(project, { recursive: true, force: true });
+  }
+
+  // Subprocess: legacy ~/.aih config is still read when the XDG dir is absent.
+  const home3 = mkdtempSync(join(tmpdir(), "aih-xdg-legacy-"));
+  const proj3 = mkdtempSync(join(tmpdir(), "aih-xdg-legacy-proj-"));
+  try {
+    mkdirSync(join(home3, ".aih"), { recursive: true });
+    const legacyCfg = join(home3, ".aih", "config.json");
+    writeFileSync(legacyCfg, JSON.stringify({ model: "legacy-model-2" }) + "\n");
+    const out = aihClean(
+      ["config"],
+      { HOME: home3, AIH_HOME: "", XDG_DATA_HOME: "" },
+      proj3,
+    );
+    const cfg = JSON.parse(out.stdout);
+    assert(
+      cfg.model?.value === "legacy-model-2" && cfg.model?.source === legacyCfg,
+      "legacy ~/.aih/config.json is honored for existing installs (XDG absent)",
+    );
+  } finally {
+    rmSync(home3, { recursive: true, force: true });
+    rmSync(proj3, { recursive: true, force: true });
+  }
+}
+
+// --- P2#8: serve / attach (headless harness over HTTP/SSE) ------------------
+{
+  const { spawn } = await import("node:child_process");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const workDir = mkdtempSync(join(tmpdir(), "aih-serve-"));
+  const port = 18000 + (process.pid % 10000);
+  const url = `http://127.0.0.1:${port}`;
+  const child = spawn(
+    process.execPath,
+    [cli, "serve", "--port", String(port), "--session", "smksrv", "--mock", "--yes", "--no-dev"],
+    { cwd: workDir, stdio: "ignore", detached: true },
+  );
+  const cleanup = (): void => {
+    try {
+      process.kill(-child.pid!, "SIGKILL");
+    } catch {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+  try {
+    // Wait for the server to be ready.
+    let up = false;
+    for (let i = 0; i < 60 && !up; i += 1) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        const h = await fetch(`${url}/health`);
+        up = h.ok;
+      } catch {
+        up = false;
+      }
+    }
+    assert(up, "serve /health is reachable");
+
+    const health = (await (await fetch(`${url}/health`)).json()) as Record<string, unknown>;
+    assert(
+      health.ok === true && health.session === "smksrv" && typeof health.tools === "number",
+      "serve /health reports session + tool count",
+    );
+
+    const tools = (await (await fetch(`${url}/tools`)).json()) as Array<{ name: string }>;
+    assert(Array.isArray(tools) && tools.some((t) => t.name === "add_todo"), "serve /tools lists backend tools");
+
+    // POST /message runs a (mocked) turn and persists it to the session file.
+    const post = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "serve smoke" }),
+    });
+    assert(post.status === 200, "serve /message accepts a turn");
+    const body = (await post.json()) as { ok?: boolean };
+    assert(body.ok === true, "serve /message reports ok");
+
+    // Empty text → 400.
+    const bad = await fetch(`${url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "  " }),
+    });
+    assert(bad.status === 400, "serve /message rejects empty text with 400");
+
+    // Unknown route → 404.
+    const nf = await fetch(`${url}/nope`);
+    assert(nf.status === 404, "serve unknown route → 404");
+
+    // attach client: SSE replay of the persisted turn.
+    const { attach } = await import("./serve.js");
+    const { events } = await attach({ url, minEvents: 5, timeoutMs: 5000 });
+    const types = events.map((e) => e.type);
+    assert(types.includes("user/message") && types.includes("turn/end"), "attach sees the replayed turn (user/message … turn/end)");
+    assert(
+      events.some((e) => e.type === "user/message" && (e as { text?: string }).text === "serve smoke"),
+      "attach replay carries the posted message text",
+    );
+
+    // The turn is persisted in the serve cwd (append-only JSONL).
+    const sessionFile = join(workDir, ".aih", "sessions", "smksrv.jsonl");
+    assert(existsSync(sessionFile), "serve persists the session to .aih/sessions/<name>.jsonl");
+    const lines = readFileSync(sessionFile, "utf8").split("\n").filter(Boolean);
+    assert(lines.length >= 5 && lines.every((l) => l.startsWith("{")), "session file is append-only JSONL");
+  } finally {
+    cleanup();
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 console.log("\nAIH cli smoke test passed.");

@@ -107,7 +107,7 @@ const HELP_LINES: string[] = [
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
   bold("commands"),
-  "    /skills · /usage · /compact · /checkpoint · /restore · /help · /exit",
+  "    /skills · /usage · /compact · /checkpoint · /restore · /vivid · /help · /exit",
 ];
 
 const TOOL_ICONS: Record<string, string> = {
@@ -154,21 +154,41 @@ const WIDTH_OVERRIDES: Record<number, number> = {
 };
 const segmenter = new Intl.Segmenter();
 
+// swOpts derives from an env var that is fixed for the life of the process —
+// memoize it so the per-cluster hot path never re-reads env / re-allocates.
+let _swOpts: { ambiguousIsNarrow: boolean } | null = null;
 function swOpts(): { ambiguousIsNarrow: boolean } {
-  const mode = process.env.AIH_AMBIGUOUS_WIDE;
-  if (mode === "2") return { ambiguousIsNarrow: false };
-  return { ambiguousIsNarrow: true };
+  if (_swOpts === null) {
+    _swOpts = process.env.AIH_AMBIGUOUS_WIDE === "2"
+      ? { ambiguousIsNarrow: false }
+      : { ambiguousIsNarrow: true };
+  }
+  return _swOpts;
 }
 
-/** Width of one grapheme cluster, applying font-specific overrides. */
+// Cache cluster widths: the same grapheme clusters repeat across the whole TUI,
+// so a Map lookup is far cheaper than re-running stringWidth on every paint.
+// (The set of distinct clusters in a TUI is small — ASCII + CJK + a few emoji —
+// so this stays bounded.)
+const clusterWidthCache = new Map<string, number>();
 function clusterWidth(cluster: string): number {
+  const hit = clusterWidthCache.get(cluster);
+  if (hit !== undefined) return hit;
   const c = cluster.codePointAt(0);
-  if (c !== undefined && WIDTH_OVERRIDES[c] !== undefined) return WIDTH_OVERRIDES[c];
-  return stringWidth(cluster, swOpts());
+  const w =
+    c !== undefined && WIDTH_OVERRIDES[c] !== undefined
+      ? WIDTH_OVERRIDES[c]
+      : stringWidth(cluster, swOpts());
+  clusterWidthCache.set(cluster, w);
+  return w;
 }
 
 /** Display width of one code point in terminal cells: 0, 1, or 2. */
 export function width(ch: string): number {
+  // Fast path for a single code point (the #clip / wrapStyled hot path): a lone
+  // code point is a single grapheme cluster, so skip the Segmenter iterator.
+  if (ch.length === 1) return clusterWidth(ch);
+  if (ch.length === 2 && (ch.charCodeAt(0) & 0xfc00) === 0xd800) return clusterWidth(ch);
   let n = 0;
   for (const { segment } of segmenter.segment(ch)) n += clusterWidth(segment);
   return n;
@@ -450,6 +470,8 @@ export class Tui {
   } | null = null;
   /** Theme: derived from the terminal background (OSC 11), forced via AIH_THEME. */
   #dark = true;
+  /** P2#9 — /vivid: concise (plain) render mode — no borders/surface/panel/chrome. */
+  #plain = false;
 
 constructor(opts: TuiOptions) {
     this.#opts = opts;
@@ -459,6 +481,19 @@ constructor(opts: TuiOptions) {
  /** Current theme (test/UI hook). */
   isDark(): boolean {
     return this.#dark;
+  }
+
+  /** P2#9 — /vivid concise render mode (toggle). */
+  setPlain(on: boolean): void {
+    if (this.#plain === on) return;
+    this.#plain = on;
+    this.#itemCache.clear();
+    this.requestPaint();
+  }
+
+  /** P2#9 — current concise render mode. */
+  isPlain(): boolean {
+    return this.#plain;
   }
 
   /** All rendered transcript lines (test/text-replay hook). */
@@ -1530,6 +1565,7 @@ constructor(opts: TuiOptions) {
   }
 
   #panelWidth(): number {
+    if (this.#plain) return 0; // /vivid: no side panel
     if (!this.#panelActive()) return 0;
     return Math.min(32, Math.max(24, this.#cols >> 2));
   }
@@ -1635,6 +1671,23 @@ constructor(opts: TuiOptions) {
     const lines = this.#renderBlock(item);
     this.#itemCache.set(item, { w, d, lines });
     return lines;
+  }
+
+  /** P2#9 — plain (/vivid) render: user rows are plain text, no border/surface. */
+  #userRow(line: string): string {
+    if (this.#plain) return this.#clip(line, this.#bodyCols());
+    const bg = this.#surface();
+    const inner = Math.max(1, this.#bodyCols() - 2);
+    const raw = `${cyan("┃")} ${this.#clip(line, inner)}`;
+    return bg + raw.split(RESET).join(RESET + bg) + RESET;
+  }
+
+  #boxLine(content: string, width: number): string {
+    if (this.#plain) return this.#clip(content, width);
+    const bg = this.#surface();
+    const inner = Math.max(1, width - 2);
+    const raw = `${cyan("┃")} ${this.#clip(content, inner)}`;
+    return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #renderBlock(item: TuiItem): string[] {
@@ -1797,20 +1850,6 @@ constructor(opts: TuiOptions) {
       rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
     }
     return rows;
-  }
-
-  #userRow(line: string): string {
-    const bg = this.#surface();
-    const inner = Math.max(1, this.#bodyCols() - 2);
-    const raw = `${cyan("┃")} ${this.#clip(line, inner)}`;
-    return bg + raw.split(RESET).join(RESET + bg) + RESET;
-  }
-
-  #boxLine(content: string, width: number): string {
-    const bg = this.#surface();
-    const inner = Math.max(1, width - 2);
-    const raw = `${cyan("┃")} ${this.#clip(content, inner)}`;
-    return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #ghost(): string {

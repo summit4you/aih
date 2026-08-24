@@ -1,7 +1,31 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PermissionRule } from "@aih/core";
+import { userAihDir, userAihDirs } from "./paths.js";
+
+/**
+ * Global (user-level) config file. Resolves through the XDG data dir
+ * (AIH_HOME > $XDG_DATA_HOME/aih > ~/.local/share/aih, with ~/.aih legacy
+ * read-compat) — see paths.ts.
+ */
+function globalConfigPath(): string {
+  return join(userAihDir(), "config.json");
+}
+
+/**
+ * Ordered global config file candidates: the primary (XDG-resolved) path first
+ * — even if not yet present, so writes land there — then any existing legacy
+ * `~/.aih/config.json`. All are read (primary wins per-key on merge).
+ */
+function globalConfigCandidates(): string[] {
+  const primary = join(userAihDir(), "config.json");
+  const out = [primary];
+  for (const d of userAihDirs()) {
+    const p = join(d, "config.json");
+    if (p !== primary && existsSync(p)) out.push(p);
+  }
+  return out;
+}
 
 export interface ProviderConfig {
   baseUrl?: string;
@@ -85,9 +109,18 @@ function readConfig(path: string): AihConfig {
 
 export function loadLayers(): ConfigLayer[] {
   const layers: ConfigLayer[] = [];
-  const globalPath = join(homedir(), ".aih", "config.json");
-  const global = readConfig(globalPath);
-  if (Object.keys(global).length > 0) layers.push({ path: globalPath, config: global });
+  // Global (user-level) config: legacy `~/.aih/config.json` first, then the
+  // primary XDG dir — `fromLayers` reads from the end of the array, so the
+  // primary (pushed last) wins per-key over the legacy copy.
+  const primary = join(userAihDir(), "config.json");
+  for (const dir of userAihDirs()) {
+    const p = join(dir, "config.json");
+    if (p === primary) continue;
+    const cfg = readConfig(p);
+    if (Object.keys(cfg).length > 0) layers.push({ path: p, config: cfg });
+  }
+  const primaryCfg = readConfig(primary);
+  if (Object.keys(primaryCfg).length > 0) layers.push({ path: primary, config: primaryCfg });
   for (const name of PROJECT_CONFIG_FILES) {
     const projectPath = join(process.cwd(), name);
     const project = readConfig(projectPath);
@@ -191,7 +224,7 @@ export function saveSkillRegistry(url: string): string {
     join(process.cwd(), ".aih", "config.json"),
   ];
   const path =
-    candidates.find((p) => existsSync(p)) ?? join(homedir(), ".aih", "config.json");
+    candidates.find((p) => existsSync(p)) ?? join(userAihDir(), "config.json");
   const cfg = readConfig(path);
   cfg.skills = { ...(cfg.skills ?? {}), registry: url };
   mkdirSync(dirname(path), { recursive: true });
@@ -222,7 +255,7 @@ export function savePermissionRule(rule: PermissionRule): string {
     join(process.cwd(), ".aih", "config.json"),
   ];
   const path =
-    candidates.find((p) => existsSync(p)) ?? join(homedir(), ".aih", "config.json");
+    candidates.find((p) => existsSync(p)) ?? join(userAihDir(), "config.json");
   const cfg = readConfig(path);
   const list = Array.isArray(cfg.permissions) ? [...cfg.permissions] : [];
   if (!list.some((r) => r.tool === rule.tool && (r.pattern ?? "*") === (rule.pattern ?? "*"))) {

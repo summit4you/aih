@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aih.dev/schema/aih.schema.json",
+  "title": "AIH config (aih.json / .aih/config.json / ~/.local/share/aih/config.json)",
+  "description": "JSON Schema for AIH configuration files. Add \"$schema\": \"https://aih.dev/schema/aih.schema.json\" at the top of your config for editor autocompletion.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "model": { "type": "string", "description": "Default model id (env AIH_MODEL / --model outrank this)." },
+    "baseUrl": { "type": "string", "description": "OpenAI-compatible base URL (env AIH_BASE_URL / --base-url outrank this)." },
+    "defaultProvider": { "type": "string", "description": "Provider name from `providers` to use by default." },
+    "contextWindow": { "type": "integer", "minimum": 1, "description": "Max input tokens (default 131072; live /slots detection beats this)." },
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "baseUrl": { "type": "string" },
+          "model": { "type": "string", "description": "Primary model for this provider." },
+          "models": { "type": "array", "items": { "type": "string" }, "description": "Extra selectable models (ctrl-p picker / `aih models`)." },
+          "apiKeyEnv": { "type": "string", "description": "Env var holding the API key (default AIH_<NAME>_API_KEY)." },
+          "contextWindow": { "type": "integer", "minimum": 1 },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra request headers (e.g. client identity)." }
+        }
+      }
+    },
+    "mcpServers": {
+      "type": "object",
+      "description": "Multiple stdio MCP servers connected side-by-side and merged.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["command"],
+        "additionalProperties": false,
+        "properties": {
+          "command": { "type": "string", "description": "Server command (first token)." },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "name": { "type": "string", "description": "Display name (default: command basename)." },
+          "enabled": { "type": "boolean" }
+        }
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "description": "Folder-scoped permission rules (last-match-wins).",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "action"],
+        "additionalProperties": false,
+        "properties": {
+          "pattern": { "type": "string", "description": "Glob path pattern (e.g. `src/**` or `*` for non-path tools)." },
+          "action": { "type": "string", "enum": ["allow", "ask", "deny"] }
+        }
+      }
+    },
+    "prices": {
+      "type": "object",
+      "description": "F#30 — model price table ($ per 1M tokens). Keys are model-id substrings; overrides the built-in table.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["input", "output"],
+        "additionalProperties": false,
+        "properties": {
+          "input": { "type": "number" },
+          "output": { "type": "number" }
+        }
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }], "description": "External skill registry base URL(s) (opencode-compatible index.json)." }
+      }
+    }
+  }
+}

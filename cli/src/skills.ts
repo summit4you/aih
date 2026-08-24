@@ -7,9 +7,9 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadSkillRegistry } from "./config.js";
+import { userAihDirs } from "./paths.js";
 
 export interface Skill {
   name: string;
@@ -54,17 +54,29 @@ function loadSkillDir(dir: string, scope: "project" | "user"): Skill[] {
   return out;
 }
 
+/** User-level skill dirs: primary XDG dir first, legacy `~/.aih` second (deduped). */
+export function userSkillsDirs(): string[] {
+  const out: string[] = [];
+  for (const d of userAihDirs()) {
+    const p = join(d, "skills");
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 export function skillDirs(projectDir = process.cwd()): Array<{ dir: string; scope: "project" | "user" }> {
   return [
     { dir: join(projectDir, ".aih", "skills"), scope: "project" as const },
-    { dir: join(homedir(), ".aih", "skills"), scope: "user" as const },
+    ...userSkillsDirs().map((dir) => ({ dir, scope: "user" as const })),
   ];
 }
 
 export function discoverSkills(projectDir = process.cwd()): Skill[] {
   const byName = new Map<string, Skill>();
-  for (const s of loadSkillDir(join(homedir(), ".aih", "skills"), "user")) {
-    byName.set(s.name, s);
+  // User-level: legacy `~/.aih/skills` first, then the primary XDG dir — later
+  // entries win per-name, so the primary XDG location takes precedence.
+  for (const dir of userSkillsDirs()) {
+    for (const s of loadSkillDir(dir, "user")) byName.set(s.name, s);
   }
   for (const s of loadSkillDir(join(projectDir, ".aih", "skills"), "project")) {
     byName.set(s.name, s);

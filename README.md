@@ -70,6 +70,23 @@ AIH 的四层内核把"接入"拆成职责分明的层级，与 deepseek-harness
 | **CLI 接入** | 交互终端、一次性问答、脚本管道 | `aih` / `aih run` / `aih chat` |
 | **内嵌 Copilot**（SDK） | 直接复用 L1 内核，把工具注册进 `AgentLoop` | `@aih/core` |
 
+### serve / attach（远程模式）
+
+`aih serve` 把 harness（MCP + loop）跑成无头 HTTP/SSE 服务，解决 SSH 卡顿、
+让 UI 与后端分离：
+
+```sh
+aih serve --port 8787 --session work   # 无头跑 harness（MCP + loop）
+aih attach http://127.0.0.1:8787       # 从另一台机器 attach 一个 REPL
+```
+
+- `GET /health`：就绪检查（工具数 / 会话名 / 版本）
+- `GET /events`：SSE 事件流（含流式 `app/event` 增量帧）
+- `POST /message`：提交一轮，返回结构化结果
+- `GET /tools`：列出当前工具集
+- `aih attach` 是 SSE 客户端：回放既有事件 + 实时续接，可选 `--min-events` /
+  `--timeout`；`attachInteractive` 提供 REPL。实现：`cli/src/serve.ts`。
+
 ### Multiple Agents（build / plan）
 
 对齐 opencode 的 build/plan 分工：
@@ -291,6 +308,17 @@ npm run cli -- stats                              # 所有会话 token 用量汇
 `task` 工具派发子代理：独立上下文、≤8 步、不可再嵌套，返回最终答案。
 `task` 本身免审，但其子代理调用的每个工具仍走各自权限门。
 
+### Max Mode（并行子代理 + best-of-N 裁判）
+
+`best_of_n` 工具对同一 prompt 并行派发 N 个独立子代理（N 默认 3、封顶 8；
+并发受 `AIH_TOOL_CONCURRENCY` 限制，结果按原序收集），再用一次**无工具**的
+LLM 裁判调用从候选答案里选出最佳（`{"best": <index>, "reason": "..."}`，
+越界/解析失败回退到第一个成功候选）。全部失败则整体报错；仅一个成功则直接
+采用（跳过裁判）。实现：`cli/src/maxmode.ts`（`runSubagent` / `mapOrdered` /
+`parseJudgeVerdict` / `bestOfN`），零新依赖，复用 core `AgentLoop` +
+`ToolRegistry`。冒烟覆盖：裁判解析/越界回退、`mapOrdered` 顺序与并发上限、
+N=3 全流程、n 钳制、全失败路径、子代理防递归（剔除 task/question/best_of_n）。
+
 ### Builtin Skills（内置技能）
 
 技能是可复用的指令包（YAML frontmatter + 正文），让 agent "接入即懂行"：
@@ -343,7 +371,9 @@ opencode / MiMo-Code 风格全屏 TUI：
 - **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；`exit`（或 `/quit`，
   `ctrl-c` 清空输入再按退出）还原终端；忙碌中 `ctrl-c` 取消当前轮不退出
 - 斜杠命令：`/mode` `/goal` `/tools` `/model <id>`（热切换）`/usage` `/compact [focus]` `/clear`
-  `/inject <text>` `/events` `/skills` `/ <技能名>`
+  `/inject <text>` `/events` `/skills` `/vivid` `/ <技能名>`
+- **`/vivid` 简洁渲染**：切换 plain 模式——去掉边框/底色/侧栏/状态提示等 chrome，
+  只留正文（适合低带宽/远程/日志回放）；再按一次还原完整主题
 - 会话标题：首轮后自动 LLM 生成 2–6 词标题（`<name>.jsonl.meta.json`），状态栏与
   `session list` 显示
 
@@ -400,10 +430,15 @@ L0 接入层   mcp-server/  AppAdapter: Context(读) / Action(写,带权限) / E
 
 ## Configuration
 
-优先级：**flag > 环境变量 > 项目 `aih.json`/`.aih/config.json` > 全局 `~/.aih/config.json`**。
+优先级：**flag > 环境变量 > 项目 `aih.json`/`.aih/config.json` > 全局用户配置**。
+
+全局用户配置按 **XDG 数据目录规范**解析（`cli/src/paths.ts`）：
+`AIH_HOME` > `$XDG_DATA_HOME/aih` > `~/.local/share/aih`；旧版 `~/.aih` 在 XDG
+目录不存在时**仍可读**（平滑迁移，已存在的旧配置不丢）。
 
 ```json
 {
+  "$schema": "https://aih.dev/schema/aih.schema.json",
   "defaultProvider": "zen",
   "providers": {
     "zen": {
@@ -417,6 +452,10 @@ L0 接入层   mcp-server/  AppAdapter: Context(读) / Action(写,带权限) / E
 ```
 
 `aih config` 打印生效配置及各字段来源；`aih models` 列出所有 provider。
+
+**编辑器补全（`$schema` 注入）**：在 `aih.json` / `config.json` 顶部加
+`"$schema": "https://aih.dev/schema/aih.schema.json"` 即获得字段自动补全与校验；
+`aih config --schema` 直接打印该 JSON Schema（本地文件 `cli/schema/aih.schema.json`）。
 
 **一个 provider 挂多个模型**：`model` 是主模型，`models[]` 列出同一端点下额外
 可切换的模型（共享该 provider 的 `baseUrl` / `headers` / `apiKeyEnv`）。每个模型
@@ -459,6 +498,8 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | 变量 | 作用 |
 |---|---|
 | `AIH_MODEL` / `AIH_BASE_URL` / `AIH_API_KEY` | 模型、端点、密钥（任意 OpenAI 兼容接口） |
+| `AIH_HOME` | 全局用户配置/数据目录（最高优先级，覆盖 XDG 默认） |
+| `XDG_DATA_HOME` | XDG 数据基目录（全局配置落到 `$XDG_DATA_HOME/aih`） |
 | `AIH_RETRIES` (1) | LLM 429/5xx 自动重试次数（鉴权错误不重试） |
 | `NO_COLOR` | 关闭彩色输出 |
 | `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `providers.<name>.contextWindow` / `contextWindow`） |
@@ -590,7 +631,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
 | 项目记忆（memory.md + 注入预算） | — | — | ✅ | — | ✅ |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
-| 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ◐ 串行 task |
+| 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ✅ 串行 `task` + **并行 `best_of_n`**（Max Mode，P2#9） |
 | 并行工具调用（读类 ≤N 有界并发） | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29（写类恒串行） |
 | 技能层（SKILL.md 三级加载） | — | ✅ | ✅ | — | ✅ |
 | plan/build 双模式 | — | ✅ | ✅ | — | ✅ |
@@ -603,7 +644,10 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
 | curl\|bash 一键安装 | — | ◐ | ✅ | — | ✅ |
 | CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
-| serve/attach 多前端 | ✅ Web | ✅ | ✅ | — | ◐ roadmap P2#8 |
+| serve/attach 多前端 | ✅ Web | ✅ | ✅ | — | ✅ **HTTP/SSE** `serve`+`attach`（P2#8） |
+| XDG 数据目录规范 | ✅ | ◐ | ◐ | — | ✅ `AIH_HOME`>XDG>默认 + `~/.aih` 兼容（P2#9） |
+| 配置 `$schema` 注入（编辑器补全） | — | ◐ | ◐ | — | ✅ `aih config --schema` + `aih.schema.json`（P2#9） |
+| 简洁/无 chrome 渲染模式 | — | ◐ | — | — | ✅ `/vivid` plain 模式（P2#9） |
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 

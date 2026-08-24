@@ -8,12 +8,14 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { userAihDir } from "./paths.js";
 import { fileURLToPath } from "node:url";
 import {
   AgentLoop,
@@ -103,7 +105,7 @@ import {
 } from "./workflow.js";
 
 const VERSION = "0.2.0";
-const DEFAULT_SERVER_ENTRY = fileURLToPath(
+export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -131,6 +133,9 @@ Usage:
                                    list: list .aih/workflows/*.mjs
                                    run: aih workflow run <name> [--format json]
   aih mcp                         serve the bundled todo-app over stdio
+  aih serve --port N              headless harness over HTTP/SSE (P2#8)
+                                  GET /health · GET /events (SSE) · POST /message · GET /tools
+  aih attach <url>                attach a lightweight REPL to a running serve
   aih doctor | check | eval       run harness scripts
 
 Options:
@@ -169,7 +174,9 @@ Options:
   -h, --help                  show help
   -v, --version               show version
 
-Configuration (precedence: flags > env > project aih.json > ~/.aih/config.json):
+Configuration (precedence: flags > env > project aih.json/.aih/config.json >
+  user config — XDG: $AIH_HOME > $XDG_DATA_HOME/aih > ~/.local/share/aih,
+  with legacy ~/.aih read-compat):
   { "model", "baseUrl", "defaultProvider", "contextWindow"?,
     "providers": { "<name>": { "baseUrl", "model", "apiKeyEnv", "contextWindow"? } },
     "mcpServers": { "<name>": { "command", "args?", "enabled?", "name?" } },
@@ -177,6 +184,7 @@ Configuration (precedence: flags > env > project aih.json > ~/.aih/config.json):
 
 Environment:
   AIH_MODEL, AIH_BASE_URL, AIH_API_KEY, AIH_RETRIES, NO_COLOR
+  AIH_HOME (explicit user data dir) / XDG_DATA_HOME (default ~/.local/share/aih)
   AIH_CONTEXT_WINDOW (default 131072; live /slots detection [llama.cpp] beats aih.json
     providers.<name>.contextWindow; explicit flag/env always wins),
   AIH_COMPACT_AT (0.8), AIH_GOAL_ROUNDS (3)
@@ -189,8 +197,11 @@ Examples:
   aih run "add a todo buy milk" --mock
   aih run "what else?" -c                     # continue most recent session
   aih chat --session work
+  aih serve --port 8787 --session work       # headless harness over HTTP/SSE
+  aih attach http://127.0.0.1:8787           # attach a REPL from another box
   aih init my-app && cd my-app && npm run bootstrap
   aih config                                  # inspect effective settings
+  aih config --schema                         # print the aih.json JSON Schema
 
 Chat commands (inside the TUI):
   ctrl-p              command palette (switch model, mode, compact, …)
@@ -221,6 +232,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     "from",
     "context-window",
     "goal",
+    "port",
+    "url",
   ]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
@@ -257,12 +270,12 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { command: positionals.shift() ?? "", positionals, flags };
 }
 
-function str(flags: Record<string, string | boolean>, key: string): string | undefined {
+export function str(flags: Record<string, string | boolean>, key: string): string | undefined {
   const v = flags[key];
   return typeof v === "string" ? v : undefined;
 }
 
-function bool(flags: Record<string, string | boolean>, ...keys: string[]): boolean {
+export function bool(flags: Record<string, string | boolean>, ...keys: string[]): boolean {
   return keys.some((k) => flags[k] === true || flags[k] === "true");
 }
 
@@ -389,7 +402,7 @@ export function buildLlm(flags: Record<string, string | boolean>) {
   });
 }
 
-function loadMemoryBlock(cwd = process.cwd()): string {
+export function loadMemoryBlock(cwd = process.cwd()): string {
   const path = join(cwd, ".aih", "memory.md");
   if (!existsSync(path)) return "";
   let text = readFileSync(path, "utf8").trim();
@@ -399,7 +412,7 @@ function loadMemoryBlock(cwd = process.cwd()): string {
   return `\n\n# Project memory (persistent across sessions; keep it current with the remember tool)\n${text}`;
 }
 
-function loadSystemPrompt(): string {
+export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
   const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}`;
   if (existsSync(appMd)) {
@@ -421,7 +434,7 @@ function makeBaseGate(flags: Record<string, string | boolean>): ApprovalGate {
   return bool(flags, "yes", "y") ? new AutoApprove() : new DenyGate();
 }
 
-function makeSessionGate(flags: Record<string, string | boolean>): SessionGate {
+export function makeSessionGate(flags: Record<string, string | boolean>): SessionGate {
   return new SessionGate(
     makeBaseGate(flags),
     loadPermissionRules(),
@@ -429,7 +442,7 @@ function makeSessionGate(flags: Record<string, string | boolean>): SessionGate {
   );
 }
 
-function registerSkillTool(registry: ToolRegistry): Skill[] {
+export function registerSkillTool(registry: ToolRegistry): Skill[] {
   const skills = discoverSkills();
   if (!skills.length) return skills;
   registry.register({
@@ -545,11 +558,11 @@ function auditHooks(cwd: string) {
   };
 }
 
-function attachAudit(registry: ToolRegistry, flags: Record<string, string | boolean>, cwd = process.cwd()): void {
+export function attachAudit(registry: ToolRegistry, flags: Record<string, string | boolean>, cwd = process.cwd()): void {
   if (!bool(flags, "no-audit")) registry.addHooks(auditHooks(cwd));
 }
 
-function registerLocalTools(
+export function registerLocalTools(
   registry: ToolRegistry,
   flags: Record<string, string | boolean>,
   gate: ApprovalGate,
@@ -1140,6 +1153,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "distill", hint: "/distill — repeated flows → skill/workflow candidates", run: () => handleLine("/distill") },
       { name: "events", hint: "/events — session event log toggle", run: () => handleLine("/events") },
       { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
+      { name: "vivid (concise render)", hint: "/vivid — toggle plain render (no borders/panel)", run: () => handleLine("/vivid") },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
@@ -1214,6 +1228,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/restore",
       "/dream",
       "/distill",
+      "/vivid",
       "/clear",
       "/inject",
       "/events",
@@ -1530,6 +1545,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input === "/clear") {
       tui.clearItems();
+      return;
+    }
+    // P2#9: /vivid toggles the concise (plain) render mode — no borders/surface/panel.
+    if (input === "/vivid") {
+      const on = !tui.isPlain();
+      tui.setPlain(on);
+      tui.pushSystem(on ? "vivid: concise render ON (no borders/panel/chrome)" : "vivid: concise render OFF (full theme)");
       return;
     }
     // F#28: checkpoint / restore (append-only rollback to a marker)
@@ -2127,7 +2149,21 @@ function cmdStats() {
   }
 }
 
+/** P2#9 — config `$schema` for editor autocompletion. */
+const AIH_SCHEMA_URL = "https://aih.dev/schema/aih.schema.json";
+function aihSchemaPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "schema", "aih.schema.json");
+}
+function aihSchema(): string {
+  return readFileSync(aihSchemaPath(), "utf8");
+}
+
 async function cmdConfig(flags: Record<string, string | boolean>) {
+  // `aih config --schema` prints the raw JSON Schema for aih.json / config.json.
+  if (bool(flags, "schema")) {
+    console.log(aihSchema());
+    return;
+  }
   const llm = resolveLlm({
     flagModel: str(flags, "model"),
     flagBaseUrl: str(flags, "base-url"),
@@ -2148,6 +2184,8 @@ async function cmdConfig(flags: Record<string, string | boolean>) {
     JSON.stringify(
       {
         version: VERSION,
+        schema: AIH_SCHEMA_URL,
+        schemaFile: aihSchemaPath(),
         model: llm.model,
         baseUrl: llm.baseUrl,
         provider: llm.provider,
@@ -2271,14 +2309,27 @@ async function cmdSkills(
   if (action === "install") {
     const name = args[0];
     if (!name) {
-      console.error("error: usage: aih skills install <name> [--registry <url>]");
+      console.error("error: usage: aih skills install <name> [--registry <url>] [--global]");
       process.exit(1);
     }
+    // --global: install into the user-level (XDG) skills dir, not the project.
+    const global = bool(flags, "global");
+    const targetDir = global ? join(userAihDir(), "skills") : projectSkillsDir;
     // 1) local builtin
     if (BUILTIN_SKILLS.some((b) => b.name === name)) {
       try {
+        // installSkill writes to <projectDir>/.aih/skills; for --global we
+        // relocate the result into the user-level (XDG) skills dir.
         const file = installSkill(name);
-        console.log(`installed ${name} -> ${file}`);
+        if (global) {
+          const want = join(targetDir, name, "SKILL.md");
+          mkdirSync(dirname(want), { recursive: true });
+          renameSync(file, want);
+          rmSync(dirname(file), { recursive: true, force: true });
+          console.log(`installed ${name} (global) -> ${want}`);
+        } else {
+          console.log(`installed ${name} -> ${file}`);
+        }
       } catch (err) {
         console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
@@ -2289,7 +2340,7 @@ async function cmdSkills(
     const remote = await fetchRemote();
     const match = remote.find((s) => s.name === name);
     if (match) {
-      const destDir = join(projectSkillsDir, name);
+      const destDir = join(targetDir, name);
       const file = await installRemoteSkill(match, destDir);
       console.log(`installed ${name} (remote) -> ${file}`);
       return;
@@ -2408,6 +2459,39 @@ async function cmdMcp(flags: Record<string, string | boolean>) {
   process.exit(res.status ?? 1);
 }
 
+// --- P2#8: serve / attach (headless harness + remote UI over HTTP/SSE) ------
+async function cmdServe(flags: Record<string, string | boolean>): Promise<void> {
+  const { startServe } = await import("./serve.js");
+  const srv = await startServe(flags);
+  const url = `http://${srv.host}:${srv.port}`;
+  console.log(`${green("serving")} AIH harness at ${url}`);
+  console.log(
+    dim(
+      `  session ${str(flags, "session") ?? "(auto)"} · GET /health · GET /events (SSE) · POST /message · GET /tools`,
+    ),
+  );
+  console.log(dim(`  attach with: aih attach ${url}`));
+  const shutdown = (sig: string): void => {
+    process.stderr.write(`\n${dim(`shutting down (${sig})`)}`);
+    void srv
+      .close()
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  await new Promise(() => undefined); // run until signaled
+}
+
+async function cmdAttach(
+  positionals: string[],
+  flags: Record<string, string | boolean>,
+): Promise<void> {
+  const url = positionals[0] ?? str(flags, "url") ?? "http://127.0.0.1:8787";
+  const { attachInteractive } = await import("./serve.js");
+  await attachInteractive(url);
+}
+
 function cmdScript(name: string) {
   const script = `${REPO_ROOT}scripts/${name}`;
   if (!existsSync(script)) {
@@ -2499,6 +2583,10 @@ async function main() {
       return cmdWorkflow(positionals, flags);
     case "mcp":
       return cmdMcp(flags);
+    case "serve":
+      return cmdServe(flags);
+    case "attach":
+      return cmdAttach(positionals, flags);
     case "version":
       console.log(VERSION);
       return;

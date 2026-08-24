@@ -13,6 +13,7 @@ import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
 import type { DiffLine } from "./diff.js";
 import { lineDiff } from "./diff.js";
 import { formatAfterWrite } from "./formatter.js";
+import { bestOfN } from "./maxmode.js";
 
 export interface GeneralToolsOptions {
   cwd?: string;
@@ -606,6 +607,44 @@ export function registerGeneralTools(
         .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
       const answer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
       return { description: String(a.description ?? ""), steps: result.steps, stopReason: result.stopReason, answer };
+    },
+  });
+
+  // P2#9 — Max Mode: N parallel subagents + a judge picks the best answer.
+  reg({
+    name: "best_of_n",
+    description:
+      "Max Mode: run N independent subagents in parallel on the same prompt and let a judge " +
+      "pick the best answer (bounded concurrency, AIH_TOOL_CONCURRENCY). " +
+      "Use for high-stakes answers where one shot is not enough.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        description: { type: "string", description: "short (3-8 word) task label" },
+        prompt: { type: "string", description: "full instructions for every subagent" },
+        n: { type: "number", description: "number of parallel candidates (default 3, max 8)" },
+      },
+      required: ["description", "prompt"],
+    },
+    execute: async (args) => {
+      const a = args as { description?: unknown; prompt?: unknown; n?: unknown };
+      const prompt = String(a.prompt ?? "");
+      if (!prompt) throw new Error("best_of_n requires a prompt");
+      if (!opts.gate || !opts.llm || !opts.toolsProvider) {
+        throw new Error("best_of_n is not wired in this context (chat only)");
+      }
+      const llm = typeof opts.llm === "function" ? opts.llm() : opts.llm;
+      const n = Math.max(1, Math.min(8, Math.floor(Number(a.n ?? "") || 3)));
+      const result = await bestOfN(
+        { gate: opts.gate, llm, toolsProvider: opts.toolsProvider, hooks: opts.hooks },
+        prompt,
+        n,
+        String(a.description ?? ""),
+      );
+      if (result.best < 0) throw new Error(`best_of_n: ${result.judgeReason}`);
+      return result;
     },
   });
 }
