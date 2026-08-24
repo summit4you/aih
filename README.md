@@ -177,8 +177,13 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
   **原会话文件不动**，append-only 全量历史仍可审计
 - TUI：`/checkpoint [note]` 与 `/restore [seq]`；回滚前自动把完整历史快照到
   `*-pre-restore-<时间戳>.jsonl`，被丢弃的后缀随时可查
+- **worktree 摘要**：checkpoint 事件附带当时的 git 工作区快照（`WorktreeSummary`：
+  分支、HEAD 短 sha、变更文件清单封顶 50 条 + 总数）——恢复点同时告诉你"代码当时
+  什么样"；git 缺失/非仓库/超时（5s）时静默省略，绝不阻断 checkpoint；CLI 与 TUI
+  记录时打印摘要，restore 时回显该快照
 - 冒烟测试覆盖：标记追加、前缀派生、指针切换后 seq 续接、`deriveMessages` 跳过标记、
-  拒绝覆盖、坏 seq / 无标记报错
+  拒绝覆盖、坏 seq / 无标记报错；worktree 快照（非仓库 undefined、分支/sha/脏文件、
+  封顶计数、事件携带结构化摘要）
 
 ### 成本与吞吐（cost / TPS）
 
@@ -593,7 +598,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore`（余 worktree 摘要）；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
+**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore` + worktree 摘要；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
 
 一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
 

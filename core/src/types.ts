@@ -2,6 +2,23 @@ export type PermissionAction = "allow" | "ask" | "deny";
 
 export type ToolKind = "read" | "write";
 
+/**
+ * Git worktree snapshot attached to checkpoint events (F#28 increment):
+ * branch, HEAD sha and a capped changed-file list captured at checkpoint time.
+ */
+export interface WorktreeSummary {
+  /** Current branch name (`null` = detached HEAD or undetermined). */
+  branch: string | null;
+  /** Short HEAD sha (`null` = no commits yet or undetermined). */
+  head: string | null;
+  /** Changed files (status letter + path), capped at MAX_DIRTY_ENTRIES. */
+  dirty: string[];
+  /** Total number of changed files (>= dirty.length when capped). */
+  dirtyCount: number;
+  /** True when there are no local changes. */
+  clean: boolean;
+}
+
 export interface JsonSchemaProperty {
   type: "string" | "number" | "boolean" | "object" | "array";
   description?: string;
@@ -119,6 +136,12 @@ export type SessionEvent =
       note?: string;
       /** Context-window usage snapshot at checkpoint time. */
       contextTokens?: number;
+      /**
+       * Git worktree snapshot at checkpoint time (F#28 increment): branch,
+       * HEAD sha and capped changed-file list, so a restore point also tells
+       * you what the code looked like. Absent when git is unavailable.
+       */
+      worktree?: WorktreeSummary;
     }
   | {
       seq: number;

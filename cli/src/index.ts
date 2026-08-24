@@ -60,6 +60,7 @@ import {
   totalCost,
 } from "./cost.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
+import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import {
@@ -1479,10 +1480,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         tui.pushSystem("finish the current turn before checkpointing");
         return;
       }
-      const cp = log.checkpoint(note || undefined, usedTokens || undefined);
+      const cp = log.checkpoint(
+        note || undefined,
+        usedTokens || undefined,
+        gitStatusSummary({ cwd: process.cwd() }),
+      );
       if (sessionPath) saveSession(sessionPath, log);
+      const wtLines = cp.worktree ? formatWorktreeSummary(cp.worktree) : [];
       tui.pushSystem(
-        `checkpoint #${cp.seq} recorded${note ? ` — ${note}` : ""}\nrestore later with /restore [seq] (rolls back context to that point; the discarded suffix stays auditable in the log)`,
+        `checkpoint #${cp.seq} recorded${note ? ` — ${note}` : ""}` +
+          (wtLines.length ? `\n${wtLines.join("\n")}` : "") +
+          `\nrestore later with /restore [seq] (rolls back context to that point; the discarded suffix stays auditable in the log)`,
       );
       return;
     }
@@ -1928,11 +1936,12 @@ function cmdSessionCheckpoint(name: string | undefined, note: string | undefined
     process.exit(1);
   }
   const log = SessionLog.fromEvents(readSessionEvents(src));
-  const cp = log.checkpoint(note);
+  const cp = log.checkpoint(note, undefined, gitStatusSummary());
   saveSession(srcPath, log);
   console.log(
     `checkpoint #${cp.seq} recorded in ${src}` +
       (note ? ` — ${note}` : "") +
+      (cp.worktree ? `\n${formatWorktreeSummary(cp.worktree).join("\n")}` : "") +
       `\nrestore later with: aih session restore ${src} [seq]   (or /restore in the TUI)`,
   );
 }
@@ -1985,6 +1994,7 @@ function cmdSessionRestore(name: string, seqArg: string | undefined) {
   const dropped = events.length - restored.all().length;
   console.log(
     `restored ${name} @ checkpoint #${cp.seq}${cp.note ? ` — ${cp.note}` : ""} → ${target}\n` +
+      (cp.worktree ? `${formatWorktreeSummary(cp.worktree).join("\n")}\n` : "") +
       `kept ${restored.all().length} events, dropped ${dropped}; original ${name} untouched (full history stays auditable)\n` +
       `resume with: aih chat --session ${target}`,
   );

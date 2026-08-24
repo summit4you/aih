@@ -1,5 +1,5 @@
 import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
-import type { ChatMessage, SessionEvent } from "./types.js";
+import type { ChatMessage, SessionEvent, WorktreeSummary } from "./types.js";
 
 export type SessionListener = (event: SessionEvent) => void;
 
@@ -56,11 +56,16 @@ export class SessionLog {
    * Record a named checkpoint (roadmap F#28). Append-only: the event is just a
    * marker; restoring never rewrites history.
    */
-  checkpoint(note?: string, contextTokens?: number): SessionEvent & { type: "checkpoint" } {
+  checkpoint(
+    note?: string,
+    contextTokens?: number,
+    worktree?: WorktreeSummary,
+  ): SessionEvent & { type: "checkpoint" } {
     return this.append({
       type: "checkpoint",
       ...(note ? { note } : {}),
       ...(contextTokens != null ? { contextTokens } : {}),
+      ...(worktree ? { worktree } : {}),
     }) as SessionEvent & { type: "checkpoint" };
   }
 

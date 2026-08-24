@@ -1329,4 +1329,58 @@ await srv.connect(new StdioServerTransport());
   assert(tui.transcriptLines().some((l) => l.includes("APPENDED")), "pushDelta after cache invalidates and re-renders");
 }
 
+// --- F#28 increment: worktree snapshot on checkpoints ------------------------
+{
+  const { gitStatusSummary, formatWorktreeSummary, MAX_DIRTY_ENTRIES } = await import("./worktree.js");
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync: gitSpawn } = await import("node:child_process");
+  const repo = mkdtempSync(join(tmpdir(), "aih-wt-"));
+  const run = (args: string[]) => gitSpawn("git", args, { cwd: repo, encoding: "utf8" });
+
+  // Not a repository → undefined, never throws.
+  const plain = mkdtempSync(join(tmpdir(), "aih-plain-"));
+  assert(gitStatusSummary({ cwd: plain }) === undefined, "worktree snapshot returns undefined outside a repo");
+  rmSync(plain, { recursive: true, force: true });
+
+  // Real repo: branch + HEAD + dirty files.
+  run(["init", "-q", "-b", "main"]);
+  run(["config", "user.email", "smoke@test"]);
+  run(["config", "user.name", "smoke"]);
+  writeFileSync(`${repo}/tracked.txt`, "v1\n");
+  run(["add", "."]);
+  run(["commit", "-q", "-m", "init"]);
+  writeFileSync(`${repo}/tracked.txt`, "v2\n");
+  writeFileSync(`${repo}/new.txt`, "n\n");
+  const snap = gitStatusSummary({ cwd: repo });
+  assert(!!snap && snap.branch === "main", "snapshot reads the current branch");
+  assert(!!snap && typeof snap.head === "string" && /^[0-9a-f]{7,}$/.test(snap.head!), "snapshot carries the short HEAD sha");
+  assert(!!snap && !snap.clean && snap.dirtyCount === 2 && snap.dirty.length === 2, "snapshot lists changed files (modified + untracked)");
+  assert(!!snap && snap.dirty.some((d) => d.startsWith("M") && d.includes("tracked.txt")), "modified file keeps its status letter");
+
+  // Cap + formatting.
+  for (let i = 0; i < MAX_DIRTY_ENTRIES + 5; i += 1) writeFileSync(`${repo}/f${i}.txt`, "x\n");
+  const capped = gitStatusSummary({ cwd: repo });
+  assert(!!capped && capped.dirty.length === MAX_DIRTY_ENTRIES && capped.dirtyCount > capped.dirty.length, "dirty list caps at MAX_DIRTY_ENTRIES but counts all");
+  const lines = formatWorktreeSummary(snap!);
+  assert(lines[0].startsWith("worktree: main @ "), "formatted summary names branch@sha");
+  assert(lines.slice(1).some((l) => l.trim().length > 0), "formatted summary includes dirty entries");
+  rmSync(repo, { recursive: true, force: true });
+
+  // CLI checkpoint embeds the snapshot into the event (cwd = this repo).
+  rmSync(".aih/sessions", { recursive: true, force: true });
+  const s1run = aih(["run", "seed for wt", "--mock", "--yes", "--session", "s1wt"]);
+  assert(s1run.status === 0, "seed session exists before checkpoint");
+  const cpOut = aih(["session", "checkpoint", "s1wt", "wt", "check"]);
+  assert(cpOut.status === 0 && cpOut.stdout.includes("worktree:"), "CLI checkpoint prints the worktree summary");
+  const s1Events = JSON.parse(aih(["session", "export", "s1wt"]).stdout);
+  const cpEvt = [...s1Events].reverse().find((e: { type?: string }) => e.type === "checkpoint");
+  assert(!!cpEvt?.worktree, "checkpoint event carries a worktree summary");
+  assert(
+    typeof cpEvt.worktree.dirtyCount === "number" && Array.isArray(cpEvt.worktree.dirty) && typeof cpEvt.worktree.branch !== "undefined",
+    "worktree summary is structured (branch/head/dirty/dirtyCount)",
+  );
+}
+
 console.log("\nAIH cli smoke test passed.");
