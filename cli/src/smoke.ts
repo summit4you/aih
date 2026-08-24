@@ -1041,7 +1041,10 @@ await srv.connect(new StdioServerTransport());
   tui.resolveTool("c1", true, { done: true });
   tui.resolveTool("c2", true, { path: "/tmp/foo.txt" });
   tui.resolveTool("c3", true, {
-    _diff: [{ t: "del", s: "old line" }, { t: "add", s: "new line" }],
+    _diff: [
+      { t: "del", s: "old line", a: 7 },
+      { t: "add", s: "new line", b: 9 },
+    ],
   });
   const raw = tui.transcriptLines();
   const body = raw.map((s) => s.replace(/\x1b\[[0-9;]*m/g, ""));
@@ -1056,13 +1059,56 @@ await srv.connect(new StdioServerTransport());
   );
   assert(!raw.some((l) => l.includes("48;5;236")), "tool rows carry no background box");
   assert(!raw.some((l) => l.includes("┃")), "tool rows carry no left border");
-  const diffLine = raw.find((l) => l.includes("48;5;237") && l.includes("48;5;233"));
-  assert(!!diffLine, "edit diff renders side-by-side (red del cell + green add cell)");
-  const diffBody = diffLine!.replace(/\x1b\[[0-9;]*m/g, "");
-  assert(diffBody.includes("old line") && diffBody.includes("new line"), "diff shows original left, modified right");
-  assert(diffBody.indexOf("old line") < diffBody.indexOf("new line"), "removed side is left, added side is right");
-  assert(diffBody.includes("┃") === false, "diff cells have no border");
+  const diffLine = raw.find((l) => l.includes("48;5;237") && l.includes("old line"));
+  assert(!!diffLine, "edit diff renders a tinted removed row");
+  const addLine = raw.find((l) => l.includes("48;5;233") && l.includes("new line"));
+  assert(!!addLine, "edit diff renders a tinted added row");
+  const flatBody = body.join("\n");
+  assert(flatBody.indexOf("old line") < flatBody.indexOf("new line"), "removed row comes before the added row");
+  assert(diffLine!.includes("┃") === false && addLine!.includes("┃") === false, "diff cells have no border");
   assert(body.every((l) => l.length <= 80), "tool rows fit the full history width (80 cols)");
+
+  // F#31: line numbers + unified fallback on narrow terminals.
+  // Default 80-col test TUI → body < 100 → unified single-column rows.
+  assert(
+    body.some((l) => /7 - old line/.test(l)) && body.some((l) => /9 \+ new line/.test(l)),
+    "narrow (<100 cols) diff falls back to unified with inline numbers",
+  );
+  assert(
+    !raw.some((l) => l.includes("48;5;237") && l.includes("48;5;233")),
+    "unified fallback renders one cell per row (never both tints)",
+  );
+  // Wide terminal (width option = 120): side-by-side with numbered gutters.
+  const wide = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+    width: 120,
+  });
+  wide.pushTool("edit", { path: "/tmp/foo.txt", old_string: "a\nb", new_string: "A\nc" }, "w1");
+  wide.resolveTool("w1", true, {
+    _diff: [
+      { t: "del", s: "alpha", a: 12 },
+      { t: "del", s: "beta", a: 13 },
+      { t: "add", s: "ALPHA", b: 12 },
+      { t: "add", s: "GAMMA", b: 13 },
+    ],
+  });
+  const wideRaw = wide.transcriptLines();
+  const pairRow = wideRaw.find((l) => l.includes("48;5;237") && l.includes("48;5;233"));
+  assert(!!pairRow, "wide diff renders side-by-side (both tints on one row)");
+  const pairBody = pairRow!.replace(/\x1b\[[0-9;]*m/g, "");
+  assert(pairBody.includes("12 - alpha") && pairBody.includes("12 + ALPHA"), "wide diff shows old/new line numbers before -/+");
+  assert(wideRaw.some((l) => /13 - beta/.test(l.replace(/\x1b\[[0-9;]*m/g, ""))), "second del keeps its own number");
+  assert(
+    wideRaw.every((l) => l.replace(/\x1b\[[0-9;]*m/g, "").length <= 120),
+    "wide diff rows fit the fixed width",
+  );
+  assert(!pairBody.includes("┃"), "wide diff cells keep the borderless style");
 }
 
 // --- Post-write auto-formatting (roadmap F#27, opencode formatters) --------

@@ -1,6 +1,10 @@
 export interface DiffLine {
   t: "add" | "del";
   s: string;
+  /** 1-based line number in the old file (present on del lines). */
+  a?: number;
+  /** 1-based line number in the new file (present on add lines). */
+  b?: number;
 }
 
 const MAX_DIFF_LINES = 80;
@@ -12,8 +16,8 @@ export function lineDiff(oldText: string, newText: string): DiffLine[] {
   if (a.length === b.length && a.every((l, i) => l === b[i])) return [];
   if (a.length * b.length > MAX_LCS_CELLS) {
     return [
-      ...a.map((s): DiffLine => ({ t: "del", s })),
-      ...b.map((s): DiffLine => ({ t: "add", s })),
+      ...a.map((s, k): DiffLine => ({ t: "del", s, a: k + 1 })),
+      ...b.map((s, k): DiffLine => ({ t: "add", s, b: k + 1 })),
     ];
   }
   const n = a.length;
@@ -32,19 +36,19 @@ export function lineDiff(oldText: string, newText: string): DiffLine[] {
       i += 1;
       j += 1;
     } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      out.push({ t: "del", s: a[i] });
+      out.push({ t: "del", s: a[i], a: i + 1 });
       i += 1;
     } else {
-      out.push({ t: "add", s: b[j] });
+      out.push({ t: "add", s: b[j], b: j + 1 });
       j += 1;
     }
   }
   while (i < n) {
-    out.push({ t: "del", s: a[i] });
+    out.push({ t: "del", s: a[i], a: i + 1 });
     i += 1;
   }
   while (j < m) {
-    out.push({ t: "add", s: b[j] });
+    out.push({ t: "add", s: b[j], b: j + 1 });
     j += 1;
   }
   return out;

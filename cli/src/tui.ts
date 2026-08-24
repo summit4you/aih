@@ -52,6 +52,12 @@ export interface TuiOptions {
   onTab?(): void;
   /** open the command palette (ctrl-p) */
   onPalette?(): void;
+  /**
+   * Fixed terminal width override (cols). When set, the TUI uses this instead
+   * of process.stdout.columns — for tests, embedding and replay harnesses.
+   * Resize events from the real terminal are ignored while it is set.
+   */
+  width?: number;
 }
 
 /** One selectable entry in a TUI overlay picker. */
@@ -80,6 +86,8 @@ const DEL_BG = `${CSI}48;5;237m`; // dark-theme removed cell (red tint)
 const ADD_BG = `${CSI}48;5;233m`; // dark-theme added cell (green tint)
 const DEL_BG_LIGHT = `${CSI}48;5;225m`; // light-theme removed cell
 const ADD_BG_LIGHT = `${CSI}48;5;194m`; // light-theme added cell
+/** Below this body width the side-by-side diff falls back to unified. */
+const DIFF_SIDEBYSIDE_MIN_COLS = 100;
 const REV = `${CSI}7m`; // reverse video: selection that works on any theme
 const RESET = `${CSI}0m`;
 // Terminal background report (OSC 11), 16-bit RRRR/GGGG/BBBB, BEL or ST terminated.
@@ -445,6 +453,7 @@ export class Tui {
 
 constructor(opts: TuiOptions) {
     this.#opts = opts;
+    if (typeof opts.width === "number" && opts.width > 0) this.#cols = Math.floor(opts.width);
   }
 
  /** Current theme (test/UI hook). */
@@ -1702,28 +1711,28 @@ constructor(opts: TuiOptions) {
   }
 
   /** Zip each del run with the add run that follows it (side-by-side pairs). */
-  #diffPairs(d: DiffLine[]): Array<{ del: string; add: string }> {
-    const pairs: Array<{ del: string; add: string }> = [];
+  #diffPairs(d: DiffLine[]): Array<{ del: DiffLine | null; add: DiffLine | null }> {
+    const pairs: Array<{ del: DiffLine | null; add: DiffLine | null }> = [];
     let i = 0;
     while (i < d.length) {
       if (d[i].t === "del") {
-        const dels: string[] = [];
+        const dels: DiffLine[] = [];
         while (i < d.length && d[i].t === "del") {
-          dels.push(d[i].s);
+          dels.push(d[i]);
           i += 1;
         }
-        const adds: string[] = [];
+        const adds: DiffLine[] = [];
         while (i < d.length && d[i].t === "add") {
-          adds.push(d[i].s);
+          adds.push(d[i]);
           i += 1;
         }
         const n = Math.max(dels.length, adds.length);
         for (let k = 0; k < n; k += 1) {
-          pairs.push({ del: dels[k] ?? "", add: adds[k] ?? "" });
+          pairs.push({ del: dels[k] ?? null, add: adds[k] ?? null });
         }
       } else {
         while (i < d.length && d[i].t === "add") {
-          pairs.push({ del: "", add: d[i].s });
+          pairs.push({ del: null, add: d[i] });
           i += 1;
         }
       }
@@ -1732,25 +1741,58 @@ constructor(opts: TuiOptions) {
   }
 
   /**
-   * Side-by-side diff (opencode style): left cell = removed (red tint),
-   * right cell = added (green tint), no border, full history width.
+   * Diff rendering. Wide terminals (≥100 cols): side-by-side — left cell =
+   * removed (red tint, old-file line number), right cell = added (green
+   * tint, new-file line number), no border, full history width.
+   * Narrow terminals (<100 cols): unified single-column fallback — one
+   * cell per changed line, `-` red / `+` green, line numbers inline.
    */
   #diffRows(item: TuiItem): string[] {
     const t = item.tool;
     if (!t || !t.diff || !t.diff.length) return [];
     const bodyCols = this.#bodyCols();
-    const leftW = Math.max(4, Math.floor((bodyCols - 1) / 2));
-    const rightW = Math.max(4, bodyCols - 1 - leftW);
     const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
     const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
     const surf = this.#surface();
+    if (bodyCols < DIFF_SIDEBYSIDE_MIN_COLS) return this.#diffRowsUnified(item);
+    // Line-number gutter sized to the largest number actually shown (capped,
+    // so a huge file can't eat the whole row).
+    let maxNo = 0;
+    for (const l of t.diff) maxNo = Math.max(maxNo, l.a ?? 0, l.b ?? 0);
+    const gutter = String(Math.min(maxNo, 99999)).length + 1;
+    const half = bodyCols - 2 - 2 * gutter;
+    const leftW = Math.max(4, Math.floor(half / 2));
+    const rightW = Math.max(4, half - leftW);
     const cell = (bg: string, text: string, w: number): string =>
       `${bg}${this.#clip(text, w)}${RESET}`;
-    const rows = this.#diffPairs(t.diff).map(
-      (p) =>
-        `${cell(p.del ? delBg : surf, p.del ? `- ${p.del}` : "", leftW)} ` +
-        `${cell(p.add ? addBg : surf, p.add ? `+ ${p.add}` : "", rightW)}`,
-    );
+    const rows = this.#diffPairs(t.diff).map((p) => {
+      const noL = p.del?.a ? String(p.del.a).padStart(gutter - 1) : " ".repeat(gutter - 1);
+      const noR = p.add?.b ? String(p.add.b).padStart(gutter - 1) : " ".repeat(gutter - 1);
+      return (
+        `${cell(p.del ? delBg : surf, `${noL} - ${p.del?.s ?? ""}`, leftW)} ` +
+        `${cell(p.add ? addBg : surf, `${noR} + ${p.add?.s ?? ""}`, rightW)}`
+      );
+    });
+    if (t.truncated) {
+      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
+    }
+    return rows;
+  }
+
+  /** Unified single-column fallback for narrow terminals (opencode style). */
+  #diffRowsUnified(item: TuiItem): string[] {
+    const t = item.tool;
+    if (!t || !t.diff || !t.diff.length) return [];
+    const bodyCols = this.#bodyCols();
+    const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
+    const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
+    const cell = (bg: string, text: string): string => `${bg}${this.#clip(text, bodyCols)}${RESET}`;
+    const rows = t.diff.map((l) => {
+      const no = l.t === "del" ? l.a : l.b;
+      const mark = l.t === "del" ? "-" : "+";
+      const bg = l.t === "del" ? delBg : addBg;
+      return cell(bg, `${typeof no === "number" ? `${no} ` : ""}${mark} ${l.s}`);
+    });
     if (t.truncated) {
       rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
     }
@@ -1999,7 +2041,10 @@ constructor(opts: TuiOptions) {
   #paint(): void {
     if (!this.#running) return;
     this.#rows = process.stdout.rows || 24;
-    this.#cols = process.stdout.columns || 80;
+    // A fixed `width` option (test/embedding) wins over the live terminal.
+    if (typeof this.#opts.width !== "number" || this.#opts.width <= 0) {
+      this.#cols = process.stdout.columns || 80;
+    }
     const width = this.#cols;
 
     const view = this.#viewHeight();
