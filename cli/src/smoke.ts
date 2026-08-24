@@ -2246,4 +2246,122 @@ await srv.connect(new StdioServerTransport());
   assert(streamingTps([]) === 0, "streamingTps: 0 with no events");
 }
 
+// --- D#15: Agent Teams (roster + task board + mailbox) ---
+{
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const {
+    addAgent,
+    addTask,
+    claimTask,
+    dispatchTask,
+    loadTeam,
+    readMail,
+    resolveTask,
+    sendMail,
+    setTaskStatus,
+    summarizeTeam,
+  } = await import("./teams.js");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "aih-team-"));
+  try {
+    // roster
+    addAgent(dir, "scout", "research", "You are a careful researcher.");
+    addAgent(dir, "builder");
+    let state = loadTeam(dir);
+    assert(state.agents.length === 2, "team: two agents in roster");
+    assert(state.agents[0].role === "research" && Boolean(state.agents[0].prompt), "team: role + prompt recorded");
+    // re-adding the same name updates, does not duplicate
+    addAgent(dir, "scout", "research+build");
+    state = loadTeam(dir);
+    assert(state.agents.length === 2, "team: add-agent is upsert, not duplicate");
+    assert(state.agents[0].role === "research+build", "team: upsert updates role");
+    // invalid names rejected
+    let threw = false;
+    try { addAgent(dir, "bad name"); } catch { threw = true; }
+    assert(threw, "team: agent name with whitespace rejected");
+
+    // task board
+    const t1 = addTask(dir, "write the report", "draft v1 of the quarterly report");
+    const t2 = addTask(dir, "review the report");
+    state = loadTeam(dir);
+    assert(state.tasks.length === 2, "team: two tasks on the board");
+    assert(state.tasks.every((t) => t.status === "todo"), "team: new tasks start todo");
+    // claim
+    claimTask(dir, t1.id, "scout");
+    state = loadTeam(dir);
+    assert(state.tasks[0].status === "claimed" && state.tasks[0].assignee === "scout", "team: claim sets status+assignee");
+    // double-claim rejected
+    threw = false;
+    try { claimTask(dir, t1.id, "builder"); } catch { threw = true; }
+    assert(threw, "team: claiming a claimed task throws");
+    // prefix resolution (drop the last 2 chars of the random tail; the seq
+    // counter keeps same-millisecond ids distinct, so the prefix is unique)
+    const byPrefix = resolveTask(dir, t2.id.slice(0, -2));
+    assert(byPrefix?.id === t2.id, "team: resolveTask by unique prefix");
+    // status transitions
+    setTaskStatus(dir, t1.id, "done", "report shipped");
+    state = loadTeam(dir);
+    assert(state.tasks[0].status === "done" && state.tasks[0].preview === "report shipped", "team: done + preview recorded");
+    setTaskStatus(dir, t2.id, "cancelled");
+    // summary
+    const s = summarizeTeam(loadTeam(dir));
+    assert(s.agents === 2 && s.done === 1 && s.todo === 0, "team: summarizeTeam counts");
+
+    // mailbox
+    sendMail(dir, "scout", "builder", "report is ready for review");
+    sendMail(dir, "builder", "scout", "looks good, ship it");
+    const inbox = readMail(dir, "builder");
+    assert(inbox.length === 1 && inbox[0].from === "scout", "team: mailbox delivers to the right inbox");
+    assert(readMail(dir, "scout").length === 1, "team: each agent has its own inbox");
+    assert(readMail(dir, "nobody").length === 0, "team: empty inbox for unknown agent");
+
+    // dispatch: claim (idempotent) + spawn a child that echoes the prompt.
+    // We point the CLI at a tiny node script that prints its args so no LLM
+    // is needed and the job finishes fast.
+    const t3 = addTask(dir, "echo task", "say hello from the team");
+    const fakeCli = path.join(dir, "fake-cli.mjs");
+    writeFileSync(fakeCli, `import process from "node:process";\nconsole.log("ARGS " + process.argv.slice(2).join(" ").slice(0, 200));\n`);
+    const { job, child, task } = dispatchTask(dir, t3.id, "builder", { cli: fakeCli });
+    assert(task.status === "claimed" && task.assignee === "builder", "team: dispatch claims the task");
+    assert(job.status === "running", "team: dispatch creates a running job");
+    await new Promise<void>((res) => child.on("close", () => res()));
+    const after = resolveTask(dir, t3.id);
+    assert(Boolean(after?.session) && Boolean(after?.out), "team: dispatch records session + output path on the task");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- T#22: /find — search across tool outputs ---
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  tui.pushTool("run_cmd", { command: "npm test" }, "c1");
+  tui.resolveTool("c1", true, { stdout: "line one\nECONNREFUSED 127.0.0.1:5432\nall green" });
+  tui.pushTool("run_cmd", { command: "ls" }, "c2");
+  tui.resolveTool("c2", true, { stdout: "a.txt\nb.txt" });
+  tui.push({ role: "assistant", text: "the tests failed with a connection error" });
+  // no match
+  let r = tui.searchTools("zzz-not-present");
+  assert(r.n === 0, "/find: no match → n=0");
+  // match (case-insensitive)
+  r = tui.searchTools("econnrefused");
+  assert(r.n === 1, "/find: one line matches");
+  assert(r.matches[0].tool === "run_cmd" && r.matches[0].line === 2, "/find: match points at the right tool + line");
+  assert(r.matches[0].snippet.includes("ECONNREFUSED"), "/find: snippet carries the matched line");
+  // the matched tool is now expanded so the match is visible
+  const t1 = tui.transcriptLines().join("\n");
+  assert(t1.includes("ECONNREFUSED"), "/find: matched tool output is expanded in the transcript");
+  // empty query is a no-op
+  assert(tui.searchTools("   ").n === 0, "/find: blank query → no matches");
+}
+
 console.log("\nAIH cli smoke test passed.");

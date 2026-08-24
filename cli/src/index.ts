@@ -70,6 +70,21 @@ import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
 import { builtinHooks, composeHooks } from "./hooks.js";
 import { loadBoard, spawnJob, cancelJob, jobById, summarize } from "./jobs.js";
+import {
+  addAgent,
+  addTask,
+  agentByName,
+  claimTask,
+  dispatchTask,
+  loadTeam,
+  markRead,
+  readMail,
+  removeAgent,
+  resolveTask,
+  sendMail,
+  setTaskStatus,
+  summarizeTeam,
+} from "./teams.js";
 import { tidyMemory, formatTidyReport } from "./memory-tidy.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
@@ -131,6 +146,8 @@ Usage:
   aih session <list|show|rm|export|fork> [args]
                                fork: aih session fork [source] <target> [--from seq]
   aih stats                       token usage across saved sessions
+  aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
+                               Agent Teams: roster + task board + mailbox (D#15)
   aih skills <list|find|install|show|registry> [args]
                                    manage skills (local + external registry)
                                    find: aih skills find <query> [--install]
@@ -250,6 +267,11 @@ function parseArgs(argv: string[]): ParsedArgs {
     "url",
     "as",
     "a",
+    "role",
+    "prompt",
+    "detail",
+    "note",
+    "sender",
   ]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
@@ -1266,6 +1288,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
       { name: "vivid (concise render)", hint: "/vivid — toggle plain render (no borders/panel)", run: () => handleLine("/vivid") },
       { name: "background jobs", hint: "/bg <prompt> — dispatch a background agent turn (list/cancel)", run: () => handleLine("/bg") },
+      { name: "search tool output", hint: "/find <text> — search across tool outputs (T#22)", run: () => handleLine("/find") },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
@@ -1346,6 +1369,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/dream",
       "/distill",
       "/tidy",
+      "/find",
       "/vivid",
       "/bg",
       "/clear",
@@ -1667,6 +1691,27 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input === "/clear") {
       tui.clearItems();
+      return;
+    }
+    // T#22: /find — search across tool outputs (expanded content, incl. the
+    // 32KB in-band cap). Expands matched tools and scrolls the first hit into
+    // view; results are listed newest-first (capped at 12).
+    if (input === "/find" || input.startsWith("/find ")) {
+      const q = input === "/find" ? "" : input.slice("/find ".length).trim();
+      if (!q) {
+        tui.pushSystem("usage: /find <text> — search tool outputs (e.g. /find ECONNREFUSED)\n  (full output beyond the 32KB cap: run_cmd keep_output=true → output_file)");
+        return;
+      }
+      const { n, matches } = tui.searchTools(q);
+      if (!n) {
+        tui.pushSystem(`no tool output matched "${q}"`);
+        return;
+      }
+      const rows = matches
+        .slice(-12)
+        .reverse()
+        .map((m) => `  ${m.tool} · line ${m.line}  ${m.snippet}`);
+      tui.pushSystem(`found ${n} line(s) matching "${q}" (showing last ${rows.length}):\n${rows.join("\n")}`);
       return;
     }
     // D#13: /bg — background tasks (dispatch + status + cancel)
@@ -2553,6 +2598,201 @@ function cmdTidy(positionals: string[], flags: Record<string, string | boolean>)
   }
 }
 
+/**
+ * D#15 — Agent Teams (minimal): roster + task board + mailbox.
+ *
+ *   aih team list                       roster + task board + inbox counts
+ *   aih team add-agent <name> [--role R] [--prompt P]
+ *   aih team rm-agent <name>
+ *   aih team add-task <title...> [--detail D]
+ *   aih team claim <task> --as <agent>
+ *   aih team done|fail|cancel <task> [--note N]
+ *   aih team dispatch <task> --as <agent>   (synchronous agent turn)
+ *   aih team mail <to> <body...> [--sender F]
+ *   aih team inbox <agent> [--unread]
+ */
+function cmdTeam(positionals: string[], flags: Record<string, string | boolean>) {
+  const cwd = process.cwd();
+  const sub = positionals.shift() ?? "list";
+  const as = str(flags, "as");
+  const icon = (s: string): string =>
+    s === "todo" ? "◻" : s === "claimed" ? "▶" : s === "done" ? "✓" : s === "failed" ? "✗" : "⊘";
+
+  switch (sub) {
+    case "list":
+    case "ls": {
+      const state = loadTeam(cwd);
+      const s = summarizeTeam(state);
+      if (!state.agents.length && !state.tasks.length) {
+        console.log("no team yet — aih team add-agent <name> [--role R] [--prompt P]");
+        return;
+      }
+      console.log(`team @ ${cwd}`);
+      console.log(`  agents: ${s.agents}   tasks: ${s.todo} todo · ${s.claimed} claimed · ${s.done} done · ${s.failed} failed`);
+      for (const a of state.agents) {
+        console.log(`  ● ${a.name}${a.role ? `  — ${a.role}` : ""}${a.prompt ? "  (has prompt)" : ""}`);
+      }
+      const recent = state.tasks.slice(-15).reverse();
+      for (const t of recent) {
+        console.log(`  ${icon(t.status)} ${t.id}  ${t.title}  [${t.status}${t.assignee ? ` · ${t.assignee}` : ""}]${t.preview ? `\n      ${t.preview}` : ""}`);
+      }
+      for (const a of state.agents) {
+        const mail = readMail(cwd, a.name);
+        if (mail.length) console.log(`  ✉ ${a.name}: ${mail.length} message(s) in inbox`);
+      }
+      return;
+    }
+    case "add-agent":
+    case "agent": {
+      const name = positionals.shift();
+      if (!name) {
+        console.error("error: usage: aih team add-agent <name> [--role R] [--prompt P]");
+        process.exit(1);
+      }
+      const agent = addAgent(cwd, name, str(flags, "role"), str(flags, "prompt"));
+      console.log(`added agent ${agent.name}${agent.role ? ` (${agent.role})` : ""}`);
+      return;
+    }
+    case "rm-agent": {
+      const name = positionals.shift();
+      if (!name) {
+        console.error("error: usage: aih team rm-agent <name>");
+        process.exit(1);
+      }
+      if (removeAgent(cwd, name)) console.log(`removed agent ${name}`);
+      else {
+        console.error(`error: no agent "${name}"`);
+        process.exit(1);
+      }
+      return;
+    }
+    case "add-task":
+    case "task": {
+      const title = positionals.join(" ").trim();
+      if (!title) {
+        console.error("error: usage: aih team add-task <title...> [--detail D]");
+        process.exit(1);
+      }
+      const t = addTask(cwd, title, str(flags, "detail"));
+      console.log(`added task ${t.id}: ${t.title}`);
+      return;
+    }
+    case "claim": {
+      const ref = positionals.shift();
+      if (!ref || !as) {
+        console.error("error: usage: aih team claim <task> --as <agent>");
+        process.exit(1);
+      }
+      try {
+        const t = claimTask(cwd, ref, as);
+        console.log(`claimed ${t.id} for ${as}`);
+      } catch (err) {
+        console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+      return;
+    }
+    case "done":
+    case "fail":
+    case "cancel": {
+      const ref = positionals.shift();
+      if (!ref) {
+        console.error(`error: usage: aih team ${sub} <task> [--note N]`);
+        process.exit(1);
+      }
+      const status = sub === "done" ? "done" : sub === "fail" ? "failed" : "cancelled";
+      try {
+        const t = setTaskStatus(cwd, ref, status, str(flags, "note"));
+        console.log(`${t.id} → ${status}`);
+      } catch (err) {
+        console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+      return;
+    }
+    case "dispatch": {
+      const ref = positionals.shift();
+      if (!ref || !as) {
+        console.error("error: usage: aih team dispatch <task> --as <agent>");
+        process.exit(1);
+      }
+      if (!agentByName(cwd, as)) {
+        // allow dispatching to a name not in the roster (still recorded) —
+        // but warn so typos surface.
+        console.error(`warning: agent "${as}" is not in the roster (aih team add-agent ${as})`);
+      }
+      const cliPath = fileURLToPath(new URL("./index.js", import.meta.url));
+      let job: ReturnType<typeof dispatchTask>["job"];
+      let child: ReturnType<typeof dispatchTask>["child"];
+      let task: ReturnType<typeof dispatchTask>["task"];
+      try {
+        ({ job, child, task } = dispatchTask(cwd, ref, as, { cli: cliPath }));
+      } catch (err) {
+        console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+      // Synchronous dispatch: wait for the agent turn, mirror the outcome onto
+      // the task board, report, and exit with the child's code. (spawnJob
+      // pipes the child's stdio, so the CLI process stays alive until it
+      // finishes anyway — a "background" dispatch from a non-interactive CLI
+      // would just look hung. True backgrounding is the TUI's /bg, which owns
+      // the child handle in a long-lived process.)
+      const finish = (code: number | null, err?: Error): void => {
+        try {
+          const finished = resolveTask(cwd, task.id);
+          if (finished && (finished.status === "todo" || finished.status === "claimed")) {
+            setTaskStatus(cwd, task.id, code === 0 ? "done" : "failed", finished?.preview ?? (err ? `spawn error: ${err.message}` : undefined));
+          }
+        } catch {
+          /* board mirror is best-effort */
+        }
+        const t = resolveTask(cwd, task.id);
+        const status = t?.status ?? (code === 0 ? "done" : "failed");
+        console.log(`${icon(status)} task ${task.id} ${status}${t?.preview ? ` — ${t.preview}` : err ? ` — ${err.message}` : ""}`);
+        console.log(`  output: ${job.out}`);
+        process.exit(code === 0 ? 0 : 1);
+      };
+      child.on("close", (code) => finish(code));
+      child.on("error", (err) => finish(null, err));
+      console.log(`▶ dispatching ${task.id} as ${as}…`);
+      return;
+    }
+    case "mail": {
+      const to = positionals.shift();
+      const body = positionals.join(" ").trim();
+      if (!to || !body) {
+        console.error("error: usage: aih team mail <to> <body...> [--sender F]");
+        process.exit(1);
+      }
+      const m = sendMail(cwd, str(flags, "sender") ?? "cli", to, body);
+      console.log(`✉ ${m.from} → ${m.to}: ${m.body}`);
+      return;
+    }
+    case "inbox": {
+      const to = positionals.shift();
+      if (!to) {
+        console.error("error: usage: aih team inbox <agent> [--unread]");
+        process.exit(1);
+      }
+      const unread = bool(flags, "unread");
+      const mail = readMail(cwd, to, unread);
+      if (!mail.length) {
+        console.log(`no ${unread ? "unread " : ""}messages for ${to}`);
+        return;
+      }
+      for (const m of mail) {
+        const when = new Date(m.ts).toISOString().replace("T", " ").slice(0, 19);
+        console.log(`  [${when}] ${m.from}: ${m.body}`);
+      }
+      if (!unread) markRead(cwd, to);
+      return;
+    }
+    default:
+      console.error(`error: unknown team subcommand "${sub}" (list|add-agent|rm-agent|add-task|claim|done|fail|cancel|dispatch|mail|inbox)`);
+      process.exit(1);
+  }
+}
+
 /** P2#9 — config `$schema` for editor autocompletion. */
 const AIH_SCHEMA_URL = "https://aih.dev/schema/aih.schema.json";
 function aihSchemaPath(): string {
@@ -3017,6 +3257,8 @@ async function main() {
     }
     case "stats":
       return cmdStats();
+    case "team":
+      return cmdTeam(positionals, flags);
     case "tidy":
       return cmdTidy(positionals, flags);
     case "distill":

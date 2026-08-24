@@ -212,7 +212,9 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 - **三处展示**：TUI Context 面板加 `cost $x.xx · N tok/s` 行；`/usage` 输出累计成本 + 吞吐；
   `aih stats`（非交互）输出成本 + 吞吐
 - **TPS** 为会话平均吞吐（总 token / 时间跨度），数据可推导、可单测；
-  逐请求流式 TPS 为剩余增量
+  **逐请求流式 TPS 已交付**——`streamingTps()` 用完成 token / 真实生成毫秒
+  （`turn/end.genMs`，流式响应自请求至末个 delta 计时），三处展示为 `stps` /
+  `stream N tok/s`；mock / 非流式无 `genMs` 时为 0
 - 无价目表匹配时成本显示 `—` 并提示配置 `prices`；mock 模式无 usage 数据，成本/TPS 不显示
 - 冒烟测试覆盖：价格解析（精确/子串/大小写/用户覆盖/未命中）、成本计算、TPS 边界、格式化
 
@@ -220,9 +222,12 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 
 `.aih/memory.md` 是 agent 自己维护的持久知识（与 APP.md"人写契约"分离）：
 
-- `remember` 工具写入：`action=append` 追加带日期条目 / `action=set` 整体重写
-- 每轮自动注入 system prompt（预算 `AIH_MEMORY_BUDGET`，默认 4000 字符，超出截断）
-- TUI `/memory` 查看当前记忆
+- `remember` 工具写入：`action=append` 追加带日期条目 / `action=set` 整体重写；
+  `scope` 可选 `project`（`.aih/memory.md`）/ `user`（XDG 用户目录 `memory.md`）
+- 每轮自动注入 system prompt（项目 + 用户两级合并，预算 `AIH_MEMORY_BUDGET`，
+  默认 4000 字符，超出截断）
+- TUI `/memory` 查看当前记忆；`/tidy [project|user]` 确定性去重
+  （保留最新日期副本，`/tidy apply` 写入）
 
 ### Dream / Distill（会话即资产）
 
@@ -319,6 +324,26 @@ LLM 裁判调用从候选答案里选出最佳（`{"best": <index>, "reason": ".
 `ToolRegistry`。冒烟覆盖：裁判解析/越界回退、`mapOrdered` 顺序与并发上限、
 N=3 全流程、n 钳制、全失败路径、子代理防递归（剔除 task/question/best_of_n）。
 
+### Agent Teams（roster + 任务板 + mailbox）
+
+在子代理原语之上的协作层（roadmap D#15）：`.aih/team/` 下的纯文件团队工作区，
+`aih team` 管理名册、任务板与每 agent 的 mailbox：
+
+```sh
+aih team add-agent scout --role research --prompt "You are a careful researcher."
+aih team add-task "write the report" --detail "draft v1"
+aih team claim <task> --as scout
+aih team dispatch <task> --as scout   # 跑一个同步 agent turn，结果镜像回任务板
+aih team done <task> --note "shipped"
+aih team mail builder "report ready" --sender scout
+aih team inbox builder [--unread]
+aih team list                         # 名册 + 任务板 + inbox 计数
+```
+
+任务 id 支持唯一前缀解析；`dispatch` 复用 D#13 的 `spawnJob`（作业板
+`.aih/jobs.json` 记录运行态），完成后把 done/failed + 预览写回任务板；
+需要后台并行时用 TUI `/bg`（长驻进程持有子进程句柄）。
+
 ### Builtin Skills（内置技能）
 
 技能是可复用的指令包（YAML frontmatter + 正文），让 agent "接入即懂行"：
@@ -340,6 +365,22 @@ npm run cli -- skills show app-tour               # 查看正文
 
 同名时项目覆盖用户覆盖内置；会话与 `run` 中技能清单注入 system prompt，模型按需
 调用 `load_skill` 加载全文；TUI `/skills` 列出、`/<技能名>` 直接注入。
+
+**技能相关性自动加载**（roadmap P1#4，`cli/src/bm25.ts`）：每轮开始前用 BM25
+对已装技能做相关性排序（CJK 按字符 bigram 分词），命中技能以"建议加载"提示
+注入本轮上下文，模型可直接 `load_skill`；`aih skills suggest <query>` 可离线
+查看同一排序。另：`SKILL.md` front matter 支持 `secretPatterns`（见"安全与调试"）。
+
+### 后台任务（`/bg`）与沙箱 seam
+
+- **后台任务**（roadmap D#13）：TUI `/bg <prompt>` 把一次 agent turn 派生成
+  后台子进程（`aih run --session bg-<id>`），TUI 保持响应；状态行实时显示
+  running/done/failed 计数，完成时把最终答案作为 system 消息回显；
+  `/bg list` / `/bg cancel <id>` 管理；作业板落 `.aih/jobs.json`，重启 TUI 仍在。
+  `distill` / `tidy` 等纯 CLI 子命令也可作为后台作业派发。
+- **沙箱 seam**（roadmap D#12）：`run_cmd` 的执行后端可替换——
+  `local`（默认）/ `bwrap` / `remote`（`cli/src/sandbox.ts` 的 `SandboxBackend`
+  接口，`AIH_SANDBOX` 或工具参数 `sandbox` 选择）；先定接口，默认本地。
 
 ### 权限模型（allow / ask / deny）
 
@@ -371,7 +412,10 @@ opencode / MiMo-Code 风格全屏 TUI：
 - **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；`exit`（或 `/quit`，
   `ctrl-c` 清空输入再按退出）还原终端；忙碌中 `ctrl-c` 取消当前轮不退出
 - 斜杠命令：`/mode` `/goal` `/tools` `/model <id>`（热切换）`/usage` `/compact [focus]` `/clear`
-  `/inject <text>` `/events` `/skills` `/vivid` `/ <技能名>`
+  `/inject <text>` `/events` `/skills` `/vivid` `/bg <prompt>` `/find <text>` `/ <技能名>`
+- **`/find <text>`**：跨所有工具输出逐行检索（含 32KB 内带上限的展开内容），
+  命中工具自动展开并滚动到首个命中，列出最近 12 条命中（`tool · line · 片段`）；
+  超出内带上限的全量输出用 `run_cmd keep_output=true` 落盘 `.aih/outputs/*.log`
 - **`/vivid` 简洁渲染**：切换 plain 模式——去掉边框/底色/侧栏/状态提示等 chrome，
   只留正文（适合低带宽/远程/日志回放）；再按一次还原完整主题
 - 会话标题：首轮后自动 LLM 生成 2–6 词标题（`<name>.jsonl.meta.json`），状态栏与
@@ -415,6 +459,12 @@ plan 模式下所有 `ask` 写工具自动隐藏。未对齐 opencode 的仅 `ls
 - **技能名册上下文预算**：系统提示里的 `## Skills` 名册受上下文预算约束
   （窗口已知时取 2%，未知时上限 8000 字符）。超限时先截短各技能描述、
   仍超则省略尾部技能并附提示，避免技能越多越挤占正文上下文。
+- **工具结果脱敏 + 计时钩子**（roadmap D#11）：默认开启的内置钩子在工具结果
+  进入 LLM / 会话日志 / 审计前，把常见凭据形状（`sk-…` / `ghp_…` / `AKIA…` /
+  `xox…` / `api_key=…` 等）替换为 `[REDACTED]` 并附 `redacted: N` 计数与
+  `duration_ms` 计时；`--no-redact` 关闭脱敏。技能可在 `SKILL.md` front matter
+  用 `secretPatterns`（分号分隔的正则源）声明额外秘密形状，非法正则自动跳过，
+  内置表始终生效。实现见 `cli/src/hooks.ts`。
 
 ---
 
@@ -631,7 +681,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
 | 项目记忆（memory.md + 注入预算） | — | — | ✅ | — | ✅ |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
-| 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ✅ 串行 `task` + **并行 `best_of_n`**（Max Mode，P2#9） |
+| 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ✅ 串行 `task` + **并行 `best_of_n`**（Max Mode，P2#9）+ **Agent Teams**（D#15） |
 | 并行工具调用（读类 ≤N 有界并发） | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29（写类恒串行） |
 | 技能层（SKILL.md 三级加载） | — | ✅ | ✅ | — | ✅ |
 | plan/build 双模式 | — | ✅ | ✅ | — | ✅ |
@@ -640,7 +690,8 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 会话自进化（dream/distill 挖掘记忆+流程） | — | — | ◐ MEMORY | — | ✅ `/dream`+`/distill`（P2#7，只建议不自动写） |
 | 确定性 Workflow（阶段脚本） | — | — | ✅ | — | ✅ `.aih/workflows/*.mjs` |
 | 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
-| 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ |
+| 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ 审计 + **脱敏/计时 + 技能驱动 `secretPatterns`**（D#11） |
+| 工具输出搜索 / 全量落盘 | — | ◐ | ◐ | — | ✅ `/find` + `run_cmd keep_output`（T#22） |
 | 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
 | curl\|bash 一键安装 | — | ◐ | ✅ | — | ✅ |
 | CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
@@ -651,7 +702,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
-- **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）—— 余：沙箱 seam、后台 jobs（roadmap D/F）。
+- **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子（✅ D#11 脱敏/计时 + 技能驱动）、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）、后台 jobs（✅ D#13）、Agent Teams（✅ D#15）—— 余：沙箱 seam（✅ D#12 接口已留，默认本地）。
 - **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）。余：checkpoint 回滚。
 - **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS ✅ F#30；side-by-side diff ✅ F#31（双色单元格 + 行号列 + 窄屏回退）。
 - **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。

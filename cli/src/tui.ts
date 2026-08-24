@@ -111,7 +111,7 @@ const HELP_LINES: string[] = [
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
   bold("commands"),
-  "    /skills · /usage · /compact · /checkpoint · /restore · /fork · /vivid · /help · /exit",
+  "    /skills · /usage · /compact · /checkpoint · /restore · /fork · /find · /vivid · /exit",
 ];
 
 const TOOL_ICONS: Record<string, string> = {
@@ -1331,6 +1331,54 @@ constructor(opts: TuiOptions) {
 
   #follow(): void {
     this.#scrollTop = Math.max(0, this.#contentLines() - this.#viewHeight());
+  }
+
+  /**
+   * T#22 — search across tool outputs (the expanded content, incl. the 32KB
+   * in-band cap). Returns matches in transcript order; expands any matched
+   * tool (and its collapsed group) and scrolls the first match into view.
+   */
+  searchTools(query: string): { n: number; matches: Array<{ item: number; tool: string; callId: string; line: number; snippet: string }> } {
+    const q = query.toLowerCase();
+    const matches: Array<{ item: number; tool: string; callId: string; line: number; snippet: string }> = [];
+    if (!q) return { n: 0, matches };
+    this.#items.forEach((it, idx) => {
+      const t = it.tool;
+      if (!t || typeof t.output !== "string" || !t.output.trim()) return;
+      const lines = t.output.split("\n");
+      for (let li = 0; li < lines.length; li += 1) {
+        if (lines[li].toLowerCase().includes(q)) {
+          matches.push({
+            item: idx,
+            tool: t.name,
+            callId: t.callId,
+            line: li + 1,
+            snippet: lines[li].trim().slice(0, 96),
+          });
+          if (matches.length >= 50) return;
+        }
+      }
+    });
+    if (!matches.length) return { n: 0, matches };
+    // Expand the matched tools (and any collapsed group they live in) so the
+    // match is actually visible, then scroll the first match into view.
+    const first = matches[0].item;
+    const units = this.#units();
+    for (const u of units) {
+      if (u.kind === "group" && u.start <= first && first < u.start + u.items.length) {
+        this.#groupOpen.set(u.start, true);
+        this.#groupCache.delete(u.start);
+      }
+    }
+    const it = this.#items[first];
+    if (it.tool) it.tool.expanded = true;
+    this.#invalidateItem(it);
+    // best-effort scroll: land the first match ~1/3 down the viewport
+    const view = this.#viewHeight();
+    const target = Math.max(0, this.#contentLines() - view);
+    this.#scrollTop = Math.max(0, Math.min(target, Math.max(0, target - 3)));
+    this.requestPaint();
+    return { n: matches.length, matches };
   }
 
   #viewHeight(): number {

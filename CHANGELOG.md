@@ -29,6 +29,25 @@ the versions listed here (`scripts/package` derives the version from
 - **Repo hygiene** (F#32): this changelog and `.devcontainer/` giving
   in-container agents a stable environment (`postCreateCommand` bootstraps and
   builds automatically).
+- **User-level memory + background jobs + memory tidy** (P0#2 / D#13 / E#17):
+  `remember` gains `scope: project|user`; `/bg <prompt>` dispatches isolated
+  background agent turns with a live status line; `aih tidy` / `aih distill`
+  dedup memory and mine repeated flows.
+- **BM25 skill relevance + streaming TPS** (P1#4 / F#30): installed skills are
+  ranked against the user query and auto-surfaced before each turn; per-request
+  streaming throughput (completion tokens / real generation ms) is shown in
+  `/usage`, `aih stats`, and the TUI context panel.
+- **Skill-driven hook config** (D#11): a skill's `SKILL.md` front matter may
+  declare `secretPatterns` (semicolon-separated regex sources) that the
+  built-in redaction hook masks in addition to the credential table; invalid
+  patterns are skipped and never break the turn.
+- **Agent Teams (minimal)** (D#15): `aih team` manages a roster, a task board,
+  and a per-agent mailbox under `.aih/team/`; `dispatch` runs one agent turn
+  against a claimed task and mirrors the outcome back onto the board.
+- **`/find` tool-output search** (T#22): search across every tool's output
+  (the expanded content, including the 32KB in-band cap), expand matched tools
+  and scroll the first hit into view; `run_cmd keep_output=true` still persists
+  the full uncapped output for external inspection.
 
 ## [0.2.0]
 
