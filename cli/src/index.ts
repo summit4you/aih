@@ -1185,6 +1185,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/models",
       "/usage",
       "/compact",
+      "/checkpoint",
+      "/restore",
       "/clear",
       "/inject",
       "/events",
@@ -1440,6 +1442,72 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.clearItems();
       return;
     }
+    // F#28: checkpoint / restore (append-only rollback to a marker)
+    if (input === "/checkpoint" || input.startsWith("/checkpoint ")) {
+      const note = input === "/checkpoint" ? "" : input.slice("/checkpoint ".length).trim();
+      if (busy) {
+        tui.pushSystem("finish the current turn before checkpointing");
+        return;
+      }
+      const cp = log.checkpoint(note || undefined, usedTokens || undefined);
+      if (sessionPath) saveSession(sessionPath, log);
+      tui.pushSystem(
+        `checkpoint #${cp.seq} recorded${note ? ` — ${note}` : ""}\nrestore later with /restore [seq] (rolls back context to that point; the discarded suffix stays auditable in the log)`,
+      );
+      return;
+    }
+    if (input === "/restore" || input.startsWith("/restore ")) {
+      if (busy) {
+        tui.pushSystem("finish the current turn before restoring");
+        return;
+      }
+      const arg = input === "/restore" ? "" : input.slice("/restore ".length).trim();
+      const cps = log.all().filter((e) => e.type === "checkpoint");
+      if (cps.length === 0) {
+        tui.pushSystem("no checkpoints yet — record one with /checkpoint [note]");
+        return;
+      }
+      let target: (SessionEvent & { type: "checkpoint" }) | undefined = log.latestCheckpoint();
+      if (!target) {
+        tui.pushSystem("no checkpoints yet — record one with /checkpoint [note]");
+        return;
+      }
+      if (arg) {
+        const want = Number.parseInt(arg, 10);
+        target = cps.find(
+          (c): c is SessionEvent & { type: "checkpoint" } => c.type === "checkpoint" && c.seq === want,
+        );
+        if (!target) {
+          tui.pushSystem(
+            `no checkpoint at seq ${arg} — available: ${cps.map((c) => `#${c.seq}${(c as { note?: string }).note ? ` (${(c as { note?: string }).note})` : ""}`).join(", ")}`,
+          );
+          return;
+        }
+      }
+      const restored = log.restoreTo(target.seq);
+      // Append-only: snapshot the FULL pre-restore history to a side file so
+      // the discarded suffix stays auditable (the live file will be rewritten
+      // to the restored prefix below).
+      let snapshot = "";
+      if (sessionPath) {
+        const base = basename(sessionPath).replace(/\.jsonl$/, "");
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const snapName = `${base}-pre-restore-${stamp}.jsonl`;
+        const snapPath = join(dirname(sessionPath), snapName);
+        saveSession(snapPath, log);
+        snapshot = snapName;
+      }
+      log.adopt(restored);
+      tui.clearItems();
+      replayHistory(tui, restored.all());
+      if (sessionPath) saveSession(sessionPath, log);
+      usedTokens = target.contextTokens ?? 0;
+      tui.pushSystem(
+        `restored to checkpoint #${target.seq}${target.note ? ` — ${target.note}` : ""}\n` +
+          `context now rolls back to that point; the discarded suffix was snapshotted to ${snapshot || "(ephemeral — no session file)"} for audit`,
+      );
+      return;
+    }
     if (input === "/tools") {
       const rows: string[] = [];
       for (const schema of registry.schemas()) {
@@ -1621,7 +1689,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input.startsWith("/")) {
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /skills /inject /events /clear /exit`,
       );
       return;
     }
@@ -1810,6 +1878,77 @@ function cmdSessionFork(source: string | undefined, target: string, fromSeq?: st
   saveSession(dstPath, log);
   console.log(
     `forked ${src} (from seq ${from}) -> ${target} (${log.all().length} events)`,
+  );
+}
+
+/** F#28: record a named checkpoint marker in a session (append-only). */
+function cmdSessionCheckpoint(name: string | undefined, note: string | undefined) {
+  const src = name ?? latestSessionNameOrExit();
+  const srcPath = join(SESSIONS_DIR, `${src}.jsonl`);
+  if (!existsSync(srcPath)) {
+    console.error(`error: no such session: ${src}`);
+    process.exit(1);
+  }
+  const log = SessionLog.fromEvents(readSessionEvents(src));
+  const cp = log.checkpoint(note);
+  saveSession(srcPath, log);
+  console.log(
+    `checkpoint #${cp.seq} recorded in ${src}` +
+      (note ? ` — ${note}` : "") +
+      `\nrestore later with: aih session restore ${src} [seq]   (or /restore in the TUI)`,
+  );
+}
+
+/**
+ * F#28: restore a session to a checkpoint = fork + pointer switch.
+ * The ORIGINAL session file is left untouched (append-only, fully auditable);
+ * the restored prefix is written to `<name>-restore-<seq>.jsonl`, which the
+ * user then resumes (aih chat --session <name>-restore-<seq>).
+ */
+function cmdSessionRestore(name: string, seqArg: string | undefined) {
+  const srcPath = join(SESSIONS_DIR, `${name}.jsonl`);
+  if (!existsSync(srcPath)) {
+    console.error(`error: no such session: ${name}`);
+    process.exit(1);
+  }
+  const events = readSessionEvents(name);
+  const log = SessionLog.fromEvents(events);
+  let cp: (SessionEvent & { type: "checkpoint" }) | undefined;
+  if (seqArg != null) {
+    const want = Number.parseInt(seqArg, 10);
+    if (!Number.isFinite(want)) {
+      console.error(`error: bad checkpoint seq: ${seqArg}`);
+      process.exit(1);
+    }
+    cp = events.find((e) => e.type === "checkpoint" && e.seq === want) as
+      | (SessionEvent & { type: "checkpoint" })
+      | undefined;
+    if (!cp) {
+      console.error(`error: no checkpoint at seq ${want} in ${name}`);
+      process.exit(1);
+    }
+  } else {
+    cp = log.latestCheckpoint();
+    if (!cp) {
+      console.error(
+        `error: no checkpoints in ${name} (record one with: aih session checkpoint ${name} [note])`,
+      );
+      process.exit(1);
+    }
+  }
+  const target = `${name}-restore-${cp.seq}`;
+  const dstPath = join(SESSIONS_DIR, `${target}.jsonl`);
+  if (existsSync(dstPath)) {
+    console.error(`error: session already exists: ${target} (rm it first)`);
+    process.exit(1);
+  }
+  const restored = log.restoreTo(cp.seq);
+  saveSession(dstPath, restored);
+  const dropped = events.length - restored.all().length;
+  console.log(
+    `restored ${name} @ checkpoint #${cp.seq}${cp.note ? ` — ${cp.note}` : ""} → ${target}\n` +
+      `kept ${restored.all().length} events, dropped ${dropped}; original ${name} untouched (full history stays auditable)\n` +
+      `resume with: aih chat --session ${target}`,
   );
 }
 
@@ -2190,7 +2329,20 @@ async function main() {
         }
         return cmdSessionFork(positionals[0], positionals[1], str(flags, "from"));
       }
-      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|fork)`);
+      if (sub === "checkpoint") {
+        // aih session checkpoint [name] [note...]  — name defaults to latest session
+        const name = positionals[0] && !positionals[0].startsWith("-") ? positionals[0] : undefined;
+        const note = (positionals.slice(name ? 1 : 0).join(" ").trim() || undefined);
+        return cmdSessionCheckpoint(name, note);
+      }
+      if (sub === "restore") {
+        if (!positionals[0]) {
+          console.error("error: usage: aih session restore <name> [checkpoint-seq]");
+          process.exit(1);
+        }
+        return cmdSessionRestore(positionals[0], positionals[1]);
+      }
+      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|fork|checkpoint|restore)`);
       process.exit(1);
     }
     case "stats":

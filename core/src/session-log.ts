@@ -52,6 +52,52 @@ export class SessionLog {
     return child;
   }
 
+  /**
+   * Record a named checkpoint (roadmap F#28). Append-only: the event is just a
+   * marker; restoring never rewrites history.
+   */
+  checkpoint(note?: string, contextTokens?: number): SessionEvent & { type: "checkpoint" } {
+    return this.append({
+      type: "checkpoint",
+      ...(note ? { note } : {}),
+      ...(contextTokens != null ? { contextTokens } : {}),
+    }) as SessionEvent & { type: "checkpoint" };
+  }
+
+  /** Latest checkpoint at or before `beforeSeq` (inclusive), if any. */
+  latestCheckpoint(beforeSeq = Infinity):
+    | (SessionEvent & { type: "checkpoint" })
+    | undefined {
+    for (let i = this.#events.length - 1; i >= 0; i -= 1) {
+      const e = this.#events[i];
+      if (e.type === "checkpoint" && e.seq <= beforeSeq) return e;
+    }
+    return undefined;
+  }
+
+  /**
+   * Restore to a checkpoint (F#28): returns a NEW log containing only events
+   * up to and including the marker (restore = prefix, not deletion), so the
+   * discarded suffix survives in the original log / session file for audit.
+   */
+  restoreTo(checkpointSeq: number): SessionLog {
+    const child = new SessionLog();
+    child.#events = this.#events
+      .filter((e) => e.seq <= checkpointSeq)
+      .map((e) => ({ ...e }));
+    return child;
+  }
+
+  /**
+   * In-place pointer switch to another log's events (F#28 `/restore`): the
+   * live log object keeps its identity (exit-save closures stay valid) while
+   * its event list is replaced by the restored prefix. Seq numbers are kept,
+   * so appends after the switch continue the restored timeline.
+   */
+  adopt(other: SessionLog): void {
+    this.#events = other.all().map((e) => ({ ...e }));
+  }
+
   deriveMessages(systemPrompt?: string): ChatMessage[] {
     let compact: Extract<SessionEvent, { type: "compaction" }> | undefined;
     for (const event of this.#events) {

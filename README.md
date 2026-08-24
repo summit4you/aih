@@ -162,6 +162,20 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 `… N more line(s)`。实现位于 `cli/src/diff.ts`（也随 MCP 工具结果返回 `_diff`
 字段，可被任意客户端渲染）。
 
+### 检查点与回滚（checkpoint / restore）
+
+结构化"可回滚快照点"（roadmap F#28，升级 P0#1 剩余增量）：
+
+- `checkpoint` 事件是**追加式标记**（`SessionLog.checkpoint(note?, contextTokens?)`），
+  不重写任何历史；`restoreTo(seq)` 派生"到该标记为止"的前缀，`adopt()` 原地切换指针
+- CLI：`aih session checkpoint [name] [note...]` 记录标记；
+  `aih session restore <name> [seq]` 把前缀分叉为 `<name>-restore-<seq>` 新会话——
+  **原会话文件不动**，append-only 全量历史仍可审计
+- TUI：`/checkpoint [note]` 与 `/restore [seq]`；回滚前自动把完整历史快照到
+  `*-pre-restore-<时间戳>.jsonl`，被丢弃的后缀随时可查
+- 冒烟测试覆盖：标记追加、前缀派生、指针切换后 seq 续接、`deriveMessages` 跳过标记、
+  拒绝覆盖、坏 seq / 无标记报错
+
 ### Persistent Memory（持久记忆）
 
 `.aih/memory.md` 是 agent 自己维护的持久知识（与 APP.md"人写契约"分离）：
@@ -223,6 +237,9 @@ npm run cli -- session list                       # 列出
 npm run cli -- session show work                  # 人类可读回放
 npm run cli -- session export work  > work.json   # 导出为 JSON
 npm run cli -- session fork default branch-a --from 7   # 从事件序 7 分叉出新会话
+npm run cli -- session checkpoint work "before risky refactor"   # 记录检查点（F#28）
+npm run cli -- session restore work   # 回滚：前缀分叉为 work-restore-<seq>（原文件不动）
+# TUI 内：/checkpoint [note] 与 /restore [seq]（回滚前自动快照完整历史）
 npm run cli -- session rm work                    # 删除
 npm run cli -- stats                              # 所有会话 token 用量汇总
 ```
@@ -532,7 +549,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 权限规则集（pattern/路径作用域/last-match） | ◐ 沙箱视角 | ✅ | ✅ | — | ✅ |
 | doom_loop 死循环守卫 | ◐ 钩子拦截 | ✅ | ✅ | — | ✅ |
 | 上下文压缩（主动+被动+手动 /compact） | — | ✅ | ✅ | — | ✅ 三路+手动 |
-| 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ◐ roadmap F#28 |
+| 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
 | 项目记忆（memory.md + 注入预算） | — | — | ✅ | — | ✅ |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
 | 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ◐ 串行 task |
@@ -558,7 +575,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）→ 未做；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）→ 未做；⑥ side-by-side diff（MiMo，此前已承诺）→ ◐ 核心已交付：edit/write/apply_patch 双色单元格（红删/绿加，明暗双主题）；余行号列与窄屏回退；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
+**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore`（余 worktree 摘要）；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）→ 未做；⑥ side-by-side diff（MiMo，此前已承诺）→ ◐ 核心已交付：edit/write/apply_patch 双色单元格（红删/绿加，明暗双主题）；余行号列与窄屏回退；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
 
 一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
 

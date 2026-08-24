@@ -104,6 +104,33 @@ assert(derived.filter((m) => m.role === "tool").length === 2, "both tool results
 const forked = log.fork();
 assert(forked.all().length === events.length, "fork copies full history");
 
+// --- F#28: checkpoint / restore (append-only, prefix semantics) -------------
+{
+  const clog = new SessionLog();
+  clog.append({ type: "user/message", turnId: "t1", text: "turn one" });
+  clog.append({ type: "assistant/message", turnId: "t1", text: "reply one", toolCalls: [] });
+  const cp = clog.checkpoint("before risky refactor", 1234);
+  assert(cp.type === "checkpoint" && cp.note === "before risky refactor", "checkpoint appends a marker event");
+  assert(cp.contextTokens === 1234, "checkpoint records context-token snapshot");
+  clog.append({ type: "user/message", turnId: "t2", text: "turn two" });
+  clog.append({ type: "assistant/message", turnId: "t2", text: "reply two", toolCalls: [] });
+  assert(clog.all().length === 5, "post-checkpoint events keep appending");
+  assert(clog.latestCheckpoint()!.seq === cp.seq, "latestCheckpoint finds the marker");
+  assert(clog.latestCheckpoint(cp.seq - 1) === undefined, "latestCheckpoint respects the beforeSeq bound");
+  const restored = clog.restoreTo(cp.seq);
+  assert(restored.all().length === 3, "restoreTo keeps the prefix up to and including the marker");
+  assert(restored.all()[2].type === "checkpoint", "the marker itself survives the restore");
+  assert(clog.all().length === 5, "original log keeps the full history (append-only)");
+  clog.adopt(restored);
+  assert(clog.all().length === 3, "adopt switches the live log pointer in place");
+  clog.append({ type: "user/message", turnId: "t3", text: "turn three" });
+  const last = clog.all()[clog.all().length - 1];
+  assert(last.seq === cp.seq + 1, "appends after adopt continue the restored seq timeline");
+  // deriveMessages must not be confused by checkpoint markers.
+  const msgs = restored.deriveMessages("sys");
+  assert(msgs.some((m) => m.content.includes("turn one")) && !msgs.some((m) => m.content.includes("turn two")), "deriveMessages ignores checkpoint markers");
+}
+
 loop.inject("[app/event] todo.added #42");
 assert(true, "injected context queued without error");
 

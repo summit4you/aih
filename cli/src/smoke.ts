@@ -156,6 +156,35 @@ assert(existsSync(".aih/sessions/s1-branch.jsonl"), "forked session file exists"
 const forkAgain = aih(["session", "fork", "s1", "s1-branch"]);
 assert(forkAgain.status === 1 && forkAgain.stderr.includes("already exists"), "fork refuses to overwrite an existing session");
 
+// --- F#28: checkpoint / restore (append-only rollback) ----------------------
+{
+  const cp = aih(["session", "checkpoint", "s1", "before", "risky", "refactor"]);
+  assert(cp.status === 0 && cp.stdout.includes("checkpoint #") && cp.stdout.includes("before risky refactor"), "session checkpoint records a named marker");
+  const cpSeq = Number.parseInt(cp.stdout.match(/checkpoint #(\d+)/)?.[1] ?? "", 10);
+  assert(Number.isFinite(cpSeq), "checkpoint reports its seq");
+
+  const moreTurn = aih(["run", "turn after checkpoint", "--mock", "--yes", "--session", "s1"]);
+  assert(moreTurn.status === 0, "turns keep appending after a checkpoint");
+
+  const restore = aih(["session", "restore", "s1"]);
+  assert(restore.status === 0 && restore.stdout.includes(`restore-${cpSeq}`), "session restore forks the prefix to a new session");
+  const restoredFile = `.aih/sessions/s1-restore-${cpSeq}.jsonl`;
+  assert(existsSync(restoredFile), "restored session file exists");
+  const restoredEvents = JSON.parse(aih(["session", "export", `s1-restore-${cpSeq}`]).stdout);
+  assert(restoredEvents[restoredEvents.length - 1].type === "checkpoint", "restored session ends at the checkpoint marker");
+  assert(!restoredEvents.some((e: { text?: string }) => e.text === "turn after checkpoint"), "restored session excludes the post-checkpoint suffix");
+  assert(
+    readFileSync(".aih/sessions/s1.jsonl", "utf8").includes("turn after checkpoint"),
+    "original session file stays untouched (append-only, full history auditable)",
+  );
+  const restoreAgain = aih(["session", "restore", "s1"]);
+  assert(restoreAgain.status === 1 && restoreAgain.stderr.includes("already exists"), "restore refuses to overwrite an existing restored session");
+  const badSeq = aih(["session", "restore", "s1", "99999"]);
+  assert(badSeq.status === 1 && badSeq.stderr.includes("no checkpoint at seq"), "restore rejects an unknown checkpoint seq");
+  const noCp = aih(["session", "restore", "s1-branch"]);
+  assert(noCp.status === 1 && noCp.stderr.includes("no checkpoints"), "restore errors cleanly when the session has no checkpoints");
+}
+
 rmSync(".aih/sessions", { recursive: true, force: true });
 
 const config = aih(["config"], { AIH_MODEL: "deepseek-v4-flash" });

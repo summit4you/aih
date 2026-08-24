@@ -114,6 +114,15 @@ export type SessionEvent =
   | {
       seq: number;
       ts: number;
+      type: "checkpoint";
+      /** Human label, e.g. "before risky refactor" (optional). */
+      note?: string;
+      /** Context-window usage snapshot at checkpoint time. */
+      contextTokens?: number;
+    }
+  | {
+      seq: number;
+      ts: number;
       type: "app/event";
       source: string;
       payload: unknown;

@@ -91,7 +91,7 @@ const HELP_LINES: string[] = [
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
   bold("commands"),
-  "    /skills · /usage · /compact · /help · /exit",
+  "    /skills · /usage · /compact · /checkpoint · /restore · /help · /exit",
 ];
 
 const TOOL_ICONS: Record<string, string> = {
