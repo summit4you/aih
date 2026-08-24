@@ -609,19 +609,27 @@ function saveSession(path: string | undefined, log: SessionLog): void {
 }
 
 function replayHistory(tui: Tui, events: readonly SessionEvent[]): void {
-  for (const e of events) {
-    if (e.type === "user/message") {
-      tui.push({ role: "user", text: e.text });
-    } else if (e.type === "assistant/message" && e.text) {
-      tui.push({ role: "assistant", text: e.text });
-    } else if (e.type === "tool/call") {
-      tui.pushTool(e.name, e.args, e.callId);
-    } else if (e.type === "tool/result") {
-      tui.resolveTool(e.callId, e.ok, e.result);
-    } else if (e.type === "compaction") {
-      tui.pushSystem("── compacted (earlier context summarized) ──");
+  const userLines: string[] = [];
+  tui.beginBatch();
+  try {
+    for (const e of events) {
+      if (e.type === "user/message") {
+        tui.push({ role: "user", text: e.text });
+        userLines.push(e.text);
+      } else if (e.type === "assistant/message" && e.text) {
+        tui.push({ role: "assistant", text: e.text });
+      } else if (e.type === "tool/call") {
+        tui.pushTool(e.name, e.args, e.callId);
+      } else if (e.type === "tool/result") {
+        tui.resolveTool(e.callId, e.ok, e.result);
+      } else if (e.type === "compaction") {
+        tui.pushSystem("── compacted (earlier context summarized) ──");
+      }
     }
+  } finally {
+    tui.endBatch();
   }
+  tui.seedHistory(userLines);
 }
 
 async function startBackend(

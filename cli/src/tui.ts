@@ -1,6 +1,7 @@
 import { accent, bold, blue, cyan, danger, dim, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
+import stringWidth from "string-width";
 
 export interface TodoItem {
   content: string;
@@ -121,55 +122,47 @@ const TOOL_ICONS: Record<string, string> = {
   load_skill: "→",
 };
 
-// East Asian Ambiguous symbols (❯⚠⊙▣✗…): mainstream terminals render them at
-// 1 column even under CJK locales — counting them as 2 made rows 1-2 columns
-// short of their padded width (box right edges misaligned). Treat as 1.
-// Emoji-presentation dingbats (U+2700–U+27BF) that terminals render 2 cells
-// wide. Text-presentation ones the TUI uses as icons (✓ U+2713, ✕ U+2715,
-// ✗ U+2717, ✱ U+2731, ❯ U+276F) are deliberately excluded so they stay 1 cell.
-const EMOJI_DINGBAT = new Set<number>([
-  0x2702, 0x2705, 0x2708, 0x2709, 0x270a, 0x270b, 0x270c, 0x270d, 0x270f,
-  0x2712, 0x2714, 0x2716, 0x271d, 0x2721, 0x2728, 0x2733, 0x2734, 0x2744,
-  0x2747, 0x274c, 0x274e, 0x2753, 0x2754, 0x2755, 0x2757, 0x2763, 0x2764,
-  0x2795, 0x2796, 0x2797, 0x27a1, 0x27bf,
-]);
+// Display width follows the standard `string-width` algorithm (the same one
+// Bun.stringWidth and opencode/mimo use): emoji = 2 cells, East-Asian
+// Wide/Fullwidth = 2, Ambiguous = 1 (narrow) by default, Neutral = 1, and
+// zero-width / combining / variation-selector code points = 0. ANSI escape
+// sequences are stripped. Override AIH_AMBIGUOUS_WIDE=2 to count Ambiguous
+// characters as wide (2 cells) for terminals whose CJK font renders them so.
+//
+// Font-specific overrides: some CJK mono fonts render a few emoji as a single
+// halfwidth cell even though the standard algorithm counts them as 2. Map of
+// code point -> actual cell count for the user's terminal (GNOME/Konsole,
+// zh_CN CJK font). Verified against the user's table: ⚠ (U+26A0) is 1 cell.
+const WIDTH_OVERRIDES: Record<number, number> = {
+  0x26a0: 1, // ⚠ warning sign
+};
+const segmenter = new Intl.Segmenter();
 
-/**
- * Display width of one code point in terminal cells: 0 (zero-width), 1, or 2.
- * CJK + emoji-presentation symbols are 2; variation selectors / ZWJ /
- * combining marks are 0; everything else is 1.
- */
-function width(ch: string): number {
-  const c = ch.codePointAt(0)!;
-  if (
-    (c >= 0xfe00 && c <= 0xfe0f) || c === 0x200b || c === 0x200c || c === 0x200d ||
-    (c >= 0x0300 && c <= 0x036f) || (c >= 0x20d0 && c <= 0x20ff)
-  ) return 0;
-  if (
-    (c >= 0x1100 && c <= 0x115f) ||
-    (c >= 0x2e80 && c <= 0x303e) ||
-    (c >= 0x3041 && c <= 0x33ff) ||
-    (c >= 0x3400 && c <= 0x4dbf) ||
-    (c >= 0x4e00 && c <= 0x9fff) ||
-    (c >= 0xa000 && c <= 0xa4cf) ||
-    (c >= 0xac00 && c <= 0xd7a3) ||
-    (c >= 0xf900 && c <= 0xfaff) ||
-    (c >= 0xfe30 && c <= 0xfe4f) ||
-    (c >= 0xff00 && c <= 0xff60) ||
-    (c >= 0xffe0 && c <= 0xffe6) ||
-    (c >= 0x20000 && c <= 0x3fffd) ||
-    (c >= 0x1f000 && c <= 0x1faff) || // emoji & pictographs
-    (c >= 0x2b00 && c <= 0x2bff) ||   // misc symbols & arrows (⭐ ⭕ …)
-    (c >= 0x2600 && c <= 0x26ff) ||   // misc symbols (⚙ ⚠ ☀ …)
-    EMOJI_DINGBAT.has(c)              // emoji dingbats (✅ ❌ ❓ …)
-  ) return 2;
-  return 1;
+function swOpts(): { ambiguousIsNarrow: boolean } {
+  const mode = process.env.AIH_AMBIGUOUS_WIDE;
+  if (mode === "2") return { ambiguousIsNarrow: false };
+  return { ambiguousIsNarrow: true };
 }
 
-function cols(text: string): number {
+/** Width of one grapheme cluster, applying font-specific overrides. */
+function clusterWidth(cluster: string): number {
+  const c = cluster.codePointAt(0);
+  if (c !== undefined && WIDTH_OVERRIDES[c] !== undefined) return WIDTH_OVERRIDES[c];
+  return stringWidth(cluster, swOpts());
+}
+
+/** Display width of one code point in terminal cells: 0, 1, or 2. */
+export function width(ch: string): number {
+  let n = 0;
+  for (const { segment } of segmenter.segment(ch)) n += clusterWidth(segment);
+  return n;
+}
+
+/** Display width of a (possibly ANSI-styled) string, in terminal cells. */
+export function cols(text: string): number {
   const plain = text.replace(/\x1b\[[0-9;]*m/g, "");
   let n = 0;
-  for (const ch of plain) n += width(ch);
+  for (const { segment } of segmenter.segment(plain)) n += clusterWidth(segment);
   return n;
 }
 
@@ -399,6 +392,14 @@ export class Tui {
   #items: TuiItem[] = [];
   #bodyUnitIdx: number[] = [];
   #groupOpen = new Map<number, boolean>();
+  // Render cache: rendered lines per item / per group, keyed by (width, theme).
+  // Items are immutable once pushed (except the streaming assistant item and
+  // tool results, which are invalidated on mutation), so re-rendering the whole
+  // transcript on every follow/paint is pure waste. This makes scroll + replay
+  // O(viewport) instead of O(transcript).
+  #itemCache = new Map<object, { w: number; d: boolean; lines: string[] }>();
+  #groupCache = new Map<number, { w: number; d: boolean; open: boolean; lines: string[] }>();
+  #batching = false;
   #edit = "";
   #cursor = 0;
   #history: string[] = [];
@@ -528,10 +529,24 @@ constructor(opts: TuiOptions) {
     process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`);
   };
 
-  push(item: TuiItem): void {
-    this.#items.push(item);
+  /** Begin a bulk insert (session replay): suppress per-item follow/paint. */
+  beginBatch(): void {
+    this.#batching = true;
+  }
+
+  /** End a bulk insert: follow + paint once. */
+  endBatch(): void {
+    this.#batching = false;
     this.#follow();
     this.requestPaint();
+  }
+
+  push(item: TuiItem): void {
+    this.#items.push(item);
+    if (!this.#batching) {
+      this.#follow();
+      this.requestPaint();
+    }
   }
 
   pushTool(name: string, args: unknown, callId: string): void {
@@ -540,8 +555,10 @@ constructor(opts: TuiOptions) {
       text: name,
       tool: { name, args: fmtArgs(name, args), callId, ok: undefined },
     });
-    this.#follow();
-    this.requestPaint();
+    if (!this.#batching) {
+      this.#follow();
+      this.requestPaint();
+    }
   }
 
   resolveTool(callId: string, ok: boolean, result?: unknown): void {
@@ -612,28 +629,47 @@ constructor(opts: TuiOptions) {
         view.output = out;
         view.expanded = false;
       }
+      this.#invalidateItem(this.#items[idx]);
     }
-    this.requestPaint();
+    if (!this.#batching) this.requestPaint();
   }
 
   pushDelta(text: string): void {
     const last = this.#items[this.#items.length - 1];
-    if (last && last.role === "assistant") last.text += text;
-    else this.#items.push({ role: "assistant", text });
-    this.#follow();
-    this.requestPaint();
+    if (last && last.role === "assistant") {
+      last.text += text;
+      this.#invalidateItem(last);
+    } else this.#items.push({ role: "assistant", text });
+    if (!this.#batching) {
+      this.#follow();
+      this.requestPaint();
+    }
   }
 
   resetStream(): void {
     const last = this.#items[this.#items.length - 1];
     if (last && last.role === "assistant") {
       last.text = "";
-      this.requestPaint();
+      this.#invalidateItem(last);
+      if (!this.#batching) this.requestPaint();
     }
+  }
+
+  /** Drop cached render for a mutated item (and any group containing it). */
+  #invalidateItem(item: TuiItem): void {
+    this.#itemCache.delete(item);
+    this.#groupCache.clear();
   }
 
   pushSystem(text: string): void {
     this.push({ role: "system", text });
+  }
+
+  /** Restore up-arrow recall from a resumed session (chronological order). */
+  seedHistory(lines: string[]): void {
+    const clean = lines.filter((l) => l.trim().length > 0);
+    this.#history = clean.slice(-200);
+    this.#histCursor = -1;
   }
 
   turnSettled(): void {
@@ -1226,12 +1262,14 @@ constructor(opts: TuiOptions) {
     if (!u) return;
     if (u.kind === "group") {
       this.#groupOpen.set(u.start, !this.#groupOpen.get(u.start));
+      this.#groupCache.delete(u.start);
       this.requestPaint();
       return;
     }
     const item = u.item;
     if (!item?.tool || typeof item.tool.output !== "string") return;
     item.tool.expanded = !item.tool.expanded;
+    this.#invalidateItem(item);
     this.requestPaint();
   }
 
@@ -1421,6 +1459,17 @@ constructor(opts: TuiOptions) {
   }
 
   #groupLines(g: { start: number; items: TuiItem[] }): string[] {
+    const w = this.#bodyCols();
+    const d = this.#dark;
+    const open = !!this.#groupOpen.get(g.start);
+    const c = this.#groupCache.get(g.start);
+    if (c && c.w === w && c.d === d && c.open === open) return c.lines;
+    const lines = this.#renderGroup(g);
+    this.#groupCache.set(g.start, { w, d, open, lines });
+    return lines;
+  }
+
+  #renderGroup(g: { start: number; items: TuiItem[] }): string[] {
     const t = g.items[0].tool!;
     const icon = TOOL_ICONS[t.name] ?? "⚙";
     if (!this.#groupOpen.get(g.start)) {
@@ -1546,7 +1595,17 @@ constructor(opts: TuiOptions) {
     return `   ${muted("○ ")}${t.content}`;
   }
 
-    #block(item: TuiItem): string[] {
+  #block(item: TuiItem): string[] {
+    const w = this.#bodyCols();
+    const d = this.#dark;
+    const c = this.#itemCache.get(item);
+    if (c && c.w === w && c.d === d) return c.lines;
+    const lines = this.#renderBlock(item);
+    this.#itemCache.set(item, { w, d, lines });
+    return lines;
+  }
+
+  #renderBlock(item: TuiItem): string[] {
     const limit = Math.max(1, this.#bodyCols() - 3);
     if (item.role === "assistant") {
       const lines = this.#markdown(item.text, limit);

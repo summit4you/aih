@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const cli = fileURLToPath(new URL("./index.js", import.meta.url));
 
@@ -1103,7 +1103,23 @@ await srv.connect(new StdioServerTransport());
 
 // --- TUI markdown table rendering: bordered, column-aligned, CJK-aware ---
 {
-  const { Tui } = await import("./tui.js");
+  const { Tui, width, cols } = await import("./tui.js");
+  assert(width("✅") === 2 && width("⚪") === 2, "emoji (✅ ⚪) count 2 cells");
+  assert(width("⚠") === 1 && width("⚠️") === 1, "⚠ (U+26A0) is 1 cell in the user's CJK font (override)");
+  assert(width("✓") === 1 && width("✗") === 1 && width("❯") === 1, "text dingbats (✓ ✗ ❯, EAW=N) count 1 cell");
+  assert(width("≥") === 1 && width("−") === 1, "math operators (≥ −, EAW=A) count 1 cell by default");
+  assert(width("—") === 1 && width("…") === 1 && width("→") === 1, "dashes/ellipsis/arrows (— … →) count 1 cell by default");
+  assert(width("\ufe0f") === 0, "variation selector (U+FE0F) is zero-width");
+  assert(width("组") === 2 && width("\u{1f600}") === 2, "true-wide (CJK, pictographic emoji) stay 2 cells");
+  const tuiUrl = pathToFileURL(fileURLToPath(new URL("./tui.js", import.meta.url))).href;
+  const probe = (env: Record<string, string>) =>
+    spawnSync(
+      process.execPath,
+      ["-e", `import(${JSON.stringify(tuiUrl)}).then((m) => console.log(m.width("✅"), m.width("≥"), m.width("—")))`],
+      { encoding: "utf8", env: { ...process.env, ...env } },
+    ).stdout.trim();
+  assert(probe({ AIH_AMBIGUOUS_WIDE: "1" }) === "2 1 1", "AIH_AMBIGUOUS_WIDE=1 keeps EAW=A narrow (emoji still 2)");
+  assert(probe({ AIH_AMBIGUOUS_WIDE: "2" }) === "2 2 2", "AIH_AMBIGUOUS_WIDE=2 forces EAW=A wide");
   const tui = new Tui({
     placeholder: ">",
     meta: () => ({ agent: "t", model: "m", provider: "p" }),
@@ -1122,30 +1138,6 @@ await srv.connect(new StdioServerTransport());
   ].join("\n");
   tui.pushDelta(table);
   const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-  // Must mirror tui.ts `width()` so the alignment assertion is consistent.
-  const width = (ch: string): number => {
-    const c = ch.codePointAt(0)!;
-    if ((c >= 0xfe00 && c <= 0xfe0f) || c === 0x200d) return 0;
-    if (
-      (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0x303e) ||
-      (c >= 0x3041 && c <= 0x33ff) || (c >= 0x3400 && c <= 0x4dbf) ||
-      (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xa000 && c <= 0xa4cf) ||
-      (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
-      (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) ||
-      (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x20000 && c <= 0x3fffd) ||
-      (c >= 0x1f000 && c <= 0x1faff) || (c >= 0x2600 && c <= 0x26ff) ||
-      [0x2705, 0x274c, 0x2753].includes(c)
-    ) return 2;
-    return 1;
-  };
-  const cols = (s: string): number => {
-    let n = 0;
-    for (const ch of s) n += width(ch);
-    return n;
-  };
-  assert(width("✅") === 2, "✅ (U+2705 emoji) is 2 cells wide");
-  assert(width("✓") === 1 && width("✗") === 1 && width("❯") === 1, "text-presentation icons (✓ ✗ ❯) stay 1 cell");
-  assert(width("\ufe0f") === 0, "variation selector (U+FE0F) is zero-width");
   const lines = tui.transcriptLines().map(plain);
   const tableLines = lines.slice(lines.findIndex((l) => l.includes("┌")));
   assert(tableLines.length > 0, "markdown table renders as a bordered block");
@@ -1161,6 +1153,41 @@ await srv.connect(new StdioServerTransport());
   assert(joined.includes("cli/src/formatter.ts"), "second data row cell preserved");
   const widths = tableLines.map((l) => cols(l));
   assert(new Set(widths).size === 1, `all table rows align to one display width (${widths[0]})`);
+}
+
+// --- TUI performance: batch replay + render cache + history seeding ---
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const md = "text **bold** and a table\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```js\nconst x = 1;\n```";
+  tui.beginBatch();
+  for (let i = 0; i < 50; i++) {
+    tui.push({ role: "user", text: `hello ${i}` });
+    tui.push({ role: "assistant", text: md + ` (msg ${i})` });
+    tui.pushTool("run_cmd", { command: `echo ${i}` }, `c${i}`);
+    tui.resolveTool(`c${i}`, true, { stdout: `out ${i}\nline2\nline3\nline4` });
+  }
+  tui.endBatch();
+  tui.seedHistory(["first", "second", "third"]);
+  const lines = tui.transcriptLines();
+  assert(lines.some((l) => l.includes("hello 0")) && lines.some((l) => l.includes("hello 49")), "batch replay renders all user messages");
+  assert(lines.some((l) => l.includes("bold")) && lines.some((l) => l.includes("const x = 1;")), "batch replay renders assistant markdown (bold + code)");
+  // Render cache: repeated renders are consistent and fast.
+  const t0 = Date.now();
+  for (let k = 0; k < 50; k++) tui.transcriptLines();
+  const per = (Date.now() - t0) / 50;
+  assert(per < 50, `render cache keeps repeated renders fast (${per.toFixed(1)} ms < 50 ms)`);
+  // Mutating the streaming item invalidates its cache (re-render picks up new text).
+  tui.pushDelta("APPENDED");
+  assert(tui.transcriptLines().some((l) => l.includes("APPENDED")), "pushDelta after cache invalidates and re-renders");
 }
 
 console.log("\nAIH cli smoke test passed.");
