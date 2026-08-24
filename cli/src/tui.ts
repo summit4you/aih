@@ -36,6 +36,8 @@ export interface TuiOptions {
   statusLeft: string;
   statusRight: string;
   statusBadge?(): { glyph: string; ok: boolean; label: string } | null;
+  /** D#13: background-job counts for the status line (null/absent = hide). */
+  jobStatus?(): { running: number; done: number; failed: number } | null;
   busy(): boolean;
   cancelTurn?(): void;
   onLine(line: string): void;
@@ -1972,9 +1974,21 @@ constructor(opts: TuiOptions) {
       : this.#question
         ? `${warn(bold("❓ AWAITING ANSWER"))}  `
         : "";
+    const js = this.#opts.jobStatus?.() ?? null;
+    const jobSeg =
+      js && js.running + js.done + js.failed > 0
+        ? [
+            js.running > 0 ? warn(`${js.running} bg running`) : "",
+            js.done > 0 ? success(`${js.done} done`) : "",
+            js.failed > 0 ? danger(`${js.failed} failed`) : "",
+          ]
+            .filter(Boolean)
+            .join(" · ") + "  "
+        : "";
     const l =
       pending +
       (badge ? `${badge}${muted("  ")}` : "") +
+      jobSeg +
       (this.#opts.statusLeft ? muted(this.#opts.statusLeft) : "");
     const r = this.#opts.statusRight ? muted(this.#opts.statusRight) : "";
     const pad = Math.max(1, width - cols(l) - cols(r) - 1);

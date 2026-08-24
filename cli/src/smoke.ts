@@ -679,6 +679,59 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     readFileSync(`${workdir}/.aih/memory.md`, "utf8").includes("smoke memory entry"),
     "remember appends to .aih/memory.md",
   );
+  // P0#2: user-level memory (cross-project) + injection budget.
+  // AIH_HOME is redirected in-process so scope=user never touches real user data.
+  const memHome = mkdtempSync("/tmp/aih-mem-");
+  const userMemPath = `${memHome}/memory.md`;
+  const prevAihHome = process.env.AIH_HOME;
+  process.env.AIH_HOME = memHome;
+  try {
+    const userRes = await call("remember", { action: "append", text: "user-level smoke memory", scope: "user" });
+    assert(
+      (userRes.path as string) === userMemPath && readFileSync(userMemPath, "utf8").includes("user-level smoke memory"),
+      "remember scope=user writes the XDG user memory file",
+    );
+    const userSet = await call("remember", { action: "set", text: "rewritten user memory", scope: "user" });
+    assert(
+      (userSet.path as string) === userMemPath &&
+        readFileSync(userMemPath, "utf8").startsWith("# User memory") &&
+        readFileSync(userMemPath, "utf8").includes("rewritten user memory") &&
+        !readFileSync(userMemPath, "utf8").includes("user-level smoke memory"),
+      "remember scope=user action=set rewrites the user file",
+    );
+    let badScope: string;
+    try {
+      await call("remember", { action: "append", text: "x", scope: "nope" });
+      badScope = "no error";
+    } catch (e) {
+      badScope = String((e as Error).message);
+    }
+    assert(badScope.includes("unknown scope"), "remember rejects an unknown scope");
+    const { loadMemoryBlock } = await import("./index.js");
+    const block = loadMemoryBlock(workdir);
+    assert(block.includes("smoke memory entry"), "loadMemoryBlock injects project memory");
+    assert(block.includes("rewritten user memory"), "loadMemoryBlock also injects the current user memory");
+    writeFileSync(userMemPath, "# User memory\n\n- 2026-01-01 — user fact abc\n");
+    const block2 = loadMemoryBlock(workdir);
+    assert(block2.includes("smoke memory entry") && block2.includes("user fact abc"), "loadMemoryBlock injects project + user memory");
+    assert(block2.indexOf("# Project memory") < block2.indexOf("# User memory"), "project memory comes before user memory");
+    // budget caps total length (project first, user gets the remainder)
+    const big = "x".repeat(9000);
+    writeFileSync(`${workdir}/.aih/memory.md`, `# Project memory\n\n- ${big}\n`);
+    writeFileSync(userMemPath, `# User memory\n\n- ${big}\n`);
+    const prevBudget = process.env.AIH_MEMORY_BUDGET;
+    process.env.AIH_MEMORY_BUDGET = "1200";
+    try {
+      const capped = loadMemoryBlock(workdir);
+      assert(capped.length <= 1400 && capped.includes("…(truncated)"), "AIH_MEMORY_BUDGET caps the injected memory block");
+    } finally {
+      if (prevBudget === undefined) delete process.env.AIH_MEMORY_BUDGET;
+      else process.env.AIH_MEMORY_BUDGET = prevBudget;
+    }
+  } finally {
+    if (prevAihHome === undefined) delete process.env.AIH_HOME;
+    else process.env.AIH_HOME = prevAihHome;
+  }
   const registryHooks = new ToolRegistry(gate);
   registryHooks.register({
     name: "calc",
@@ -2012,6 +2065,73 @@ await srv.connect(new StdioServerTransport());
     process.chdir(prevCwd);
     rmSync(profDir, { recursive: true, force: true });
   }
+}
+
+// --- D#13: background jobs (board bookkeeping + spawn lifecycle) -----------
+{
+  const { loadBoard, saveBoard, summarize, spawnJob, cancelJob, jobById, jobsFile } = await import("./jobs.js");
+  const jobdir = mkdtempSync("/tmp/aih-jobs-");
+  // pure bookkeeping
+  assert(loadBoard(jobdir).jobs.length === 0, "empty board when no jobs file");
+  const board = { jobs: [
+    { id: "a", label: "a", prompt: "a", status: "running" as const, session: "a", out: "/x", createdAt: 1, startedAt: 1 },
+    { id: "b", label: "b", prompt: "b", status: "done" as const, session: "b", out: "/x", createdAt: 1, startedAt: 1, finishedAt: 2 },
+    { id: "c", label: "c", prompt: "c", status: "failed" as const, session: "c", out: "/x", createdAt: 1, startedAt: 1, finishedAt: 2 },
+  ] };
+  saveBoard(jobdir, board);
+  assert(existsSync(jobsFile(jobdir)), "saveBoard writes .aih/jobs.json");
+  const s = summarize(loadBoard(jobdir));
+  assert(s.running === 1 && s.done === 1 && s.failed === 1, "summarize counts running/done/failed");
+  assert(jobById(jobdir, "b")?.status === "done", "jobById finds a job");
+  assert(cancelJob(jobdir, "a") === true, "cancelJob marks a running job cancelled");
+  assert(jobById(jobdir, "a")?.status === "cancelled", "cancelled job persisted");
+  assert(cancelJob(jobdir, "b") === false, "cancelJob refuses a finished job");
+  // spawn lifecycle: a fake CLI that prints an answer and exits 0
+  const fakeCli = `${jobdir}/fake.mjs`;
+  writeFileSync(fakeCli, `process.stdout.write("bg answer line\\n"); process.exit(0);\n`);
+  const { job, child } = spawnJob(jobdir, "do a thing in the background", { cli: fakeCli });
+  assert(job.status === "running" && job.id.startsWith("bg-"), "spawnJob creates a running job");
+  assert(jobById(jobdir, job.id)?.status === "running", "spawned job is on the board");
+  const code = await new Promise<number>((res) => child.on("close", (c) => res(c ?? -1)));
+  assert(code === 0, "background child exits 0");
+  const finished = jobById(jobdir, job.id);
+  assert(finished?.status === "done" && finished?.exitCode === 0, "job marked done with exit 0");
+  assert(finished?.preview === "bg answer line", "job preview captures the last output line");
+  assert(existsSync(finished!.out) && readFileSync(finished!.out, "utf8").includes("bg answer line"), "job output captured to file");
+  // failing child → failed
+  const fakeFail = `${jobdir}/fail.mjs`;
+  writeFileSync(fakeFail, `process.stderr.write("boom\\n"); process.exit(3);\n`);
+  const f2 = spawnJob(jobdir, "will fail", { cli: fakeFail });
+  await new Promise((res) => f2.child.on("close", () => res(null)));
+  assert(jobById(jobdir, f2.job.id)?.status === "failed", "failing child marks job failed");
+  rmSync(jobdir, { recursive: true, force: true });
+}
+
+// --- E#17: memory auto-tidy (deterministic dedup) ---------------------------
+{
+  const { tidyMemory, formatTidyReport, parseMemoryEntries, normEntry } = await import("./memory-tidy.js");
+  // no entries → no change
+  const empty = tidyMemory("# Project memory\n\n(no bullets here)\n");
+  assert(empty.noChange && empty.total === 0, "tidyMemory: no bullets → noChange");
+  // exact duplicates → keep one, drop the rest
+  const dup = tidyMemory(
+    "# Project memory\n\n- 2026-01-01 — use tabs not spaces\n- 2026-02-02 — use tabs not spaces\n- 2026-03-03 — other fact\n",
+  );
+  assert(dup.total === 3 && dup.kept === 2 && dup.removed.length === 1, "tidyMemory: 3 entries, 2 kept, 1 dup removed");
+  assert(!dup.cleaned.includes("2026-01-01") && dup.cleaned.includes("2026-02-02"), "tidyMemory: keeps the most recent dated copy");
+  assert(dup.cleaned.includes("other fact"), "tidyMemory: preserves non-duplicate entries");
+  // near-duplicate (punctuation/whitespace) still dedups
+  const near = tidyMemory("- use tabs, not spaces\n- use  tabs, not  spaces\n");
+  assert(near.kept === 1 && near.removed.length === 1, "tidyMemory: whitespace/punctuation variants dedupe");
+  // no dates → later in file wins
+  const undated = tidyMemory("- fact A\n- fact A\n");
+  assert(undated.kept === 1 && undated.removed.length === 1, "tidyMemory: undated dup keeps later copy");
+  // report formatting
+  assert(formatTidyReport(dup).includes("2 kept") && formatTidyReport(dup).includes("1 duplicate"), "formatTidyReport summarizes kept/removed");
+  assert(formatTidyReport(empty).includes("already tidy"), "formatTidyReport reports tidy");
+  // parse + norm helpers
+  assert(parseMemoryEntries("- a\n- b\nnot a bullet\n").length === 2, "parseMemoryEntries counts bullets only");
+  assert(normEntry("2026-01-01 — Use Tabs") === normEntry("use tabs"), "normEntry strips date + case/punct");
 }
 
 console.log("\nAIH cli smoke test passed.");

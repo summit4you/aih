@@ -14,6 +14,7 @@ import type { DiffLine } from "./diff.js";
 import { lineDiff } from "./diff.js";
 import { formatAfterWrite } from "./formatter.js";
 import { bestOfN } from "./maxmode.js";
+import { userAihDir } from "./paths.js";
 
 export interface GeneralToolsOptions {
   cwd?: string;
@@ -299,8 +300,11 @@ export function registerGeneralTools(
   reg({
     name: "remember",
     description:
-      "Persist durable project knowledge to .aih/memory.md so future sessions can recall it. " +
-      "action=append adds a dated entry; action=set rewrites the whole memory file. Use for decisions, conventions, and facts that must survive across sessions.",
+      "Persist durable knowledge to memory.md so future sessions can recall it. " +
+      "scope=project (default) writes .aih/memory.md; scope=user writes the cross-project " +
+      "user memory (~/.local/share/aih/memory.md, XDG). action=append adds a dated entry; " +
+      "action=set rewrites the whole file. Use for decisions, conventions, and facts that " +
+      "must survive across sessions.",
     kind: "write",
     permission: "allow",
     parameters: {
@@ -312,24 +316,32 @@ export function registerGeneralTools(
           description: "append a dated entry, or set (replace) the whole memory",
         },
         text: { type: "string", description: "the memory content to store" },
+        scope: {
+          type: "string",
+          enum: ["project", "user"],
+          description: "project (default, .aih/memory.md) or user (cross-project, XDG data dir)",
+        },
       },
       required: ["action", "text"],
     },
     execute: async (args) => {
-      const a = args as { action?: unknown; text?: unknown };
+      const a = args as { action?: unknown; text?: unknown; scope?: unknown };
       const action = String(a.action ?? "append");
       const text = String(a.text ?? "").trim();
       if (!text) throw new Error("remember requires non-empty text");
-      const path = join(cwd, ".aih", "memory.md");
+      const scope = String(a.scope ?? "project");
+      if (scope !== "project" && scope !== "user") throw new Error(`remember: unknown scope "${scope}" (use project|user)`);
+      const path = scope === "user" ? join(userAihDir(), "memory.md") : join(cwd, ".aih", "memory.md");
+      const header = scope === "user" ? "# User memory" : "# Project memory";
       mkdirSync(dirname(path), { recursive: true });
       if (action === "set") {
-        writeFileSync(path, `# Project memory\n\n${text}\n`);
+        writeFileSync(path, `${header}\n\n${text}\n`);
       } else {
         const stamp = new Date().toISOString().slice(0, 10);
-        const existing = existsSync(path) ? readFileSync(path, "utf8") : "# Project memory\n";
+        const existing = existsSync(path) ? readFileSync(path, "utf8") : `${header}\n`;
         writeFileSync(path, `${existing.replace(/\s+$/, "")}\n\n- ${stamp} — ${text}\n`);
       }
-      return { path, action };
+      return { path, action, scope };
     },
   });
 

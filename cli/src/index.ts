@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
@@ -67,6 +68,8 @@ import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
 import { builtinHooks, composeHooks } from "./hooks.js";
+import { loadBoard, spawnJob, cancelJob, jobById, summarize } from "./jobs.js";
+import { tidyMemory, formatTidyReport } from "./memory-tidy.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import {
@@ -216,7 +219,7 @@ Chat commands (inside the TUI):
   /model <p/m>        direct switch: "<provider>/<model>" or bare model id
   /compact [focus]    summarize earlier context now (optionally steer the summary)
   /usage              token totals + current context fill
-  /mode, /goal, /tools, /skills, /inject, /memory, /events, /clear
+  /mode, /goal, /tools, /skills, /inject, /memory, /events, /bg, /clear
 `;
 
 interface ParsedArgs {
@@ -411,14 +414,40 @@ export function buildLlm(flags: Record<string, string | boolean>) {
   });
 }
 
-export function loadMemoryBlock(cwd = process.cwd()): string {
-  const path = join(cwd, ".aih", "memory.md");
+/** Read a memory file, trimmed; "" when missing/empty. */
+function readMemoryFile(path: string): string {
   if (!existsSync(path)) return "";
-  let text = readFileSync(path, "utf8").trim();
-  if (!text) return "";
+  return readFileSync(path, "utf8").trim();
+}
+
+function fitBudget(text: string, budget: number): string {
+  if (text.length > budget) return `${text.slice(0, Math.max(budget - 12, 0))}\n…(truncated)`;
+  return text;
+}
+
+/**
+ * Memory injection (roadmap P0#2): project `.aih/memory.md` first, then
+ * user-level `~/.local/share/aih/memory.md` (cross-project). Total length is
+ * capped by AIH_MEMORY_BUDGET (default 4000 chars); the project file gets the
+ * budget first, the user file gets whatever remains.
+ */
+export function loadMemoryBlock(cwd = process.cwd()): string {
   const budget = Number(process.env.AIH_MEMORY_BUDGET ?? "") || 4000;
-  if (text.length > budget) text = `${text.slice(0, budget)}\n…(truncated)`;
-  return `\n\n# Project memory (persistent across sessions; keep it current with the remember tool)\n${text}`;
+  const parts: string[] = [];
+  const project = readMemoryFile(join(cwd, ".aih", "memory.md"));
+  if (project) {
+    parts.push(`# Project memory (persistent across sessions; keep it current with the remember tool)\n${fitBudget(project, budget)}`);
+  }
+  const user = readMemoryFile(join(userAihDir(), "memory.md"));
+  if (user) {
+    const used = parts.reduce((n, p) => n + p.length, 0);
+    const remain = Math.max(budget - used - 80, 0); // 80 ≈ header overhead
+    if (remain > 0) {
+      parts.push(`# User memory (cross-project, ${join(userAihDir(), "memory.md")}; remember scope=user)\n${fitBudget(user, remain)}`);
+    }
+  }
+  if (!parts.length) return "";
+  return `\n\n${parts.join("\n\n")}`;
 }
 
 export function loadSystemPrompt(): string {
@@ -1085,6 +1114,19 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     process.exit(1);
   }
   const streaming = !bool(flags, "no-stream") && !bool(flags, "mock");
+  const bgChildren = new Map<string, ChildProcess>();
+  // On TUI exit, in-flight background children can't be waited on synchronously;
+  // kill them and mark the board entries cancelled so the board never lies.
+  process.on("exit", () => {
+    for (const [id, child] of bgChildren) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      cancelJob(process.cwd(), id);
+    }
+  });
   let busy = false;
   let goalCondition = "";
   let goalRoundsLeft = 0;
@@ -1196,9 +1238,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "memory", hint: "/memory — project memory (.aih/memory.md)", run: () => handleLine("/memory") },
       { name: "dream", hint: "/dream — mine recent sessions for memory-worthy knowledge", run: () => handleLine("/dream") },
       { name: "distill", hint: "/distill — repeated flows → skill/workflow candidates", run: () => handleLine("/distill") },
+      { name: "tidy memory", hint: "/tidy [project|user] — dedup duplicate memory entries (apply to write)", run: () => handleLine("/tidy") },
       { name: "events", hint: "/events — session event log toggle", run: () => handleLine("/events") },
       { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
       { name: "vivid (concise render)", hint: "/vivid — toggle plain render (no borders/panel)", run: () => handleLine("/vivid") },
+      { name: "background jobs", hint: "/bg <prompt> — dispatch a background agent turn (list/cancel)", run: () => handleLine("/bg") },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
@@ -1251,6 +1295,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       const n = registry.schemas().length;
       return { glyph: "⊙", ok: n > 0, label: `${n} MCP` };
     },
+    jobStatus: () => {
+      const s = summarize(loadBoard(process.cwd()));
+      return s.running + s.done + s.failed > 0 ? s : null;
+    },
     busy: () => busy,
     cancelTurn: () => loop.cancel(),
     onLine: handleLine,
@@ -1274,7 +1322,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/fork",
       "/dream",
       "/distill",
+      "/tidy",
       "/vivid",
+      "/bg",
       "/clear",
       "/inject",
       "/events",
@@ -1593,6 +1643,70 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       tui.clearItems();
       return;
     }
+    // D#13: /bg — background tasks (dispatch + status + cancel)
+    if (input === "/bg" || input.startsWith("/bg ")) {
+      const arg = input === "/bg" ? "" : input.slice("/bg ".length).trim();
+      if (arg === "list" || arg === "") {
+        const board = loadBoard(process.cwd());
+        if (!board.jobs.length) {
+          tui.pushSystem("no background jobs yet — dispatch one with /bg <prompt>");
+          return;
+        }
+        const rows = board.jobs
+          .slice(-12)
+          .reverse()
+          .map((j) => {
+            const icon = j.status === "running" ? "▶" : j.status === "done" ? "✓" : j.status === "failed" ? "✗" : "⊘";
+            const when = j.finishedAt ? `${Math.round((j.finishedAt - j.startedAt) / 1000)}s` : `${Math.round((Date.now() - j.startedAt) / 1000)}s…`;
+            return `  ${icon} ${j.id}  ${j.label}  [${j.status} · ${when}]${j.preview ? `\n      ${j.preview}` : ""}`;
+          });
+        tui.pushSystem(`background jobs:\n${rows.join("\n")}`);
+        return;
+      }
+      if (arg.startsWith("cancel ")) {
+        const id = arg.slice("cancel ".length).trim();
+        const child = bgChildren.get(id);
+        const ok = cancelJob(process.cwd(), id, child);
+        if (ok) {
+          bgChildren.delete(id);
+          tui.pushSystem(`cancelled job ${id}`);
+        } else {
+          tui.pushSystem(`no running job ${id} to cancel`);
+        }
+        tui.requestPaint();
+        return;
+      }
+      const prompt = arg;
+      if (!prompt) {
+        tui.pushSystem("usage: /bg <prompt> — dispatch a background agent turn (or /bg list · /bg cancel <id>)");
+        return;
+      }
+      const cliPath = fileURLToPath(new URL("./index.js", import.meta.url));
+      // Direct subcommands run as a plain CLI job (no LLM turn): distill / tidy.
+      const direct = /^(distill|tidy)(\s|$)/.exec(prompt);
+      const argv = direct
+        ? [cliPath, ...prompt.split(/\s+/)]
+        : [cliPath, "run", prompt, "--session", `bg-${Date.now().toString(36)}`, "--no-audit", "--no-stream", "--format", "text"];
+      const { job, child } = spawnJob(process.cwd(), prompt, { cli: cliPath, argv });
+      bgChildren.set(job.id, child);
+      child.on("close", () => {
+        bgChildren.delete(job.id);
+        // surface the result + refresh the status line
+        const finished = jobById(process.cwd(), job.id);
+        if (finished) {
+          const icon = finished.status === "done" ? "✓" : finished.status === "failed" ? "✗" : "⊘";
+          tui.pushSystem(
+            `${icon} background job ${job.id} ${finished.status}: ${finished.label}` +
+              (finished.preview ? `\n${finished.preview}` : "") +
+              `\nfull output: ${finished.out} · session: ${finished.session}`,
+          );
+        }
+        tui.requestPaint();
+      });
+      tui.pushSystem(`▶ dispatched background job ${job.id}: ${job.label}\n  (TUI stays responsive; /bg list to track, /bg cancel ${job.id} to stop)`);
+      tui.requestPaint();
+      return;
+    }
     // P2#9: /vivid toggles the concise (plain) render mode — no borders/surface/panel.
     if (input === "/vivid") {
       const on = !tui.isPlain();
@@ -1798,10 +1912,67 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     if (input === "/memory") {
       const p = join(process.cwd(), ".aih", "memory.md");
+      const u = join(userAihDir(), "memory.md");
+      const sections: string[] = [];
+      sections.push(existsSync(p) ? readFileSync(p, "utf8").trim() || "(empty)" : "(no project memory yet)");
+      if (existsSync(u)) sections.push(`— user (${u}) —\n${readFileSync(u, "utf8").trim() || "(empty)"}`);
       tui.pushSystem(
-        existsSync(p)
-          ? readFileSync(p, "utf8").trim() || "(empty)"
-          : "(no project memory yet — the agent can add it with the remember tool)",
+        sections.join("\n\n") +
+          (sections.length === 1 ? " — the agent can add memory with the remember tool (scope: project | user)" : ""),
+      );
+      return;
+    }
+    // E#17: /tidy — deterministic memory auto-tidy (dedup stale/duplicate entries).
+    // Proposes changes; the user confirms before anything is written.
+    const tidyApply = input === "/tidy apply" || input.startsWith("/tidy apply ");
+    if (!tidyApply && (input === "/tidy" || input.startsWith("/tidy "))) {
+      const scope = input === "/tidy" ? "project" : input.slice("/tidy ".length).trim() || "project";
+      if (scope !== "project" && scope !== "user") {
+        tui.pushSystem("usage: /tidy [project|user] — tidy that memory file (duplicate entries)");
+        return;
+      }
+      const target = scope === "user" ? join(userAihDir(), "memory.md") : join(process.cwd(), ".aih", "memory.md");
+      if (!existsSync(target)) {
+        tui.pushSystem(`no ${scope} memory to tidy yet (${target})`);
+        return;
+      }
+      const current = readFileSync(target, "utf8");
+      const report = tidyMemory(current);
+      if (report.noChange) {
+        tui.pushSystem(formatTidyReport(report));
+        return;
+      }
+      tui.pushSystem(
+        `${formatTidyReport(report)}\n\n` +
+          `apply with: /tidy apply ${scope}   (or review with /memory first)`,
+      );
+      return;
+    }
+    if (tidyApply) {
+      const scope = (input.slice("/tidy apply ".length).trim() || "project") as "project" | "user";
+      if (scope !== "project" && scope !== "user") {
+        tui.pushSystem("usage: /tidy apply [project|user]");
+        return;
+      }
+      const target = scope === "user" ? join(userAihDir(), "memory.md") : join(process.cwd(), ".aih", "memory.md");
+      if (!existsSync(target)) {
+        tui.pushSystem(`no ${scope} memory to tidy yet (${target})`);
+        return;
+      }
+      const current = readFileSync(target, "utf8");
+      const report = tidyMemory(current);
+      if (report.noChange) {
+        tui.pushSystem(formatTidyReport(report));
+        return;
+      }
+      // snapshot for audit, then write the cleaned file
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const snap = `${target}.pre-tidy-${stamp}`;
+      writeFileSync(snap, current, "utf8");
+      writeFileSync(target, report.cleaned, "utf8");
+      tui.pushSystem(
+        `tidied ${scope} memory: ${report.total} → ${report.kept} entries (${report.removed.length} duplicate(s) removed)\n` +
+          `previous version snapshotted to ${snap}`,
       );
       return;
     }
@@ -2254,6 +2425,80 @@ function cmdStats() {
   }
 }
 
+/**
+ * E#17 — non-interactive distill: `aih distill [--format json]`.
+ * Deterministic repeated-flow extraction over the recent sessions (the same
+ * pure functions /distill uses in the TUI). Non-interactive so it can run as
+ * a background job (`/bg distill`) or in CI.
+ */
+function cmdDistill(flags: Record<string, string | boolean>) {
+  const format = str(flags, "format") ?? "text";
+  const files = sessionFiles().slice(0, 5);
+  const sessionsEvents = files.map((f) => {
+    try {
+      return readSessionEvents(f.name);
+    } catch {
+      return [];
+    }
+  });
+  const material = extractDreamMaterial(sessionsEvents);
+  if (format === "json") {
+    console.log(
+      JSON.stringify(
+        { sessions: material.sessions, flows: material.flows, corrections: material.corrections },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (!material.flows.length) {
+    console.log(`distill: scanned ${material.sessions} session(s) — no repeated flows (≥3 identical calls) found`);
+    return;
+  }
+  const lines = [`distill: ${material.flows.length} repeated-flow candidate(s) across ${material.sessions} session(s):`];
+  for (const f of material.flows) {
+    lines.push(`  - ${f.tool} ×${f.count}: ${f.signature}`);
+    lines.push(`    → ${f.suggestion}`);
+  }
+  lines.push("\nwrap the top one as a workflow (.aih/workflows/<name>.mjs) or a skill");
+  console.log(lines.join("\n"));
+}
+
+/** E#17 — non-interactive memory tidy: `aih tidy [project|user] [--apply]`. */
+function cmdTidy(positionals: string[], flags: Record<string, string | boolean>) {
+  const scope = (positionals[0] ?? "project") as "project" | "user";
+  if (scope !== "project" && scope !== "user") {
+    console.error(`error: unknown scope "${scope}" (use project|user)`);
+    process.exit(1);
+  }
+  const target = scope === "user" ? join(userAihDir(), "memory.md") : join(process.cwd(), ".aih", "memory.md");
+  if (!existsSync(target)) {
+    console.log(`no ${scope} memory to tidy yet (${target})`);
+    return;
+  }
+  const current = readFileSync(target, "utf8");
+  const report = tidyMemory(current);
+  if (report.noChange) {
+    console.log(formatTidyReport(report));
+    return;
+  }
+  if (bool(flags, "apply")) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const snap = `${target}.pre-tidy-${stamp}`;
+    writeFileSync(snap, current, "utf8");
+    writeFileSync(target, report.cleaned, "utf8");
+    console.log(
+      `tidied ${scope} memory: ${report.total} → ${report.kept} entries (${report.removed.length} duplicate(s) removed)\n` +
+        `previous version snapshotted to ${snap}`,
+    );
+  } else {
+    console.log(
+      `${formatTidyReport(report)}\n\n(dry run — pass --apply to write; snapshot will be saved)`,
+    );
+  }
+}
+
 /** P2#9 — config `$schema` for editor autocompletion. */
 const AIH_SCHEMA_URL = "https://aih.dev/schema/aih.schema.json";
 function aihSchemaPath(): string {
@@ -2694,6 +2939,10 @@ async function main() {
     }
     case "stats":
       return cmdStats();
+    case "tidy":
+      return cmdTidy(positionals, flags);
+    case "distill":
+      return cmdDistill(flags);
     case "skills":
       return cmdSkills(positionals[0] ?? "", positionals.slice(1), flags);
     case "config":
