@@ -44,12 +44,21 @@ import {
   loadModelCatalog,
   loadPermissionRules,
   providerEntry,
+  loadPrices,
   resolveLlm,
   resolveServers,
   savePermissionRule,
   saveSkillRegistry,
   type ModelCatalogEntry,
 } from "./config.js";
+import {
+  aggregateUsage,
+  fmtCost,
+  fmtTps,
+  resolvePrice,
+  tokensPerSecond,
+  totalCost,
+} from "./cost.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
@@ -1049,6 +1058,18 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           envBaseUrl: process.env.AIH_BASE_URL,
         }).provider ?? "custom";
 
+  // F#30: resolve the active model's price (user `prices` override → built-in
+  // table). Recomputed lazily so a runtime /model switch picks up the new price.
+  const currentPrice = () => {
+    const id =
+      str(flags, "model") ??
+      process.env.AIH_MODEL ??
+      resolveLlm({}).model.value ??
+      "";
+    if (!id) return undefined;
+    return resolvePrice(id, loadPrices());
+  };
+
   /**
    * Switch the active model/provider at runtime: update the resolution flags,
    * refresh labels + context window and rebuild the loop (fresh LLM client).
@@ -1200,10 +1221,19 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         .map((e) => (e.type === "turn/end" ? (e.usage?.promptTokens ?? 0) : 0))
         .filter((n) => n > 0)
         .slice(-8);
+      // F#30: cost + throughput (only when the model has a price table entry)
+      const price = currentPrice();
+      const usage = aggregateUsage(log.all());
       return {
         used: usedTokens,
         limit: resolveContextWindow(flags),
         trend,
+        ...(price && usage.totalTokens > 0
+          ? { cost: totalCost(log.all(), price) }
+          : {}),
+        ...(usage.totalTokens > 0
+          ? { tps: tokensPerSecond(log.all()) }
+          : {}),
       };
     },
   });
@@ -1554,14 +1584,22 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         }
       }
       const limit = resolveContextWindow(flags);
-      tui.pushSystem(
-        [
-          `turns: ${ends.length}`,
-          `context now: ${usedTokens}/${limit} (${Math.round(Math.min(1, usedTokens / limit) * 100)}%)`,
-          `context peak (prompt tokens): ${peakTokens}`,
-          `session totals: ${prompt}/${completion}/${total} (prompt/completion/total)`,
-        ].join("\n"),
-      );
+      const lines = [
+        `turns: ${ends.length}`,
+        `context now: ${usedTokens}/${limit} (${Math.round(Math.min(1, usedTokens / limit) * 100)}%)`,
+        `context peak (prompt tokens): ${peakTokens}`,
+        `session totals: ${prompt}/${completion}/${total} (prompt/completion/total)`,
+      ];
+      // F#30: cost + throughput
+      const price = currentPrice();
+      if (price && total > 0) {
+        lines.push(`cost: ${fmtCost(totalCost(log.all(), price))} (model price: ${price.input}/${price.output} per 1M in/out)`);
+      } else if (total > 0) {
+        lines.push("cost: — (no price table entry for the active model; set `prices` in aih.json)");
+      }
+      const tps = tokensPerSecond(log.all());
+      if (tps > 0) lines.push(`throughput: ${fmtTps(tps)} (session average)`);
+      tui.pushSystem(lines.join("\n"));
       return;
     }
     if (input === "/memory") {
@@ -1968,6 +2006,7 @@ function cmdStats() {
   let prompt = 0;
   let completion = 0;
   let total = 0;
+  const ts: number[] = [];
   for (const file of sessionFiles()) {
     for (const event of readSessionEvents(file.name)) {
       if (event.type === "turn/end" && event.usage) {
@@ -1975,6 +2014,7 @@ function cmdStats() {
         prompt += event.usage.promptTokens;
         completion += event.usage.completionTokens;
         total += event.usage.totalTokens;
+        ts.push(event.ts);
       }
     }
   }
@@ -1985,6 +2025,17 @@ function cmdStats() {
   console.log(`sessions   ${sessionFiles().length}`);
   console.log(`turns      ${turns}`);
   console.log(`tokens     ${prompt} prompt / ${completion} completion / ${total} total`);
+  // F#30: cost + throughput for the active model
+  const modelId = process.env.AIH_MODEL ?? resolveLlm({}).model.value ?? "";
+  const price = modelId ? resolvePrice(modelId, loadPrices()) : undefined;
+  if (price) {
+    const cost = (prompt / 1e6) * price.input + (completion / 1e6) * price.output;
+    console.log(`cost       ${fmtCost(cost)} (model ${price.input}/${price.output} per 1M in/out)`);
+  }
+  if (ts.length >= 2) {
+    const span = (Math.max(...ts) - Math.min(...ts)) / 1000;
+    if (span > 0) console.log(`throughput ${fmtTps(total / span)} (across recorded turns)`);
+  }
 }
 
 async function cmdConfig(flags: Record<string, string | boolean>) {

@@ -39,7 +39,15 @@ export interface TuiOptions {
   busy(): boolean;
   cancelTurn?(): void;
   onLine(line: string): void;
-  ctxUsage?(): { used: number; limit: number; trend?: number[] };
+  ctxUsage?(): {
+    used: number;
+    limit: number;
+    trend?: number[];
+    /** F#30: cumulative session cost in USD (undefined = no price table match) */
+    cost?: number;
+    /** F#30: session throughput tokens/s (0 = no usage data) */
+    tps?: number;
+  };
   completions?(): string[];
   onTab?(): void;
   /** open the command palette (ctrl-p) */
@@ -1488,7 +1496,13 @@ constructor(opts: TuiOptions) {
     return null;
   }
 
-  #panelCtx(): { used: number; limit: number; trend?: number[] } | null {
+  #panelCtx(): {
+    used: number;
+    limit: number;
+    trend?: number[];
+    cost?: number;
+    tps?: number;
+  } | null {
     const u = this.#opts.ctxUsage?.();
     if (!u || !(u.limit > 0)) return null;
     return u;
@@ -1555,6 +1569,15 @@ constructor(opts: TuiOptions) {
       lines.push(this.#progressBar(pct, bw));
       const spark = Tui.sparkline(ctx.trend);
       lines.push(muted(`${this.#fmtTok(used)} / ${this.#fmtTok(ctx.limit)} · ${pct}%${spark ? `  ${spark}` : ""}`));
+      // F#30: cost + throughput (only when the model has a price table entry)
+      const extras: string[] = [];
+      if (typeof ctx.cost === "number" && ctx.cost > 0) {
+        extras.push(`cost ${ctx.cost < 0.01 ? `${ctx.cost.toFixed(4)}` : `${ctx.cost.toFixed(2)}`}`);
+      }
+      if (typeof ctx.tps === "number" && ctx.tps > 0) {
+        extras.push(`${ctx.tps >= 100 ? Math.round(ctx.tps) : ctx.tps.toFixed(1)} tok/s`);
+      }
+      if (extras.length) lines.push(muted(extras.join(" · ")));
       if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));
     }
     const todos = this.#panelTodos();

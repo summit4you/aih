@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  resolvePrice,
+  totalCost,
+  tokensPerSecond,
+  fmtCost,
+  fmtTps,
+  DEFAULT_PRICES,
+} from "./cost.js";
+import type { SessionEvent } from "@aih/core";
 
 const cli = fileURLToPath(new URL("./index.js", import.meta.url));
 
@@ -17,6 +26,61 @@ function aih(args: string[], env: Record<string, string> = {}) {
     encoding: "utf8",
     env: { ...process.env, ...env },
   });
+}
+
+// --- F#30: cost / TPS (pure functions over seeded events) -------------------
+{
+  // Price resolution: exact, substring, user-override, and miss.
+  assert(
+    resolvePrice("gpt-4o")?.input === 2.5 && resolvePrice("gpt-4o")?.output === 10,
+    "resolvePrice finds built-in gpt-4o",
+  );
+  assert(
+    resolvePrice("gpt-4o-2024-11-20")?.input === 2.5,
+    "resolvePrice matches a dated id to the gpt-4o row",
+  );
+  assert(
+    resolvePrice("GPT-4O-MINI")?.input === 0.15,
+    "resolvePrice is case-insensitive and picks the more specific mini row",
+  );
+  assert(
+    resolvePrice("my-custom-model", { "my-custom-model": { input: 1, output: 2 } })?.input === 1,
+    "user `prices` override wins for an unknown model",
+  );
+  assert(
+    resolvePrice("totally-unknown-xyz") === undefined,
+    "resolvePrice returns undefined when no table matches",
+  );
+
+  // Seeded turn/end events with known usage + timestamps.
+  const mk = (seq: number, ts: number, prompt: number, completion: number): SessionEvent =>
+    ({
+      seq,
+      ts,
+      type: "turn/end",
+      turnId: `t${seq}`,
+      stopReason: "end_turn",
+      usage: { promptTokens: prompt, completionTokens: completion, totalTokens: prompt + completion },
+    }) as SessionEvent;
+  const events = [
+    mk(0, 1_000_000, 1_000_000, 0), // 1M input
+    mk(1, 1_002_000, 0, 1_000_000), // 1M output, 2s later
+  ];
+  const price = resolvePrice("gpt-4o")!;
+  // 1M input @ $2.5 + 1M output @ $10 = $12.50
+  const c = totalCost(events, price);
+  assert(Math.abs(c - 12.5) < 1e-9, `totalCost = $12.50 for 1M in + 1M out (got ${c})`);
+  // 2M tokens over 2s = 1,000,000 tok/s
+  const tps = tokensPerSecond(events);
+  assert(Math.abs(tps - 1_000_000) < 1e-6, `tokensPerSecond = 1e6 tok/s (got ${tps})`);
+  assert(tokensPerSecond([mk(0, 1, 100, 100)]) === 0, "TPS is 0 with a single turn");
+  assert(tokensPerSecond([]) === 0, "TPS is 0 with no events");
+  assert(fmtCost(12.5) === "$12.50", "fmtCost formats >=0.01 to 2 decimals");
+  assert(fmtCost(0.0042) === "$0.0042", "fmtCost formats <0.01 to 4 decimals");
+  assert(fmtCost(0) === "$0.00", "fmtCost(0) is $0.00");
+  assert(fmtTps(1000) === "1000 tok/s", "fmtTps rounds >=100");
+  assert(fmtTps(0) === "", "fmtTps(0) is empty");
+  assert(Object.keys(DEFAULT_PRICES).length >= 10, "built-in price table has entries");
 }
 
 const version = aih(["--version"]);

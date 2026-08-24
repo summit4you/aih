@@ -40,6 +40,12 @@ export interface AihConfig {
   permissions?: PermissionRule[];
   /** context window (max input tokens); per-provider value wins for that provider */
   contextWindow?: number;
+  /**
+   * F#30 — model price table ($ per 1M tokens, { input, output }).
+   * Keys are model-id substrings; user values override the built-in table.
+   * e.g. { "gpt-4o": { "input": 2.5, "output": 10 } }
+   */
+  prices?: Record<string, { input: number; output: number }>;
   /** external skill registry (opencode-compatible index.json base URL(s)) */
   skills?: { registry?: string | string[] };
 }
@@ -105,6 +111,16 @@ function fromLayers(
     if (value !== undefined) return { value, source: layers[i].path };
   }
   return { value: undefined, source: "unset" };
+}
+
+/** F#30 — merged `prices` table from all config layers (user overrides win). */
+export function loadPrices(): Record<string, { input: number; output: number }> | undefined {
+  const layers = loadLayers();
+  let out: Record<string, { input: number; output: number }> | undefined;
+  for (const { config } of layers) {
+    if (config.prices) out = { ...(out ?? {}), ...config.prices };
+  }
+  return out;
 }
 
 export function loadPermissionRules(): PermissionRule[] {
