@@ -553,12 +553,12 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 
 - **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）—— 余：沙箱 seam、后台 jobs（roadmap D/F）。
 - **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）。余：checkpoint 回滚。
-- **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS、side-by-side diff。
+- **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS、side-by-side diff 行号列（核心双色单元格 ✅ F#31）。
 - **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）→ 未做；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）→ 未做；⑥ side-by-side diff（MiMo，此前已承诺）→ 未做；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
+**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）→ 未做；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）→ 未做；⑥ side-by-side diff（MiMo，此前已承诺）→ ◐ 核心已交付：edit/write/apply_patch 双色单元格（红删/绿加，明暗双主题）；余行号列与窄屏回退；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
 
 一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
 
