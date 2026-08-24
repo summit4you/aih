@@ -769,6 +769,21 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   assert(countSecrets("sk-abcdef1234567890") >= 1, "countSecrets counts secret shapes");
   assert(countSecrets("no secrets here") === 0, "countSecrets is 0 for clean text");
 
+  // D#11 skill-driven hook config: extra secret shapes from skill front matter
+  const { compileExtraPatterns } = await import("./hooks.js");
+  const extra = ["acme_[A-Z0-9]{16,}"];
+  const rSkill = redactSecrets("key=acme_ABCDEFGHIJKLMNOP1234 done", extra) as string;
+  assert(rSkill.includes("[REDACTED]") && !rSkill.includes("acme_ABCDEFGHIJKLMNOP1234"), "skill-driven pattern masks a custom secret shape");
+  assert(redactSecrets("key=acme_ABCDEFGHIJKLMNOP1234") === "key=acme_ABCDEFGHIJKLMNOP1234", "without the skill pattern the custom shape is untouched");
+  assert(countSecrets("key=acme_ABCDEFGHIJKLMNOP1234", extra) >= 1, "countSecrets sees skill-driven patterns");
+  // invalid regex source is skipped (never breaks the turn)
+  const badExtra = ["[unclosed", "acme_[A-Z0-9]{16,}"];
+  assert(compileExtraPatterns(badExtra).length === 1, "compileExtraPatterns skips invalid regexes");
+  assert(redactSecrets("key=acme_ABCDEFGHIJKLMNOP1234", badExtra) !== "key=acme_ABCDEFGHIJKLMNOP1234", "valid patterns still apply alongside an invalid one");
+  // builtin patterns still apply on top of skill-driven ones
+  const rBoth = redactSecrets("a=sk-abcdef1234567890 b=acme_ABCDEFGHIJKLMNOP1234", extra) as string;
+  assert(!rBoth.includes("sk-abcdef1234567890") && !rBoth.includes("acme_ABCDEFGHIJKLMNOP1234"), "builtin + skill-driven patterns both apply");
+
   const regHooks = new ToolRegistry(new AutoApprove());
   regHooks.register({
     name: "leaky",
@@ -2182,6 +2197,30 @@ await srv.connect(new StdioServerTransport());
   ];
   const ch = suggestSkills("release deploy to production", custom, 2);
   assert(ch.length > 0 && ch[0].skill.name === "deploy", "suggestSkills: explicit list ranks deploy first");
+}
+
+// --- D#11: skill-driven hook config (secretPatterns front matter) -----------
+{
+  const { parseSkillMd, skillSecretPatterns } = await import("./skills.js");
+  const parsed = parseSkillMd(
+    "---\nname: acme\ndescription: acme ops\nsecretPatterns: acme_[A-Z0-9]{16,}; zzz_[0-9]{8,}\n---\n# body\n",
+    "fallback",
+  );
+  assert(parsed.name === "acme", "parseSkillMd reads name");
+  assert(Array.isArray(parsed.secretPatterns) && parsed.secretPatterns.length === 2, "parseSkillMd parses secretPatterns list");
+  assert(parsed.secretPatterns![0] === "acme_[A-Z0-9]{16,}" && parsed.secretPatterns![1] === "zzz_[0-9]{8,}", "parseSkillMd splits semicolon-separated patterns (keeps {n,} quantifiers intact)");
+  // no secretPatterns → undefined
+  const plain = parseSkillMd("---\nname: x\ndescription: d\n---\nbody\n", "fb");
+  assert(plain.secretPatterns === undefined, "parseSkillMd: absent secretPatterns → undefined");
+  // skillSecretPatterns unions across skills (deduped)
+  const skills = [
+    { name: "a", description: "", scope: "project" as const, body: "", secretPatterns: ["p1", "p2"] },
+    { name: "b", description: "", scope: "project" as const, body: "", secretPatterns: ["p2", "p3"] },
+    { name: "c", description: "", scope: "builtin" as const, body: "" },
+  ];
+  const union = skillSecretPatterns(skills);
+  assert(union.length === 3 && union.includes("p1") && union.includes("p2") && union.includes("p3"), "skillSecretPatterns unions + dedupes");
+  assert(skillSecretPatterns([{ name: "c", description: "", scope: "builtin" as const, body: "" }]).length === 0, "skillSecretPatterns: none declared → empty");
 }
 
 // --- F#30: streaming TPS (per-request generation time) ------------------------

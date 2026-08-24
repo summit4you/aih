@@ -59,7 +59,7 @@ export function composeHooks(sets: ToolHooks[]): ToolHooks {
  *  secret (bare token shapes). */
 type SecretPattern = { re: RegExp; group?: number };
 
-const SECRET_PATTERNS: SecretPattern[] = [
+const BUILTIN_SECRET_PATTERNS: SecretPattern[] = [
   // OpenAI / Anthropic / GitHub / Google / AWS / Slack / generic long tokens
   { re: /sk-[A-Za-z0-9_-]{8,}/g },
   { re: /ghp_[A-Za-z0-9]{16,}/g },
@@ -78,9 +78,33 @@ const SECRET_PATTERNS: SecretPattern[] = [
 
 const REDACTED = "[REDACTED]";
 
-function redactString(s: string): string {
+/**
+ * D#11 — skill-driven hook config: compile extra secret-shape regex sources
+ * (from SKILL.md front matter `secretPatterns`) into patterns where the whole
+ * match is the secret. Invalid regexes are skipped — a skill's config must
+ * never break the turn.
+ */
+export function compileExtraPatterns(sources: string[]): SecretPattern[] {
+  const out: SecretPattern[] = [];
+  for (const src of sources) {
+    try {
+      out.push({ re: new RegExp(src, "g") });
+    } catch {
+      /* invalid pattern — skip */
+    }
+  }
+  return out;
+}
+
+function allPatterns(extra?: string[]): SecretPattern[] {
+  return extra && extra.length
+    ? [...BUILTIN_SECRET_PATTERNS, ...compileExtraPatterns(extra)]
+    : BUILTIN_SECRET_PATTERNS;
+}
+
+function redactString(s: string, patterns: SecretPattern[] = allPatterns()): string {
   let out = s;
-  for (const p of SECRET_PATTERNS) {
+  for (const p of patterns) {
     out = out.replace(p.re, (match, ...args) => {
       // replace() callback args = [p1, p2, ..., offset, string]; drop the
       // trailing offset+string to get the capture groups.
@@ -94,37 +118,46 @@ function redactString(s: string): string {
 
 /**
  * Return a redacted copy of `value` (strings only) with secret shapes masked.
- * Non-string values pass through unchanged.
+ * Non-string values pass through unchanged. `extraPatterns` (D#11) adds
+ * skill-driven secret shapes on top of the built-ins.
  */
-export function redactSecrets(value: unknown): unknown {
-  if (typeof value === "string") return redactString(value);
-  if (Array.isArray(value)) return value.map(redactSecrets);
-  if (value && typeof value === "object") {
-    const rec = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(rec)) out[k] = redactSecrets(v);
-    return out;
-  }
-  return value;
+export function redactSecrets(value: unknown, extraPatterns?: string[]): unknown {
+  const patterns = allPatterns(extraPatterns);
+  const walk = (v: unknown): unknown => {
+    if (typeof v === "string") return redactString(v, patterns);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      const rec = v as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(rec)) out[k] = walk(val);
+      return out;
+    }
+    return v;
+  };
+  return walk(value);
 }
 
 /**
  * Count how many secret shapes a string would redact (for tests / reporting).
  */
-export function countSecrets(value: unknown): number {
-  if (typeof value === "string") {
-    let n = 0;
-    for (const p of SECRET_PATTERNS) {
-      const m = value.match(p.re);
-      if (m) n += m.length;
+export function countSecrets(value: unknown, extraPatterns?: string[]): number {
+  const patterns = allPatterns(extraPatterns);
+  const walk = (v: unknown): number => {
+    if (typeof v === "string") {
+      let n = 0;
+      for (const p of patterns) {
+        const m = v.match(p.re);
+        if (m) n += m.length;
+      }
+      return n;
     }
-    return n;
-  }
-  if (Array.isArray(value)) return value.reduce<number>((a, v) => a + countSecrets(v), 0);
-  if (value && typeof value === "object") {
-    return Object.values(value as Record<string, unknown>).reduce<number>((a, v) => a + countSecrets(v), 0);
-  }
-  return 0;
+    if (Array.isArray(v)) return v.reduce<number>((a, x) => a + walk(x), 0);
+    if (v && typeof v === "object") {
+      return Object.values(v as Record<string, unknown>).reduce<number>((a, x) => a + walk(x), 0);
+    }
+    return 0;
+  };
+  return walk(value);
 }
 
 /**
@@ -135,8 +168,12 @@ export function countSecrets(value: unknown): number {
  * - `after` redacts secrets from the result/error and attaches `duration_ms`.
  *
  * Register BEFORE the audit hook so the audit log sees the redacted result.
+ *
+ * `extraPatterns` (D#11 skill-driven hook config): additional secret-shape
+ * regex sources contributed by installed skills (SKILL.md front matter
+ * `secretPatterns`), masked on top of the built-in table.
  */
-export function builtinHooks(): {
+export function builtinHooks(extraPatterns?: string[]): {
   before: (info: ToolHookInfo) => void;
   after: (info: ToolHookInfo, outcome: ToolInvocationResult) => ToolInvocationResult;
 } {
@@ -154,13 +191,13 @@ export function builtinHooks(): {
       let result: unknown = outcome.result;
       let redactedCount = 0;
       if (outcome.ok && result !== undefined) {
-        redactedCount = countSecrets(result);
-        if (redactedCount > 0) result = redactSecrets(result);
+        redactedCount = countSecrets(result, extraPatterns);
+        if (redactedCount > 0) result = redactSecrets(result, extraPatterns);
       }
       // Redact error messages too (they can echo secrets).
       let error = outcome.error;
       if (error) {
-        const redactedErr = redactSecrets(error);
+        const redactedErr = redactSecrets(error, extraPatterns);
         if (typeof redactedErr === "string" && redactedErr !== error) error = redactedErr;
       }
       const finalResult =

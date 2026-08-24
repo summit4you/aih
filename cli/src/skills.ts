@@ -18,12 +18,24 @@ export interface Skill {
   scope: "project" | "user" | "builtin";
   path?: string;
   body: string;
+  /**
+   * D#11 — skill-driven hook config: extra secret-shape regex sources
+   * (semicolon-separated in the SKILL.md front matter `secretPatterns`) that
+   * the redaction hook masks in addition to the built-in patterns. The whole
+   * match is treated as the secret.
+   */
+  secretPatterns?: string[];
 }
 
 export function parseSkillMd(
   raw: string,
   fallbackName: string,
-): { name: string; description: string; body: string } {
+): {
+  name: string;
+  description: string;
+  body: string;
+  secretPatterns?: string[];
+} {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
   if (!m) return { name: fallbackName, description: "", body: raw.trim() };
   const meta: Record<string, string> = {};
@@ -31,10 +43,19 @@ export function parseSkillMd(
     const kv = /^(\w[\w-]*):\s*(.*)$/.exec(line.trim());
     if (kv) meta[kv[1].toLowerCase()] = kv[2].trim();
   }
+  // Semicolon-delimited (not comma — regex quantifiers like {16,} contain
+  // commas, and `|` is the alternation operator, so both are unsafe).
+  const secretPatterns = meta.secretpatterns
+    ? meta.secretpatterns
+        .split(";")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : undefined;
   return {
     name: meta.name || fallbackName,
     description: meta.description || "",
     body: m[2].trim(),
+    ...(secretPatterns && secretPatterns.length ? { secretPatterns } : {}),
   };
 }
 
@@ -117,6 +138,21 @@ export function suggestSkills(
     .filter((h) => h.score >= best * 0.25)
     .map((h) => ({ skill: byName.get(h.id)!, score: h.score }))
     .filter((h) => h.skill);
+}
+
+/**
+ * D#11 — collect the union of `secretPatterns` across all discovered skills
+ * (project > user > builtin). Feeds the redaction hook so skills can declare
+ * extra secret shapes without touching core. Empty when no skill declares any.
+ */
+export function skillSecretPatterns(skills: Skill[] = discoverSkills()): string[] {
+  const out: string[] = [];
+  for (const s of skills) {
+    for (const p of s.secretPatterns ?? []) {
+      if (!out.includes(p)) out.push(p);
+    }
+  }
+  return out;
 }
 
 export function searchSkills(query: string, skills: Skill[]): Skill[] {

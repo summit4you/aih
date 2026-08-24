@@ -82,6 +82,7 @@ import {
   resolveRegistryUrls,
   searchRemote,
   searchSkills,
+  skillSecretPatterns,
   suggestSkills,
   type RemoteSkill,
   type Skill,
@@ -626,7 +627,11 @@ function auditHooks(cwd: string) {
  * redacted result. Redaction is on by default; `--no-redact` disables it.
  */
 export function attachAudit(registry: ToolRegistry, flags: Record<string, string | boolean>, cwd = process.cwd()): void {
-  if (!bool(flags, "no-redact")) registry.addHooks(builtinHooks());
+  if (!bool(flags, "no-redact")) {
+    // D#11: redaction uses the built-in table + any secretPatterns declared
+    // by installed skills (skill-driven hook config).
+    registry.addHooks(builtinHooks(skillSecretPatterns()));
+  }
   if (!bool(flags, "no-audit")) registry.addHooks(auditHooks(cwd));
 }
 
@@ -649,7 +654,7 @@ export function registerLocalTools(
       // Compose the after-waterfall manually (spread would drop the builtin
       // `after` when audit is enabled).
       hooks: composeHooks([
-        ...(bool(flags, "no-redact") ? [] : [builtinHooks()]),
+        ...(bool(flags, "no-redact") ? [] : [builtinHooks(skillSecretPatterns())]),
         ...(bool(flags, "no-audit") ? [] : [auditHooks(process.cwd())]),
       ]),
     },
