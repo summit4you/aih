@@ -1383,4 +1383,58 @@ await srv.connect(new StdioServerTransport());
   );
 }
 
+// --- P2#7: dream / distill (pure extraction over session events) ------------
+{
+  const { findFlowCandidates, extractDreamMaterial, formatDreamMaterial } =
+    await import("./dream.js");
+  type Ev = Record<string, unknown>;
+  const am = (toolCalls: Array<{ name: string; args: unknown }>): Ev => ({
+    type: "assistant/message",
+    turnId: "t",
+    text: "",
+    toolCalls,
+  });
+  const um = (text: string): Ev => ({ type: "user/message", turnId: "t", text });
+
+  // flow candidates: same tool + same signature >= 3 → candidate; below → not
+  const evs: Ev[] = [
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+    am([{ name: "run_cmd", args: { command: "npm run build" } }]),
+    am([{ name: "webfetch", args: { url: "https://example.com/a" } }]),
+    am([{ name: "webfetch", args: { url: "https://example.com/a/" } }]),
+    am([{ name: "webfetch", args: { url: "https://example.com/a" } }]),
+    am([{ name: "run_cmd", args: { command: "echo once" } }]),
+  ];
+  const flows = findFlowCandidates(evs as never);
+  assert(flows.length === 2, "distill finds exactly 2 repeated flows");
+  assert(flows[0].tool === "run_cmd" && flows[0].count === 3, "most-repeated flow ranks first");
+  assert(flows.some((f) => f.tool === "webfetch" && f.count === 3), "trailing-slash-normalized URL still matches");
+  assert(flows.every((f) => f.count >= 3), "below-threshold flows are excluded");
+
+  // dream material: corrections + checkpoint notes + judge reasons + flows
+  const evs2: Ev[] = [
+    um("不要推送，先本地提交"),
+    um("remember: always run npm run eval before handoff"),
+    um("just a short chat"),
+    { type: "checkpoint", note: "before risky refactor" },
+    { type: "goal/judge", met: false, reason: "tests were not run" },
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+    am([{ name: "run_cmd", args: { command: "npm test" } }]),
+  ];
+  const mat = extractDreamMaterial([[...evs, ...evs2]] as never);
+  assert(mat.sessions === 1, "dream counts sessions scanned");
+  assert(mat.corrections.length === 2, "corrections captured (2 of 3 user turns)");
+  assert(mat.checkpointNotes.includes("before risky refactor"), "checkpoint note captured");
+  assert(mat.judgeReasons.includes("tests were not run"), "judge reason captured");
+  assert(mat.flows.length === 2, "flows carried into dream material");
+  const txt = formatDreamMaterial(mat);
+  assert(txt.includes("sessions scanned: 1") && txt.includes("npm test"), "formatted material renders");
+  // empty input → clean no-op
+  const empty = extractDreamMaterial([[]] as never);
+  assert(empty.corrections.length === 0 && empty.flows.length === 0 && formatDreamMaterial(empty).includes("nothing notable"), "empty sessions → nothing notable");
+}
+
 console.log("\nAIH cli smoke test passed.");

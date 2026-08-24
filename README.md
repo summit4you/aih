@@ -207,6 +207,21 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 - 每轮自动注入 system prompt（预算 `AIH_MEMORY_BUDGET`，默认 4000 字符，超出截断）
 - TUI `/memory` 查看当前记忆
 
+### Dream / Distill（会话即资产）
+
+把历史会话当作可复利资产（roadmap P2#7，`cli/src/dream.ts` 纯函数模块 + TUI 命令）：
+
+- **`/dream`**：扫描最近 5 个会话（每会话最多 40 轮，封顶），抽取"值得记住"的素材——
+  用户纠正/偏好（中英关键词启发式）、checkpoint 备注、goal/judge 理由、重复流程；
+  一次无工具 LLM 调用把素材蒸馏为 ≤5 条 memory 候选。**只建议、不自动写**——
+  用户审阅后用 `remember` 工具落盘（保持"记忆写入需人确认"的边界）
+- **`/distill`**：确定性提取重复流程——同一工具 + 同一归一化参数签名出现 ≥3 次
+  （`run_cmd` 命令 / `webfetch` URL 去尾斜杠 / 文件类 path）即为 skill/workflow 候选，
+  附建议（如 `npm test` ×N → "wrap as a workflow phase"）
+- 边界：`/dream` 无素材时直接报告"nothing notable"不调 LLM；LLM 失败回退打印原始素材；
+  扫描全程有界（5 会话 × 40 轮），大日志不爆
+- 冒烟测试覆盖：flow 阈值/排序/URL 归一化、dream 素材四类抽取、格式化渲染、空会话 no-op
+
 ### Intelligent Context Management（智能上下文管理）
 
 用量提示按最近一次请求的 prompt tokens（真实窗口占用）计算：≥80% 黄色、≥95% 红色。
@@ -581,6 +596,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | plan/build 双模式 | — | ✅ | ✅ | — | ✅ |
 | TUI：流式/markdown/侧栏面板/鼠标 | ◐ Web | ✅ | ✅ | — | ✅ |
 | 成本 / TPS 实时显示 | — | ◐ | ✅ | — | ✅ 面板 + /usage + stats（F#30，会话平均 TPS） |
+| 会话自进化（dream/distill 挖掘记忆+流程） | — | — | ◐ MEMORY | — | ✅ `/dream`+`/distill`（P2#7，只建议不自动写） |
 | 确定性 Workflow（阶段脚本） | — | — | ✅ | — | ✅ `.aih/workflows/*.mjs` |
 | 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
 | 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ |

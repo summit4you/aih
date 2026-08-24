@@ -61,6 +61,7 @@ import {
 } from "./cost.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
+import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import {
@@ -1135,6 +1136,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "tools", hint: "/tools — connected tools & permissions", run: () => handleLine("/tools") },
       { name: "skills", hint: "/skills — installed skill packs", run: () => handleLine("/skills") },
       { name: "memory", hint: "/memory — project memory (.aih/memory.md)", run: () => handleLine("/memory") },
+      { name: "dream", hint: "/dream — mine recent sessions for memory-worthy knowledge", run: () => handleLine("/dream") },
+      { name: "distill", hint: "/distill — repeated flows → skill/workflow candidates", run: () => handleLine("/distill") },
       { name: "events", hint: "/events — session event log toggle", run: () => handleLine("/events") },
       { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
@@ -1209,6 +1212,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/compact",
       "/checkpoint",
       "/restore",
+      "/dream",
+      "/distill",
       "/clear",
       "/inject",
       "/events",
@@ -1242,8 +1247,62 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   gate.attachTui(tui);
   tuiRef.current = tui;
 
-  function setMode(mode: "build" | "plan"): void {
-    if (agentMode === mode) return;
+  // P2#7 helpers — dream/distill over recent session logs (bounded).
+  function collectSessionEventsForDream(): SessionEvent[][] {
+    return sessionFiles()
+      .slice(0, 5)
+      .map((f) => {
+        try {
+          return readSessionEvents(f.name);
+        } catch {
+          return [];
+        }
+      });
+  }
+
+  async function runDream(): Promise<void> {
+    tui.pushSystem("dream: scanning recent sessions…");
+    const material = extractDreamMaterial(collectSessionEventsForDream());
+    const summary = formatDreamMaterial(material);
+    if (summary.includes("(nothing notable found)")) {
+      tui.pushSystem(`dream found nothing notable.\n${summary}`);
+      return;
+    }
+    // One no-tools LLM pass distills the material into memory prose; the
+    // result is only SUGGESTED — the user applies it via the remember tool.
+    try {
+      const resp = await buildLlm(flags).complete({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You turn scanned agent-session findings into durable project-memory entries. " +
+              "Output at most 5 concise markdown bullet lines (each starting with '- '), each stating a " +
+              "durable fact/convention/preference worth remembering across sessions. No preamble.",
+          },
+          { role: "user", content: `Scanned session material:\n${summary}\n\nWrite the memory bullets.` },
+        ],
+        tools: [],
+      });
+      const bullets = resp.text
+        .split("\n")
+        .filter((l) => l.trim().startsWith("-"))
+        .slice(0, 5)
+        .join("\n");
+      if (!bullets) {
+        tui.pushSystem(`dream produced no memory bullets. Raw material:\n${summary}`);
+        return;
+      }
+      tui.pushSystem(
+        `dream suggests adding to .aih/memory.md:\n${bullets}\n\n` +
+          `apply with the remember tool (e.g. tell me "记住这些" or use remember action=append), or /memory to review first`,
+      );
+    } catch (err) {
+      tui.pushError(`dream LLM pass failed: ${err instanceof Error ? err.message : String(err)}\nRaw material:\n${summary}`);
+    }
+  }
+
+  function setMode(mode: "build" | "plan"): void {    if (agentMode === mode) return;
     if (busy) {
       tui.pushSystem("finish the current turn before switching mode");
       return;
@@ -1616,6 +1675,26 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         existsSync(p)
           ? readFileSync(p, "utf8").trim() || "(empty)"
           : "(no project memory yet — the agent can add it with the remember tool)",
+      );
+      return;
+    }
+    // P2#7: dream / distill — "sessions are assets" (scan recent logs).
+    if (input === "/dream" || input.startsWith("/dream ")) {
+      void runDream();
+      return;
+    }
+    if (input === "/distill") {
+      const material = extractDreamMaterial(collectSessionEventsForDream());
+      const flows = material.flows;
+      if (!flows.length) {
+        tui.pushSystem("distill: no repeated flows found (need the same tool + same signature ≥3 times across sessions)");
+        return;
+      }
+      tui.pushSystem(
+        `distill — ${flows.length} candidate(s) for skills/workflows:\n` +
+          flows
+            .map((f) => `• ${f.tool} ×${f.count} — ${f.signature}\n  → ${f.suggestion}`)
+            .join("\n"),
       );
       return;
     }
