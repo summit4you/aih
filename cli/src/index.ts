@@ -61,6 +61,7 @@ import {
   fmtCost,
   fmtTps,
   resolvePrice,
+  streamingTps,
   tokensPerSecond,
   totalCost,
 } from "./cost.js";
@@ -81,6 +82,7 @@ import {
   resolveRegistryUrls,
   searchRemote,
   searchSkills,
+  suggestSkills,
   type RemoteSkill,
   type Skill,
 } from "./skills.js";
@@ -97,6 +99,7 @@ import {
   T_DOCTOR,
   T_EVAL,
   T_GITIGNORE,
+  T_SKILL_MD,
   T_HARNESS_YML,
   T_MCP_ADAPTER,
   T_MCP_INDEX,
@@ -845,6 +848,21 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
         : {}),
     });
 
+    // P1#4: BM25 relevance auto-loading — nudge the model toward a clearly
+    // relevant installed skill (best-effort; the model decides whether to load).
+    if (message.trim().length >= 8) {
+      try {
+        const sugg = suggestSkills(message, skills, 2);
+        if (sugg.length) {
+          loop.inject(
+            `[skill suggestion] "${sugg[0].skill.name}" looks relevant to this request — call load_skill("${sugg[0].skill.name}") to read its instructions before proceeding if it fits.` +
+              (sugg[1] ? ` (also: ${sugg[1].skill.name})` : ""),
+          );
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
     const result = await loop.send(
       message,
       streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
@@ -1350,6 +1368,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           : {}),
         ...(usage.totalTokens > 0
           ? { tps: tokensPerSecond(log.all()) }
+          : {}),
+        ...(usage.totalTokens > 0
+          ? { stps: streamingTps(log.all()) }
           : {}),
       };
     },
@@ -1907,6 +1928,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
       const tps = tokensPerSecond(log.all());
       if (tps > 0) lines.push(`throughput: ${fmtTps(tps)} (session average)`);
+      const stps = streamingTps(log.all());
+      if (stps > 0) lines.push(`streaming: ${fmtTps(stps)} (completion tokens / real generation time)`);
       tui.pushSystem(lines.join("\n"));
       return;
     }
@@ -2115,6 +2138,23 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /skills /inject /events /clear /exit`,
       );
       return;
+    }
+
+    // P1#4: BM25 relevance auto-loading — if an installed skill clearly
+    // matches this request and is not in context yet, nudge the model to
+    // consider it (one line, non-intrusive; the model decides).
+    if (!input.startsWith("/") && input.length >= 8) {
+      try {
+        const sugg = suggestSkills(input, skills, 2);
+        if (sugg.length) {
+          loop.inject(
+            `[skill suggestion] "${sugg[0].skill.name}" looks relevant to this request — call load_skill("${sugg[0].skill.name}") to read its instructions before proceeding if it fits.` +
+              (sugg[1] ? ` (also: ${sugg[1].skill.name})` : ""),
+          );
+        }
+      } catch {
+        /* relevance nudge is best-effort */
+      }
     }
 
     try {
@@ -2393,6 +2433,8 @@ function cmdStats() {
   let prompt = 0;
   let completion = 0;
   let total = 0;
+  let genMs = 0;
+  let genCompletion = 0;
   const ts: number[] = [];
   for (const file of sessionFiles()) {
     for (const event of readSessionEvents(file.name)) {
@@ -2402,6 +2444,10 @@ function cmdStats() {
         completion += event.usage.completionTokens;
         total += event.usage.totalTokens;
         ts.push(event.ts);
+        if (typeof event.genMs === "number" && event.genMs > 0) {
+          genMs += event.genMs;
+          genCompletion += event.usage.completionTokens;
+        }
       }
     }
   }
@@ -2422,6 +2468,9 @@ function cmdStats() {
   if (ts.length >= 2) {
     const span = (Math.max(...ts) - Math.min(...ts)) / 1000;
     if (span > 0) console.log(`throughput ${fmtTps(total / span)} (across recorded turns)`);
+  }
+  if (genMs > 0 && genCompletion > 0) {
+    console.log(`streaming  ${fmtTps(genCompletion / (genMs / 1000))} (completion tokens / real generation time)`);
   }
 }
 
@@ -2656,6 +2705,28 @@ async function cmdSkills(
     return;
   }
 
+  if (action === "suggest") {
+    // P1#4: BM25 relevance ranking of installed skills against a query.
+    const query = args.join(" ");
+    if (!query.trim()) {
+      console.error("error: usage: aih skills suggest <query>");
+      process.exit(1);
+    }
+    const hits = suggestSkills(query, skills, 5);
+    if (!hits.length) {
+      console.log(`no installed skill is relevant to "${query}"`);
+      return;
+    }
+    console.log(`${"score".padEnd(8)} ${"name".padEnd(18)} ${"scope".padEnd(8)} description`);
+    for (const h of hits) {
+      console.log(
+        `${h.score.toFixed(2).padEnd(8)} ${h.skill.name.padEnd(18)} ${scopeLabel(h.skill).padEnd(8)} ${h.skill.description}`,
+      );
+    }
+    console.log(`\nactivate the best match: aih run "..." with load_skill("${hits[0].skill.name}") (or /${hits[0].skill.name} in the TUI)`);
+    return;
+  }
+
   if (action === "install") {
     const name = args[0];
     if (!name) {
@@ -2801,6 +2872,8 @@ function cmdInit(positionals: string[], flags: Record<string, string | boolean>)
   write(".gitignore", T_GITIGNORE);
   write("docs/decisions.md", T_DECISIONS);
   write("tasks/TEMPLATE.md", T_TASK_TEMPLATE);
+  // P1#4: app-specific skill skeleton (auto-discovered as a project skill).
+  write(join(".aih", "skills", `${slug}-app`, "SKILL.md"), T_SKILL_MD);
   write("scripts/bootstrap", T_BOOTSTRAP);
   write("scripts/doctor", T_DOCTOR);
   write("scripts/check", T_CHECK);

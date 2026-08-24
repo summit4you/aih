@@ -99,6 +99,43 @@ Non-negotiables.
 How to prove it works.
 `;
 
+// P1#4 — app-specific skill skeleton. `aih init` drops this into
+// .aih/skills/<slug>-app/SKILL.md so the harness auto-discovers a
+// project-scoped skill that teaches the agent how to operate THIS app.
+// Edit the description + steps to match the real contract; the front-matter
+// `name`/`description` are what BM25 relevance ranking (suggestSkills) and
+// the /skills roster key off of.
+export const T_SKILL_MD = `---
+name: {{SLUG}}-app
+description: Operate the {{NAME}} app safely — read state, perform writes, and verify outcomes through its tools
+---
+
+# {{NAME}} app skill
+
+A project-scoped skill so any agent can drive this app without guessing.
+Fill in the real tool names and state queries from APP.md, then delete the
+placeholders.
+
+## What this app does
+- <one line: the app's purpose and who it serves>
+
+## Read state (safe, no approval)
+- <tool name> — <what it returns>
+- <tool name> — <what it returns>
+
+## Write actions (approval-gated)
+- <tool name> — <effect> — <when it is appropriate>
+
+## Conventions
+- Prefer read actions to understand state before writing.
+- Batch >10 record changes: plan → execute → verify (see batch-ops skill).
+- Never bypass the app API to touch storage directly.
+
+## Verification
+- After a write, re-read the affected state and confirm the change landed.
+- <app-specific acceptance check>
+`;
+
 export const T_BOOTSTRAP = `#!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."

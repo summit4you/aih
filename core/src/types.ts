@@ -117,6 +117,13 @@ export type SessionEvent =
       turnId: string;
       stopReason: string;
       usage?: TokenUsage;
+      /**
+       * F#30: cumulative wall-clock ms the LLM spent generating this turn
+       * (sum of per-request generation spans, measured at the LLM layer).
+       * Absent for non-streaming / mock turns — streaming TPS then falls
+       * back to the session-average metric.
+       */
+      genMs?: number;
     }
   | {
       seq: number;
@@ -179,6 +186,12 @@ export interface LLMResponse {
   stopReason: "tool_use" | "end_turn";
   finishReason?: string;
   usage?: TokenUsage;
+  /**
+   * F#30: wall-clock ms this response took to generate, as measured at the
+   * LLM layer (start of the request → last streamed delta). Set only for
+   * real streaming responses; non-streaming and mock responses omit it.
+   */
+  genMs?: number;
 }
 
 export interface TurnResult {

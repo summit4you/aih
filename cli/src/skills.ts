@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { rank } from "./bm25.js";
 import { loadSkillRegistry } from "./config.js";
 import { userAihDirs } from "./paths.js";
 
@@ -85,6 +86,37 @@ export function discoverSkills(projectDir = process.cwd()): Skill[] {
     if (!byName.has(b.name)) byName.set(b.name, { ...b, scope: "builtin" });
   }
   return [...byName.values()];
+}
+
+export interface SkillSuggestion {
+  skill: Skill;
+  score: number;
+}
+
+/**
+ * P1#4 — BM25 relevance ranking of installed skills against a user query.
+ * Returns the top-k skills whose score is meaningfully above zero (at least
+ * 25% of the best score, so a single weak keyword hit on a long query does
+ * not surface noise). Empty for an empty query or no skills.
+ */
+export function suggestSkills(
+  query: string,
+  skills: Skill[] = discoverSkills(),
+  topK = 3,
+): SkillSuggestion[] {
+  if (!query.trim() || !skills.length) return [];
+  const docs = skills.map((s) => ({
+    id: s.name,
+    text: `${s.name} ${s.description}`,
+  }));
+  const hits = rank(docs, query, topK);
+  const best = hits[0]?.score ?? 0;
+  if (best <= 0) return [];
+  const byName = new Map(skills.map((s) => [s.name, s]));
+  return hits
+    .filter((h) => h.score >= best * 0.25)
+    .map((h) => ({ skill: byName.get(h.id)!, score: h.score }))
+    .filter((h) => h.skill);
 }
 
 export function searchSkills(query: string, skills: Skill[]): Skill[] {

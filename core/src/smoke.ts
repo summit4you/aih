@@ -21,6 +21,7 @@ import {
   EMPTY_RETRY_PROMPT,
 } from "./index.js";
 import type { ChatMessage, SessionEvent, ToolDefinition } from "./types.js";
+import type { LLMAdapter } from "./seams/llm.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -229,6 +230,7 @@ assert(
   retryRes.text === "ok" && retryRes.usage?.totalTokens === 15,
   "usage mapped from OpenAI-compatible response",
 );
+assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F#30)");
 
 {
   // provider config headers (client identity) are sent with every completion call
@@ -338,6 +340,10 @@ assert(
   "streamed tool call args reconstruct from fragments",
 );
 assert(streamRes.usage?.totalTokens === 7, "stream final chunk carries usage");
+assert(
+  typeof streamRes.genMs === "number" && streamRes.genMs >= 0,
+  "streaming response carries per-request genMs (F#30)",
+);
 
 const mockStreamLlm = new MockLLM([{ text: "streamed mock text", stopReason: "end_turn" }]);
 const loopStream = new AgentLoop({
@@ -348,6 +354,29 @@ let mockStreamed = "";
 const streamTurn = await loopStream.send("echo", { onDelta: (d) => (mockStreamed += d) });
 assert(mockStreamed === "streamed mock text", "MockLLM emits deltas through the loop");
 assert(streamTurn.steps === 1, "streamed turn completes normally");
+
+{
+  // F#30: an adapter that reports per-request genMs (like the streaming
+  // OpenAI adapter does) must see it land on the turn/end event.
+  const timedLlm: LLMAdapter = {
+    async complete() {
+      return {
+        text: "done",
+        toolCalls: [],
+        stopReason: "end_turn",
+        usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+        genMs: 250,
+      };
+    },
+  };
+  const timedLog = new SessionLog();
+  const timedLoop = new AgentLoop({ llm: timedLlm, tools, log: timedLog });
+  await timedLoop.send("hi");
+  const end = timedLog
+    .all()
+    .find((e) => e.type === "turn/end") as { type: "turn/end"; genMs?: number };
+  assert(end.genMs === 250, "turn/end carries genMs from the LLM layer (F#30)");
+}
 
 const compactLog = new SessionLog();
 const compactTools = new ToolRegistry(gate);

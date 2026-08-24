@@ -180,6 +180,18 @@ export class AgentLoop {
     this.#activeAbort = ac;
     this.#log.append({ type: "turn/start", turnId });
     this.#log.append({ type: "user/message", turnId, text });
+    // Drain any context injected BEFORE this turn (e.g. a P1#4 skill
+    // relevance nudge) so it is part of the very first model call.
+    if (this.#inbox.length > 0) {
+      const injected = this.#inbox.splice(0);
+      for (const item of injected) {
+        this.#log.append({
+          type: "user/message",
+          turnId,
+          text: `[injected context] ${item}`,
+        });
+      }
+    }
 
     let steps = 0;
     let stopReason = "end_turn";
@@ -187,6 +199,9 @@ export class AgentLoop {
     let contextTokens = 0;
     let contextNow = 0;
     let truncated = false;
+    // F#30: cumulative LLM-layer generation time for this turn (ms). Set by
+    // the adapter only for real streaming responses (mocks leave it unset).
+    let genMs = 0;
     // Consecutive empty responses (no text + no tool call) the model has
     // produced this turn. Models (Qwen3, big-pickle) occasionally "drop" a
     // task mid-turn and return nothing; nudge them to continue a bounded
@@ -229,6 +244,7 @@ export class AgentLoop {
         response = await doComplete();
       }
       usage = addUsage(usage, response.usage);
+      if (typeof response.genMs === "number") genMs += response.genMs;
       const promptTokens = response.usage?.promptTokens ?? 0;
       if (promptTokens > contextTokens) contextTokens = promptTokens;
       if (promptTokens > 0) contextNow = promptTokens;
@@ -363,6 +379,7 @@ export class AgentLoop {
       turnId,
       stopReason,
       ...(usage ? { usage } : {}),
+      ...(genMs > 0 ? { genMs } : {}),
     });
     return {
       turnId,

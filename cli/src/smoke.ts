@@ -2134,4 +2134,77 @@ await srv.connect(new StdioServerTransport());
   assert(normEntry("2026-01-01 — Use Tabs") === normEntry("use tabs"), "normEntry strips date + case/punct");
 }
 
+// --- P1#4: BM25 relevance scoring -------------------------------------------
+{
+  const { tokenize, buildIndex, search, rank } = await import("./bm25.js");
+  // tokenizer: ascii words + CJK bigrams (segmenter-free CJK IR)
+  const toks = tokenize("Batch Ops 批量操作 plan-execute-verify");
+  assert(toks.includes("batch") && toks.includes("ops"), "tokenize keeps ascii words");
+  assert(toks.includes("批量") && toks.includes("操作") && !toks.includes("批量操作"), "tokenize expands CJK runs into bigrams");
+  assert(tokenize("中").length === 1 && tokenize("中") [0] === "中", "tokenize keeps a lone CJK char");
+  assert(tokenize("  ").length === 0, "tokenize of whitespace is empty");
+  // rank: relevant doc beats unrelated, topK caps, empty query → no hits
+  const docs = [
+    { id: "batch-ops", text: "batch operations bulk create update remove plan execute verify" },
+    { id: "app-tour", text: "explore connected app tools capability tour" },
+    { id: "session-report", text: "turn current session history into structured report" },
+  ];
+  const hits = rank(docs, "bulk batch operations", 3);
+  assert(hits.length > 0 && hits[0].id === "batch-ops", "rank: batch-ops tops a bulk-operations query");
+  assert(hits.every((h) => h.score > 0), "rank: only positive-score hits returned");
+  assert(rank(docs, "bulk batch operations", 2).length <= 2, "rank: topK caps results");
+  assert(search(buildIndex(docs), "   ").length === 0, "search: blank query → no hits");
+  assert(rank(docs, "zzz qqq xyz").length === 0, "rank: no-match query → no hits");
+  // CJK query matches CJK text
+  const cjk = rank(
+    [
+      { id: "cn", text: "中文技能：批量操作与验证" },
+      { id: "en", text: "english only skill" },
+    ],
+    "批量操作",
+  );
+  assert(cjk.length > 0 && cjk[0].id === "cn", "rank: CJK query ranks the CJK doc first");
+}
+
+// --- P1#4: suggestSkills (BM25 over installed skills) ------------------------
+{
+  const { suggestSkills, discoverSkills } = await import("./skills.js");
+  const skills = discoverSkills();
+  const hits = suggestSkills("bulk batch operations on app data", skills, 3);
+  assert(hits.length > 0 && hits[0].skill.name === "batch-ops", "suggestSkills: batch-ops tops a bulk-ops query");
+  assert(hits[0].score > 0, "suggestSkills: scores are positive");
+  assert(suggestSkills("   ", skills).length === 0, "suggestSkills: blank query → none");
+  assert(suggestSkills("zzz qqq xyz", skills).length === 0, "suggestSkills: no match → none");
+  // explicit skill list (deterministic, no filesystem)
+  const custom = [
+    { name: "deploy", description: "deploy release publish to production", scope: "project" as const, body: "" },
+    { name: "tour", description: "explore tools capability tour", scope: "project" as const, body: "" },
+  ];
+  const ch = suggestSkills("release deploy to production", custom, 2);
+  assert(ch.length > 0 && ch[0].skill.name === "deploy", "suggestSkills: explicit list ranks deploy first");
+}
+
+// --- F#30: streaming TPS (per-request generation time) ------------------------
+{
+  const { streamingTps } = await import("./cost.js");
+  const mk = (completion: number, genMs: number): SessionEvent =>
+    ({
+      seq: 1,
+      ts: Date.now(),
+      type: "turn/end",
+      turnId: "t",
+      stopReason: "end_turn",
+      usage: { promptTokens: 10, completionTokens: completion, totalTokens: 10 + completion },
+      genMs,
+    }) as SessionEvent;
+  // 100 completion tokens over 2s of generation → 50 tok/s
+  const evts = [mk(60, 1000), mk(40, 1000)];
+  const stps = streamingTps(evts);
+  assert(Math.abs(stps - 50) < 1e-9, "streamingTps: completion tokens / gen time");
+  // no genMs (mock / non-streaming) → 0
+  const noGen = [{ seq: 1, ts: Date.now(), type: "turn/end", turnId: "t", stopReason: "end_turn", usage: { promptTokens: 1, completionTokens: 5, totalTokens: 6 } }] as SessionEvent[];
+  assert(streamingTps(noGen) === 0, "streamingTps: 0 without genMs");
+  assert(streamingTps([]) === 0, "streamingTps: 0 with no events");
+}
+
 console.log("\nAIH cli smoke test passed.");

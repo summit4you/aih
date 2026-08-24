@@ -118,6 +118,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
   }
 
   async complete(req: LLMRequest): Promise<LLMResponse> {
+    const startedAt = Date.now(); // F#30: per-request generation span
     const { baseUrl, apiKey, model } = this.#options;
     // Materialize header placeholders per request (opencode id format: 12 hex ts + 14 base62):
     //  - "{sid}"  → a stable id minted once per client instance (session identity,
@@ -192,6 +193,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
             stopReason: acc.toolCalls.length > 0 ? "tool_use" : "end_turn",
             ...(acc.finishReason ? { finishReason: acc.finishReason } : {}),
             ...(acc.usage ? { usage: acc.usage } : {}),
+            // F#30: real per-request generation time (request → last delta),
+            // enabling a true streaming TPS metric (completion tokens / genMs).
+            genMs: Math.max(0, Date.now() - startedAt),
           };
         }
         return toResponse(await res.json());

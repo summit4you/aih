@@ -49,6 +49,8 @@ export interface TuiOptions {
     cost?: number;
     /** F#30: session throughput tokens/s (0 = no usage data) */
     tps?: number;
+    /** F#30: streaming TPS — completion tokens / real generation ms (0 = n/a) */
+    stps?: number;
   };
   completions?(): string[];
   onTab?(): void;
@@ -1548,6 +1550,7 @@ constructor(opts: TuiOptions) {
     trend?: number[];
     cost?: number;
     tps?: number;
+    stps?: number;
   } | null {
     const u = this.#opts.ctxUsage?.();
     if (!u || !(u.limit > 0)) return null;
@@ -1623,6 +1626,9 @@ constructor(opts: TuiOptions) {
       }
       if (typeof ctx.tps === "number" && ctx.tps > 0) {
         extras.push(`${ctx.tps >= 100 ? Math.round(ctx.tps) : ctx.tps.toFixed(1)} tok/s`);
+      }
+      if (typeof ctx.stps === "number" && ctx.stps > 0) {
+        extras.push(`stream ${ctx.stps >= 100 ? Math.round(ctx.stps) : ctx.stps.toFixed(1)} tok/s`);
       }
       if (extras.length) lines.push(muted(extras.join(" · ")));
       if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));

@@ -136,6 +136,27 @@ export function tokensPerSecond(events: readonly SessionEvent[]): number {
   return total / spanSec;
 }
 
+/**
+ * F#30: streaming (per-request) TPS — completion tokens generated per second
+ * of real LLM generation time, summed across all streaming turn/end events
+ * that carry `genMs`. This is the true per-token throughput (unlike
+ * `tokensPerSecond`, which is the session wall-clock average). 0 when no
+ * turn recorded generation time (mock / non-streaming).
+ */
+export function streamingTps(events: readonly SessionEvent[]): number {
+  let completion = 0;
+  let genMs = 0;
+  for (const e of events) {
+    if (e.type !== "turn/end") continue;
+    if (typeof e.genMs === "number" && e.genMs > 0) {
+      genMs += e.genMs;
+      completion += e.usage?.completionTokens ?? 0;
+    }
+  }
+  if (genMs <= 0 || completion <= 0) return 0;
+  return completion / (genMs / 1000);
+}
+
 /** Human cost string: "$0.0042" for small, "$1.23" for larger. */
 export function fmtCost(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "$0.00";
