@@ -16,8 +16,11 @@ import {
   deriveScope,
   matchPattern,
   toolCall,
+  COMPACT_CONTINUE_PROMPT,
+  MAX_STEPS_PROMPT,
+  EMPTY_RETRY_PROMPT,
 } from "./index.js";
-import type { ChatMessage, ToolDefinition } from "./types.js";
+import type { ChatMessage, SessionEvent, ToolDefinition } from "./types.js";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -366,6 +369,68 @@ assert(
   "contextNow drops below pre-compaction prompt size after compaction",
 );
 
+// User-query invariant (opencode/MiMo-Code parity): a compaction that folds
+// the turn's user message into the summary and stores no replay tail must not
+// leave the model-visible window with zero user messages (Qwen3 and other
+// strict chat templates 400 with "No user query found in messages").
+const noUserLog = new SessionLog();
+noUserLog.append({ type: "user/message", turnId: "t1", text: "do the thing" });
+noUserLog.append({ type: "assistant/message", turnId: "t1", text: "", toolCalls: [toolCall("k9", "echo", { text: "x" })] });
+noUserLog.append({ type: "tool/call", turnId: "t1", callId: "k9", name: "echo", args: { text: "x" } });
+noUserLog.append({ type: "tool/result", turnId: "t1", callId: "k9", ok: true, result: { echoed: "x" } });
+noUserLog.append({ type: "compaction", turnId: "t1", summary: "All work summarized." });
+const noUserDerived = noUserLog.deriveMessages("sys");
+assert(
+  noUserDerived.some((m) => m.role === "user" && m.content === "do the thing"),
+  "deriveMessages re-anchors the last user message when compaction swallowed it",
+);
+assert(
+  noUserDerived.filter((m) => m.role === "user").length === 1,
+  "user-query guard appends exactly one user message",
+);
+const synthLog = new SessionLog();
+synthLog.append({ type: "assistant/message", turnId: "t2", text: "orphan", toolCalls: [] });
+synthLog.append({ type: "compaction", turnId: "t2", summary: "s" });
+const synthDerived = synthLog.deriveMessages("sys");
+assert(
+  synthDerived.some((m) => m.role === "user" && m.content === COMPACT_CONTINUE_PROMPT),
+  "deriveMessages falls back to the synthetic continue prompt when no user message exists",
+);
+
+// A turn whose size exceeds the recent-tail budget (opencode "tail fallback")
+// must replay that turn's user message as the new verbatim tail after
+// compaction, so its request stays visible in the post-compaction window.
+const replayLog = new SessionLog();
+const replayTools = new ToolRegistry(gate);
+replayTools.register(echo);
+const replayUser = "huge turn: " + "context ".repeat(1700); // ~2550 est tokens > 1600 budget (window 8000)
+replayLog.append({ type: "user/message", turnId: "bulk", text: "seed: " + "old ".repeat(300) });
+replayLog.append({ type: "assistant/message", turnId: "bulk", text: "seed answer", toolCalls: [] });
+const replayLlm = new MockLLM([
+  { text: "ok, working on it", stopReason: "end_turn", usage: { promptTokens: 7000, completionTokens: 10, totalTokens: 7010 } },
+  { text: "## Objective\n- summarized the huge turn" },
+]);
+const replayResult = await new AgentLoop({
+  llm: replayLlm,
+  tools: replayTools,
+  log: replayLog,
+  systemPrompt: "sys",
+  contextWindow: 8000,
+  compactAt: 0.8,
+}).send(replayUser);
+assert(replayResult.stopReason === "end_turn", "mega-turn compaction completes the turn");
+const replayCompacts = replayLog.all().filter((e) => e.type === "compaction") as Extract<SessionEvent, { type: "compaction" }>[];
+assert(replayCompacts.length === 1, "mega turn (tail over budget) still compacts");
+assert(
+  replayCompacts[0].recent?.some((m) => m.role === "user" && m.content === replayUser) === true,
+  "#compact replays the turn's user message when the tail selection is empty",
+);
+const replayDerived = replayLog.deriveMessages("sys");
+assert(
+  replayDerived.some((m) => m.role === "user" && m.content === replayUser),
+  "post-compaction request contains the user's request again (replay tail)",
+);
+
 const blankLog = new SessionLog();
 const blankTools = new ToolRegistry(gate);
 blankTools.register(echo);
@@ -470,6 +535,71 @@ const capResult = await new AgentLoop({ llm: capLlm, tools: capTools, maxStepsPe
 assert(capResult.stopReason === "max_steps", "turn stops with max_steps at the step budget");
 assert(capResult.steps === 2, "step budget caps executed steps");
 
+// opencode/MiMo-Code parity: the final step's request is prefilled with
+// MAX_STEPS_PROMPT (trailing assistant message) so the model wraps up in text
+// instead of being cut off mid-tool-call; earlier steps carry no prefill.
+const handoffInputs: ChatMessage[][] = [];
+const handoffLlm = {
+  async complete(req: { messages: ChatMessage[] }) {
+    handoffInputs.push(req.messages);
+    return {
+      text: "working",
+      toolCalls: [toolCall(`h${handoffInputs.length}`, "echo", { text: "z" })],
+      stopReason: "tool_use" as const,
+    };
+  },
+};
+const handoff = await new AgentLoop({ llm: handoffLlm, tools: capTools, maxStepsPerTurn: 2 }).send("loop");
+assert(handoff.stopReason === "max_steps", "capped turn still stops at the step budget");
+assert(
+  handoffInputs[0][handoffInputs[0].length - 1]?.content !== MAX_STEPS_PROMPT,
+  "non-final step requests carry no handoff prefill",
+);
+assert(
+  handoffInputs[1][handoffInputs[1].length - 1]?.role === "assistant" &&
+    handoffInputs[1][handoffInputs[1].length - 1]?.content === MAX_STEPS_PROMPT,
+  "final step request is prefilled with MAX_STEPS_PROMPT",
+);
+
+// Empty-response retry: the model "drops" the task (no text, no tool call) a
+// couple of times, then resumes. The harness nudges it (bounded) instead of
+// ending the turn, and the task completes.
+const emptyTools = new ToolRegistry(gate);
+emptyTools.register(echo);
+const emptyLlm = new MockLLM([
+  { text: "", toolCalls: [], stopReason: "end_turn" }, // empty → nudge 1
+  { text: "", toolCalls: [], stopReason: "end_turn" }, // empty → nudge 2
+  { text: "", toolCalls: [toolCall("e1", "echo", { text: "resumed" })], stopReason: "tool_use" }, // progress
+  { text: "Done.", stopReason: "end_turn" }, // finish
+]);
+const emptyLog = new SessionLog();
+const emptyResult = await new AgentLoop({ llm: emptyLlm, tools: emptyTools, log: emptyLog }).send("do the task");
+assert(emptyResult.stopReason === "end_turn", "turn completes after recovering from empty responses");
+const nudges = emptyLog.all().filter((e) => e.type === "user/message" && e.text === EMPTY_RETRY_PROMPT);
+assert(nudges.length === 2, "two empty-response nudges injected (bounded by MAX_EMPTY_RETRIES)");
+
+// Empty-response exhaustion: the model returns empty every time; after
+// MAX_EMPTY_RETRIES nudges the harness gives up and ends the turn (no infinite loop).
+const stuckLlm = new MockLLM([
+  { text: "", toolCalls: [], stopReason: "end_turn" },
+  { text: "", toolCalls: [], stopReason: "end_turn" },
+  { text: "", toolCalls: [], stopReason: "end_turn" },
+  { text: "", toolCalls: [], stopReason: "end_turn" },
+]);
+const stuckLog = new SessionLog();
+const stuckResult = await new AgentLoop({ llm: stuckLlm, tools: emptyTools, log: stuckLog }).send("do the task");
+assert(stuckResult.stopReason === "end_turn", "stuck-on-empty turn ends (no infinite loop)");
+const stuckNudges = stuckLog.all().filter((e) => e.type === "user/message" && e.text === EMPTY_RETRY_PROMPT);
+assert(stuckNudges.length === 2, "gives up after MAX_EMPTY_RETRIES nudges");
+
+// A genuine end-of-turn (text present, no tool call) must NOT be retried.
+const genuineLlm = new MockLLM([{ text: "All done.", stopReason: "end_turn" }]);
+const genuineLog = new SessionLog();
+const genuineResult = await new AgentLoop({ llm: genuineLlm, tools: emptyTools, log: genuineLog }).send("status?");
+assert(genuineResult.stopReason === "end_turn", "genuine text answer ends the turn");
+const genuineNudges = genuineLog.all().filter((e) => e.type === "user/message" && e.text === EMPTY_RETRY_PROMPT);
+assert(genuineNudges.length === 0, "a non-empty final answer is not nudged");
+
 const truncTools = new ToolRegistry(gate);
 truncTools.register(echo);
 const truncLoop = new AgentLoop({
@@ -539,6 +669,174 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
     /unmet/.test(jp) && /met"\s*:\s*true\|false/.test(jp),
     "judge prompt specifies the extended verdict schema",
   );
+}
+
+{
+  // F#29: consecutive read-only tool calls run concurrently (bounded by
+  // readConcurrency); write tools stay serial; results log in original call
+  // order regardless of completion order (codex parallel.rs parity).
+  const parGate = { async request() { return true; } };
+
+  // (a) three identical slow reads overlap: max in-flight reaches 3 and the
+  // wall clock is well under the serial sum (3 x 60ms).
+  const inflight = { n: 0, max: 0 };
+  const parTools = new ToolRegistry(parGate);
+  parTools.register({
+    name: "slow_read",
+    description: "read that takes time",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => {
+      inflight.n += 1;
+      inflight.max = Math.max(inflight.max, inflight.n);
+      await new Promise((r) => setTimeout(r, 60));
+      inflight.n -= 1;
+      return { ok: true };
+    },
+  } satisfies ToolDefinition);
+  const parLog = new SessionLog();
+  const parLlm = new MockLLM([
+    {
+      text: "reading",
+      toolCalls: [
+        toolCall("p1", "slow_read", {}),
+        toolCall("p2", "slow_read", {}),
+        toolCall("p3", "slow_read", {}),
+      ],
+      stopReason: "tool_use",
+    },
+    { text: "Done.", stopReason: "end_turn" },
+  ]);
+  const t0 = Date.now();
+  const parTurn = await new AgentLoop({ llm: parLlm, tools: parTools, log: parLog }).send("read thrice");
+  const elapsed = Date.now() - t0;
+  assert(parTurn.stopReason === "end_turn", "parallel-read turn completes");
+  assert(inflight.max === 3, "three consecutive read-only calls ran concurrently");
+  assert(elapsed < 150, `parallel batch beats serial sum (${elapsed}ms < ~180ms)`);
+
+  // (b) completion order differs from call order, but tool/result events are
+  // appended in the ORIGINAL call order.
+  const ordLog = new SessionLog();
+  const ordTools = new ToolRegistry(parGate);
+  ordTools.register({
+    name: "stagger_read",
+    description: "sleeps for args.delay ms then reports it",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: { delay: { type: "number", description: "ms to sleep" } },
+      required: ["delay"],
+    },
+    execute: async (args) => {
+      const delay = (args as { delay: number }).delay;
+      await new Promise((r) => setTimeout(r, delay));
+      return { delay };
+    },
+  } satisfies ToolDefinition);
+  const ordLlm = new MockLLM([
+    {
+      text: "staggered",
+      toolCalls: [
+        toolCall("o1", "stagger_read", { delay: 90 }),
+        toolCall("o2", "stagger_read", { delay: 50 }),
+        toolCall("o3", "stagger_read", { delay: 10 }),
+      ],
+      stopReason: "tool_use",
+    },
+    { text: "Done.", stopReason: "end_turn" },
+  ]);
+  const ordTurnLog = new SessionLog();
+  await new AgentLoop({ llm: ordLlm, tools: ordTools, log: ordTurnLog }).send("stagger");
+  const resultOrder = ordTurnLog
+    .all()
+    .filter((e) => e.type === "tool/result")
+    .map((e) => ((e.result as { delay?: number }) ?? {}).delay);
+  assert(
+    JSON.stringify(resultOrder) === JSON.stringify([90, 50, 10]),
+    `results log in original call order despite out-of-order completion (${JSON.stringify(resultOrder)})`,
+  );
+
+  // (c) read / write / read: the write never overlaps a read and reads are NOT
+  // batched across it.
+  const timeline: string[] = [];
+  const mixTools = new ToolRegistry(parGate);
+  mixTools.register({
+    name: "tl_read",
+    description: "timeline read",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: { tag: { type: "string" } },
+      required: ["tag"],
+    },
+    execute: async (args) => {
+      timeline.push(`${(args as { tag: string }).tag}:start`);
+      await new Promise((r) => setTimeout(r, 30));
+      timeline.push(`${(args as { tag: string }).tag}:end`);
+      return {};
+    },
+  } satisfies ToolDefinition);
+  mixTools.register({
+    name: "tl_write",
+    description: "timeline write",
+    kind: "write",
+    permission: "ask",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => {
+      timeline.push("W:start");
+      timeline.push("W:end");
+      return {};
+    },
+  } satisfies ToolDefinition);
+  const mixLlm = new MockLLM([
+    {
+      text: "mixing",
+      toolCalls: [
+        toolCall("x1", "tl_read", { tag: "R1" }),
+        toolCall("x2", "tl_write", {}),
+        toolCall("x3", "tl_read", { tag: "R2" }),
+      ],
+      stopReason: "tool_use",
+    },
+    { text: "Done.", stopReason: "end_turn" },
+  ]);
+  await new AgentLoop({ llm: mixLlm, tools: mixTools }).send("mixed kinds");
+  assert(
+    JSON.stringify(timeline) ===
+      JSON.stringify(["R1:start", "R1:end", "W:start", "W:end", "R2:start", "R2:end"]),
+    `writes stay serial and reads do not batch across them (${JSON.stringify(timeline)})`,
+  );
+
+  // (d) readConcurrency caps in-flight reads (AIH_TOOL_CONCURRENCY default 4).
+  const capped = { n: 0, max: 0 };
+  const capParTools = new ToolRegistry(parGate);
+  capParTools.register({
+    name: "cap_read",
+    description: "counts in-flight executions",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => {
+      capped.n += 1;
+      capped.max = Math.max(capped.max, capped.n);
+      await new Promise((r) => setTimeout(r, 20));
+      capped.n -= 1;
+      return {};
+    },
+  } satisfies ToolDefinition);
+  const capLlm = new MockLLM([
+    {
+      text: "capping",
+      toolCalls: [1, 2, 3, 4].map((k) => toolCall(`q${k}`, "cap_read", {})),
+      stopReason: "tool_use",
+    },
+    { text: "Done.", stopReason: "end_turn" },
+  ]);
+  await new AgentLoop({ llm: capLlm, tools: capParTools, readConcurrency: 2 }).send("capped reads");
+  assert(capped.max === 2, `readConcurrency=2 caps in-flight reads at 2 (saw ${capped.max})`);
 }
 
 console.log("\nAIH core smoke test passed.");

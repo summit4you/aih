@@ -1,7 +1,11 @@
 import type { LLMAdapter } from "./seams/llm.js";
+import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT } from "./prompts.js";
+
+/** Max consecutive empty responses (no text + no tool call) we nudge the model to retry before ending the turn. */
+const MAX_EMPTY_RETRIES = 2;
 import { SessionLog } from "./session-log.js";
 import type { ToolRegistry } from "./tool-registry.js";
-import type { ChatMessage, TokenUsage, TurnResult } from "./types.js";
+import type { ChatMessage, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
 
 function addUsage(a: TokenUsage | undefined, b: TokenUsage | undefined): TokenUsage | undefined {
   if (!b) return a;
@@ -13,6 +17,29 @@ function addUsage(a: TokenUsage | undefined, b: TokenUsage | undefined): TokenUs
   };
 }
 
+/**
+ * Run `fn` over `items` with at most `limit` in flight; results keep the
+ * input order. Used for F#29 parallel read-only tool calls.
+ */
+async function mapConcurrent<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const idx = next;
+      next += 1;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export interface AgentLoopOptions {
   llm: LLMAdapter;
   tools: ToolRegistry;
@@ -21,6 +48,11 @@ export interface AgentLoopOptions {
   maxStepsPerTurn?: number;
   contextWindow?: number;
   compactAt?: number;
+  /**
+   * F#29: max concurrent read-only tool calls within one step
+   * (default AIH_TOOL_CONCURRENCY, 4). Write tools always run serially.
+   */
+  readConcurrency?: number;
   /**
    * Debug seam (Codex `codex debug prompt-input`): called with the exact
    * model-visible messages right before every LLM request.
@@ -93,6 +125,7 @@ export class AgentLoop {
   #maxSteps: number;
   #contextWindow: number;
   #compactAt: number;
+  #readConcurrency: number;
   #onPromptInput?: (messages: ChatMessage[]) => void;
   #inbox: string[] = [];
   #activeAbort: AbortController | null = null;
@@ -102,9 +135,16 @@ export class AgentLoop {
     this.#tools = options.tools;
     this.#log = options.log ?? new SessionLog();
     this.#systemPrompt = options.systemPrompt ?? "";
-    this.#maxSteps = options.maxStepsPerTurn ?? 8;
+    // opencode/MiMo-Code parity: no step cap by default (agent.steps ??
+    // Infinity) — the model ends the turn when it is done; a cap is an opt-in
+    // safety valve (--max-steps) that triggers a text handoff, not a hard cut.
+    this.#maxSteps = options.maxStepsPerTurn ?? Infinity;
     this.#contextWindow = options.contextWindow ?? 0;
     this.#compactAt = options.compactAt ?? 0.8;
+    this.#readConcurrency = Math.max(
+      1,
+      Math.floor(options.readConcurrency ?? (Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4)),
+    );
     this.#onPromptInput = options.onPromptInput;
   }
 
@@ -147,11 +187,26 @@ export class AgentLoop {
     let contextTokens = 0;
     let contextNow = 0;
     let truncated = false;
+    // Consecutive empty responses (no text + no tool call) the model has
+    // produced this turn. Models (Qwen3, big-pickle) occasionally "drop" a
+    // task mid-turn and return nothing; nudge them to continue a bounded
+    // number of times before giving up (see MAX_EMPTY_RETRIES).
+    let emptyRetries = 0;
 
     while (steps < this.#maxSteps && !ac.signal.aborted) {
       steps += 1;
-      const doComplete = (messages?: ChatMessage[]) => {
-        const input = messages ?? this.#log.deriveMessages(this.#systemPrompt);
+      const isLastStep = Number.isFinite(this.#maxSteps) && steps >= this.#maxSteps;
+      const buildInput = (): ChatMessage[] => {
+        const base = this.#log.deriveMessages(this.#systemPrompt);
+        // Final step: prefill the handoff prompt as a trailing assistant
+        // message (opencode/MiMo-Code) so the model wraps up in text instead
+        // of being cut off mid-tool-call.
+        return isLastStep
+          ? [...base, { role: "assistant" as const, content: MAX_STEPS_PROMPT }]
+          : base;
+      };
+      const doComplete = () => {
+        const input = buildInput();
         this.#onPromptInput?.(input);
         return this.#llm.complete({
           messages: input,
@@ -171,7 +226,7 @@ export class AgentLoop {
         const c = await this.#compact(turnId);
         if (c.usage) usage = addUsage(usage, c.usage);
         if (c.applied) contextNow = this.#estimateContext();
-        response = await doComplete(this.#log.deriveMessages(this.#systemPrompt));
+        response = await doComplete();
       }
       usage = addUsage(usage, response.usage);
       const promptTokens = response.usage?.promptTokens ?? 0;
@@ -199,6 +254,26 @@ export class AgentLoop {
       }
 
       if (response.stopReason !== "tool_use" || response.toolCalls.length === 0) {
+        // The model returned no tool call. If it ALSO returned no text, it
+        // likely "dropped" the task (a known Qwen3 / big-pickle instability on
+        // complex decisions) rather than intentionally finishing — nudge it to
+        // continue, bounded by MAX_EMPTY_RETRIES. A non-empty final answer
+        // (text present) is a genuine end-of-turn and is not retried.
+        const isEmpty = !response.text.trim() && response.toolCalls.length === 0;
+        if (isEmpty && emptyRetries < MAX_EMPTY_RETRIES && !isLastStep) {
+          emptyRetries += 1;
+          this.#log.append({
+            type: "user/message",
+            turnId,
+            text: EMPTY_RETRY_PROMPT,
+          });
+          if (shouldCompact) {
+            const c = await this.#compactOrSkip(turnId);
+            if (c.usage) usage = addUsage(usage, c.usage);
+            if (c.applied) contextNow = this.#estimateContext();
+          }
+          continue;
+        }
         if (shouldCompact) {
           const c = await this.#compactOrSkip(turnId);
           if (c.usage) usage = addUsage(usage, c.usage);
@@ -207,27 +282,57 @@ export class AgentLoop {
         break;
       }
 
-      for (const call of response.toolCalls) {
-        if (ac.signal.aborted) break;
-        this.#log.append({
-          type: "tool/call",
-          turnId,
-          callId: call.id,
-          name: call.name,
-          args: call.args,
-        });
-        const outcome = await this.#tools.invoke(call.name, call.args, {
-          turnId,
-          inject: (ctxText) => this.inject(ctxText),
-        });
-        this.#log.append({
-          type: "tool/result",
-          turnId,
-          callId: call.id,
-          ok: outcome.ok,
-          result: outcome.result,
-          error: outcome.error,
-        });
+      // F#29: run consecutive read-only tool calls concurrently (bounded by
+      // readConcurrency, default AIH_TOOL_CONCURRENCY=4); write tools stay
+      // serial (ordering + doom-loop semantics unchanged). Results are logged
+      // in the original call order regardless of completion order.
+      {
+        let i = 0;
+        const calls = response.toolCalls;
+        while (i < calls.length) {
+          if (ac.signal.aborted) break;
+          const def = this.#tools.get(calls[i].name);
+          const isRead = !!def && def.kind === "read";
+          let j = i;
+          if (isRead) {
+            while (j < calls.length) {
+              const d = this.#tools.get(calls[j].name);
+              if (!d || d.kind !== "read") break;
+              j += 1;
+            }
+          } else {
+            j = i + 1;
+          }
+          const batch = calls.slice(i, j);
+          const runOne = (call: ToolCall) =>
+            this.#tools.invoke(call.name, call.args, {
+              turnId,
+              inject: (ctxText) => this.inject(ctxText),
+            });
+          const outcomes = isRead
+            ? await mapConcurrent(batch, this.#readConcurrency, runOne)
+            : [await runOne(batch[0])];
+          for (let k = 0; k < batch.length; k += 1) {
+            const call = batch[k];
+            const outcome = outcomes[k];
+            this.#log.append({
+              type: "tool/call",
+              turnId,
+              callId: call.id,
+              name: call.name,
+              args: call.args,
+            });
+            this.#log.append({
+              type: "tool/result",
+              turnId,
+              callId: call.id,
+              ok: outcome.ok,
+              result: outcome.result,
+              error: outcome.error,
+            });
+          }
+          i = j;
+        }
       }
 
       if (this.#inbox.length > 0) {
@@ -488,6 +593,23 @@ export class AgentLoop {
     }
     const { text, usage } = await this.#summarizeHead(head, previousSummary, opts?.instructions);
     if (!text.trim()) return { usage, applied: false };
+    // User-query invariant (opencode/MiMo-Code "replay"): the compaction must
+    // never strand the conversation without a visible user turn — strict chat
+    // templates (Qwen3: "No user query found in messages") 400 otherwise.
+    // When the tail selection came back empty, this turn's user message was
+    // folded into the summarized head; replay it verbatim as the new tail
+    // (synthetic continue prompt if the session has no user message at all).
+    if (recent.length === 0) {
+      const turnUsers = this.#log
+        .all()
+        .filter((e): e is Extract<SessionEvent, { type: "user/message" }> =>
+          e.type === "user/message" && e.turnId === turnId,
+        );
+      const last = turnUsers[turnUsers.length - 1];
+      recent = [
+        { role: "user", content: last ? last.text : COMPACT_CONTINUE_PROMPT },
+      ];
+    }
     this.#log.append({
       type: "compaction",
       turnId,

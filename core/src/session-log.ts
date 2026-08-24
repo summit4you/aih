@@ -1,3 +1,4 @@
+import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
 import type { ChatMessage, SessionEvent } from "./types.js";
 
 export type SessionListener = (event: SessionEvent) => void;
@@ -110,9 +111,29 @@ export class SessionLog {
           for (const m of event.recent) messages.push(m);
         }
         continue;
-      }
-      pushMessage(event);
-    }
-    return messages;
-  }
+       }
+       pushMessage(event);
+     }
+     // Invariant (opencode/MiMo-Code parity): the model-visible conversation
+     // must contain at least one user message — strict chat templates (Qwen3:
+     // "No user query found in messages") 400 otherwise. If a compaction
+     // folded the turn's user message into the summary and stored no replay
+     // tail (sessions compacted before the replay fix), re-anchor the last
+     // user message; with none on record, use the synthetic continue prompt.
+     if (!messages.some((m) => m.role === "user")) {
+       let lastUser: string | undefined;
+       for (let i = this.#events.length - 1; i >= 0; i -= 1) {
+         const event = this.#events[i];
+         if (event.type === "user/message") {
+           lastUser = event.text;
+           break;
+         }
+       }
+       messages.push({
+         role: "user",
+         content: lastUser ?? COMPACT_CONTINUE_PROMPT,
+       });
+     }
+     return messages;
+   }
 }

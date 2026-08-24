@@ -12,6 +12,7 @@ import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/cor
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
 import type { DiffLine } from "./diff.js";
 import { lineDiff } from "./diff.js";
+import { formatAfterWrite } from "./formatter.js";
 
 export interface GeneralToolsOptions {
   cwd?: string;
@@ -152,7 +153,9 @@ export function registerGeneralTools(
       const newString = String(a.new_string ?? "");
       const updated = a.replace_all ? text.split(oldString).join(newString) : text.replace(oldString, newString);
       writeFileSync(file, updated);
-      return { path: file, replacements: a.replace_all ? count : 1, _diff: lineDiff(oldString, newString) };
+      // F#27: post-write auto-format (prettier/biome/eslint), never blocks.
+      const fmt = await formatAfterWrite(file, cwd);
+      return { path: file, replacements: a.replace_all ? count : 1, _diff: lineDiff(oldString, newString), ...fmt };
     },
   });
 
@@ -452,6 +455,7 @@ export function registerGeneralTools(
       if (!bodyMatch) throw new Error("patch must be wrapped in '*** Begin Patch' ... '*** End Patch'");
       const lines = bodyMatch[1].split("\n");
       const applied: string[] = [];
+      const written: string[] = [];
       let i = 0;
       while (i < lines.length) {
         const line = lines[i];
@@ -468,6 +472,7 @@ export function registerGeneralTools(
           mkdirSync(dirname(path), { recursive: true });
           writeFileSync(path, `${content.join("\n")}\n`);
           applied.push(`A ${relative(cwd, path)}`);
+          written.push(path);
           continue;
         }
         const del = /^\*\*\* Delete File: (.+)$/.exec(line);
@@ -524,21 +529,32 @@ export function registerGeneralTools(
             writeFileSync(moveTo, updated);
             unlinkSync(file);
             applied.push(`M ${relative(cwd, file)} -> ${relative(cwd, moveTo)}`);
+            written.push(moveTo);
           } else {
             writeFileSync(file, updated);
             applied.push(`U ${relative(cwd, file)}`);
+            written.push(file);
           }
           continue;
         }
         i += 1;
       }
       if (!applied.length) throw new Error("patch contained no file operations");
+      // F#27: post-write auto-format for every file the patch touched.
+      const fmt = await Promise.all(written.map((f) => formatAfterWrite(f, cwd)));
+      const formattedCount = fmt.filter((f) => f.formatted).length;
+      const notes = fmt.filter((f) => f.formatNote).map((f) => f.formatNote);
       const diff: DiffLine[] = [];
       for (const l of String(a.patch ?? "").split("\n")) {
         if (l.startsWith("+") && !l.startsWith("+++")) diff.push({ t: "add", s: l.slice(1) });
         else if (l.startsWith("-") && !l.startsWith("---")) diff.push({ t: "del", s: l.slice(1) });
       }
-      return { applied, _diff: diff };
+      return {
+        applied,
+        _diff: diff,
+        ...(formattedCount > 0 ? { formatted: true, formattedFiles: formattedCount } : {}),
+        ...(notes.length ? { formatNote: notes.join(" ; ") } : {}),
+      };
     },
   });
 

@@ -110,6 +110,51 @@ Next move）。
 而不是"看起来对"。不设置 `/goal` 时行为与之前一致，仅系统提示多约 550 tokens 的
 守卫规则；Goal 裁判零开销（未设置时直接跳过）。
 
+CLI 侧同样可用：`aih run --goal "<条件>" "<任务>"` 在非交互场景做有界自动续跑，
+裁判事件以结构化 `goal/judge` 类型写入会话日志（append-only JSONL，可审计回放）。
+
+### 确定性 Workflow（`.aih/workflows/*.mjs`）
+
+把固定流程写成代码而非 prompt——借鉴 MiMo-Code 的 `.mimocode/workflows` 与
+opencode 的确定性管线。工作流是导出 `phases` 数组的 ESM 模块：
+
+```js
+// .aih/workflows/example.mjs
+export default {
+  name: "example",
+  phases: [
+    { name: "check", prompt: "运行 npm test 并总结结果", expect: "passed" }, // 单次 agent 调用
+    { name: "fanout", prompts: ["审查 core/", "审查 cli/"] },               // 并行扇出
+  ],
+};
+```
+
+每个 phase 按序执行；`expect` 是输出子串门禁（不满足即 fail-fast），`retries`
+限制额外重试次数。跑完输出 JSON 报告：
+
+```sh
+aih workflow list                      # 列出 .aih/workflows/ 下所有工作流
+aih workflow run example               # 非交互跑完出报告
+aih workflow run example --format json # JSON 报告（CI 友好）
+```
+
+首发场景：`aih init` 生成的应用 APP.md 验收项一键回归。
+
+### 写后自动格式化
+
+`write_file` / `edit` / `apply_patch` 成功后自动检测项目 formatter 并执行
+（借鉴 opencode formatters）：从写入文件向上层目录探测配置文件与 lockfile，
+优先级 prettier > biome > eslint `--fix`；带超时（`AIH_FORMAT_TIMEOUT_MS`，
+默认 15s）。格式化失败**绝不阻断写入**——只在工具结果附 `formatNote` 提示，
+成功则并入 `formatted: true` 标志。
+
+### 并行只读工具调用
+
+单步内**连续的只读工具调用并发执行**（codex `parallel.rs` 同源设计）：读类
+批量并发、上限 `AIH_TOOL_CONCURRENCY`（默认 4）；写类保持串行——顺序语义与
+doom-loop 判定不受影响。完成顺序不影响落盘：`tool/result` 事件始终按**原始
+调用顺序**写入会话日志，回放审计所见即模型所依。
+
 ### 变更可视化（diff 渲染）
 
 编辑类工具（`write_file` / `edit` / `apply_patch`）执行后在 TUI 内渲染前后对比
@@ -132,6 +177,9 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 
 - **保留近期尾部原文**：按 `clamp(usable×0.25, 500, 15000)` tokens 保留最近对话**不摘要**，
   切分点落在 user 消息（轮次）边界上，保证 tool 调用/结果不被拆散；只有更旧的头部才进摘要
+- **user-query 不变量**（对齐 opencode/MiMo-Code replay）：压缩后模型可见会话**必须含 user 消息**
+  ——尾部预算装不下时把本 turn 的 user 原文 replay 成新尾部；历史里没有任何 user 时用合成
+  "Continue…" 兜底。否则 Qwen3 一类严格 chat 模板直接 400（`No user query found in messages`）
 - **滚动摘要**：每次新摘要折叠进上一次摘要（`<prior-summary>`），用结构化模板
   （目标/约束/决策/当前状态/下一步）产出，工具输出序列化时截断到 2000 字符
 - **主动**：每步后 `promptTokens ≥ AIH_COMPACT_AT`(0.8) `× 上下文窗口`(默认 128k)
@@ -359,9 +407,11 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_RETRIES` (1) | LLM 429/5xx 自动重试次数（鉴权错误不重试） |
 | `NO_COLOR` | 关闭彩色输出 |
 | `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `providers.<name>.contextWindow` / `contextWindow`） |
-| `AIH_GOAL_ROUNDS` (3) | `/goal` 额外续跑轮数上限 |
+| `AIH_GOAL_ROUNDS` (3) | `/goal` 与 `run --goal` 的额外续跑轮数上限 |
 | `AIH_MEMORY_BUDGET` (4000) | 每轮注入 memory.md 的字符预算 |
 | `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd 默认超时 |
+| `AIH_TOOL_CONCURRENCY` (4) | 单步内连续只读工具调用的并发上限（写类恒串行） |
+| `AIH_FORMAT_TIMEOUT_MS` (15000) | 写后自动格式化超时（失败不阻断写入） |
 
 ### 会话标题（隐藏系统 agent）
 
@@ -482,33 +532,33 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 权限规则集（pattern/路径作用域/last-match） | ◐ 沙箱视角 | ✅ | ✅ | — | ✅ |
 | doom_loop 死循环守卫 | ◐ 钩子拦截 | ✅ | ✅ | — | ✅ |
 | 上下文压缩（主动+被动+手动 /compact） | — | ✅ | ✅ | — | ✅ 三路+手动 |
-| 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ◐ roadmap F#3 |
+| 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ◐ roadmap F#28 |
 | 项目记忆（memory.md + 注入预算） | — | — | ✅ | — | ✅ |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
 | 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ◐ 串行 task |
-| 并行工具/子 agent（≤N） | ✅ ≤10 | ◐ | ◐ | — | ◐ roadmap F#4 |
+| 并行工具调用（读类 ≤N 有界并发） | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29（写类恒串行） |
 | 技能层（SKILL.md 三级加载） | — | ✅ | ✅ | — | ✅ |
 | plan/build 双模式 | — | ✅ | ✅ | — | ✅ |
 | TUI：流式/markdown/侧栏面板/鼠标 | ◐ Web | ✅ | ✅ | — | ✅ |
-| 成本 / TPS 实时显示 | — | ◐ | ✅ | — | ◐ 仅 token，F#5 |
-| 确定性 Workflow（阶段脚本） | — | — | ✅ | — | ◐ roadmap P1#6 |
-| 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ◐ roadmap F#2 |
+| 成本 / TPS 实时显示 | — | ◐ | ✅ | — | ◐ 仅 token，F#30 |
+| 确定性 Workflow（阶段脚本） | — | — | ✅ | — | ✅ `.aih/workflows/*.mjs` |
+| 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
 | 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ |
 | 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
 | curl\|bash 一键安装 | — | ◐ | ✅ | — | ✅ |
-| CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ◐ F#1/F#7 |
+| CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
 | serve/attach 多前端 | ✅ Web | ✅ | ✅ | — | ◐ roadmap P2#8 |
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
-- **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子、goals/续跑方向 —— **全部已落地**；余：并行工具、沙箱 seam、后台 jobs（roadmap D/F）。
-- **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐。余：写后 formatter、checkpoint、并行（roadmap F）。
-- **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅。余：成本/TPS、侧边 diff、workflow（roadmap F）。
+- **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）—— 余：沙箱 seam、后台 jobs（roadmap D/F）。
+- **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）。余：checkpoint 回滚。
+- **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS、side-by-side diff。
 - **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。
-- **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（roadmap F#1，已随本批次落地）。
+- **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）→ 已随本批次落地；② 写后自动格式化（opencode）；③ 结构化 checkpoint 回滚（opencode/P0#1）；④ 并行只读工具（dsh ≤10）；⑤ 成本/TPS 面板（MiMo）；⑥ side-by-side diff（MiMo，此前已承诺）；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）；⑧ 确定性 workflow（MiMo，P1#6 升期）。
+**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）→ 未做；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）→ 未做；⑥ side-by-side diff（MiMo，此前已承诺）→ 未做；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
 
 一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
 
@@ -518,13 +568,16 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 aih/
 ├── APP.md                    # L2：智能体行为契约（唯一事实源）
 ├── harness.yml               # L2：规范命令 + 任务循环阶段
+├── CHANGELOG.md              # L2：发版条目（Keep a Changelog）
+├── .devcontainer/            # L2：容器内 agent 稳定环境（create 后自动 bootstrap+build）
 ├── scripts/{doctor,check,eval}  # L2：标准命令入口
 ├── tasks/TEMPLATE.md         # L2：任务简报模板
 ├── docs/decisions.md         # L2：跨会话决策日志
 ├── core/                     # L1：内核（零运行时依赖）
 ├── mcp-server/               # L0：MCP 接入（含 TodoApp 示例适配器）
-├── cli/                      # CLI 接入：aih run/chat/tools/describe
+├── cli/                      # CLI 接入：aih run/chat/tools/describe/workflow
 ├── skills/                   # L3：技能
+├── .aih/workflows/           # 确定性工作流（.mjs，导出 phases）
 └── examples/opencode.json    # opencode 集成示例
 ```
 

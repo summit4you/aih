@@ -16,6 +16,9 @@ export {
   TASK_CONTRACT_RULES,
   GOAL_CONTRACT_TEMPLATE,
   GOAL_VERDICT_SCHEMA,
+  COMPACT_CONTINUE_PROMPT,
+  MAX_STEPS_PROMPT,
+  EMPTY_RETRY_PROMPT,
   buildGoalJudgePrompt,
 } from "./prompts.js";
 export { OpenAICompatibleLLM } from "./seams/llm-openai.js";

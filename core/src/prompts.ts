@@ -44,6 +44,41 @@ export const GOAL_VERDICT_SCHEMA =
   '{"met": true|false, "reason": "<one short line>", "unmet": ["<criterion or empty>"]}';
 
 /**
+ * Synthetic user query appended after a compaction that swallowed the turn's
+ * user message (opencode/MiMo-Code "continue" fallback, compaction.ts):
+ * strict chat templates (Qwen3: "No user query found in messages") reject a
+ * conversation whose visible messages contain no user turn at all.
+ */
+export const COMPACT_CONTINUE_PROMPT =
+  "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
+
+/**
+ * Final-step handoff, injected as an assistant prefill when a turn reaches its
+ * (opt-in) step budget (opencode/MiMo-Code `MAX_STEPS_PROMPT`,
+ * packages/core/src/session/runner/max-steps.ts): the model must stop calling
+ * tools and deliver a text handoff instead of being cut off mid-action.
+ */
+export const MAX_STEPS_PROMPT = `CRITICAL: Maximum steps exhausted. You MUST stop immediately.
+
+Respond with a brief text summary ONLY. Do NOT call any tools.
+
+Your summary must contain:
+1. What you completed
+2. What remains (if anything)
+3. Recommended next step for the user`;
+
+/**
+ * Nudge injected when the model returns an empty response (no text, no tool
+ * call) mid-turn — a known Qwen3 / big-pickle instability on complex
+ * decisions. Tells the model to resume the in-progress task instead of the
+ * harness silently ending the turn.
+ */
+export const EMPTY_RETRY_PROMPT =
+  "[harness] Your previous response was empty (no text and no tool call). " +
+  "The task is not complete. Please continue: either call the next tool to " +
+  "make progress, or reply with a short text answer.";
+
+/**
  * Build the augmented judge prompt: the judge may not trust the agent's
  * self-report; it checks acceptance criteria against real evidence in the
  * transcript and reports which criteria remain unmet (feeds auto-continue).

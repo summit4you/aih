@@ -85,6 +85,11 @@ import {
   T_MCP_TSCONFIG,
   T_TASK_TEMPLATE,
 } from "./templates.js";
+import {
+  describeWorkflows,
+  loadWorkflow,
+  runWorkflow,
+} from "./workflow.js";
 
 const VERSION = "0.2.0";
 const DEFAULT_SERVER_ENTRY = fileURLToPath(
@@ -111,6 +116,9 @@ Usage:
   aih config                      print effective configuration and sources
   aih models                      list configured providers/models
   aih init [dir]                  scaffold a new app harness
+  aih workflow <list|run> [name]  deterministic multi-phase agent runs
+                                   list: list .aih/workflows/*.mjs
+                                   run: aih workflow run <name> [--format json]
   aih mcp                         serve the bundled todo-app over stdio
   aih doctor | check | eval       run harness scripts
 
@@ -126,7 +134,9 @@ Options:
                               bundled todo-app server. For multiple servers set
                               \"mcpServers\" in aih.json (tools merged, duplicates
                               renamed <server>_<tool>)
-      --max-steps <n>         max steps per turn (default 50, safety valve only)
+      --max-steps <n>         max steps per turn (default: unlimited; opt-in safety valve)
+      --goal <condition>      run: judge-verified auto-continuation until the
+                              condition holds (bounded by AIH_GOAL_ROUNDS, default 3)
       --debug-prompt          print the exact model-visible prompt input before each LLM call
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
@@ -161,6 +171,8 @@ Environment:
   AIH_COMPACT_AT (0.8), AIH_GOAL_ROUNDS (3)
   AIH_MEMORY_BUDGET (4000 chars of .aih/memory.md injected per turn)
   AIH_CMD_TIMEOUT_MS (120000 default run_cmd timeout)
+  AIH_TOOL_CONCURRENCY (4) max parallel read-only tool calls per step
+  AIH_FORMAT_TIMEOUT_MS (15000) post-write formatter timeout
 
 Examples:
   aih run "add a todo buy milk" --mock
@@ -197,6 +209,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     "name",
     "from",
     "context-window",
+    "goal",
   ]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
@@ -712,7 +725,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       systemPrompt:
         withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) +
         loadMemoryBlock(),
-      maxStepsPerTurn: Number(str(flags, "max-steps") ?? 50) || 50,
+      maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
       ...(bool(flags, "debug-prompt")
@@ -728,15 +741,11 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
         : {}),
     });
 
-    let result: Awaited<ReturnType<AgentLoop["send"]>>;
-    try {
-      result = await loop.send(
-        message,
-        streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
-      );
-    } finally {
-      saveSession(sessionPath, log);
-    }
+    const result = await loop.send(
+      message,
+      streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
+    );
+    saveSession(sessionPath, log);
     if (format === "text") {
       if (!streaming) {
         const text = trace.lastAssistant();
@@ -755,9 +764,184 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
         ])}\n`,
       );
     }
+
+    // --goal: judge-verified auto-continuation (bounded by AIH_GOAL_ROUNDS).
+    const goal = str(flags, "goal");
+    if (goal) {
+      let goalMet = false;
+      let rounds = Number(process.env.AIH_GOAL_ROUNDS ?? "") || 3;
+      for (;;) {
+        let verdict: { met: boolean; reason: string; unmet: string[] };
+        try {
+          const resp = await llm.complete({
+            messages: [
+              ...log.deriveMessages(),
+              { role: "user", content: buildGoalJudgePrompt(goal) },
+            ],
+            tools: [],
+          });
+          const met = /"met"\s*:\s*(true|false)/.exec(resp.text)?.[1] === "true";
+          const reason = /"reason"\s*:\s*"([^"]*)"/.exec(resp.text)?.[1] ?? resp.text.slice(0, 200);
+          let unmet: string[] = [];
+          try {
+            const parsed = JSON.parse(resp.text.slice(resp.text.indexOf("{"), resp.text.lastIndexOf("}") + 1));
+            if (Array.isArray(parsed?.unmet)) unmet = parsed.unmet.map(String).slice(0, 5);
+          } catch {
+            /* regex fallback covers the minimal schema */
+          }
+          verdict = { met, reason, unmet };
+        } catch (err) {
+          process.stderr.write(
+            `${red("goal judge failed, stopping goal chain: ")}${err instanceof Error ? err.message : String(err)}\n`,
+          );
+          break;
+        }
+        const turnId = result.turnId;
+        log.append({ type: "goal/judge", turnId, met: verdict.met, reason: verdict.reason, unmet: verdict.unmet, roundsLeft: verdict.met ? 0 : rounds });
+        saveSession(sessionPath, log);
+        if (verdict.met) {
+          goalMet = true;
+          process.stderr.write(`${green("✅ goal met")} — ${verdict.reason}\n`);
+          break;
+        }
+        if (rounds <= 0) {
+          process.stderr.write(`${red("⏹ goal not met after auto-continue rounds — stopping")} (${verdict.reason})\n`);
+          break;
+        }
+        rounds -= 1;
+        const unmetNote = verdict.unmet.length
+          ? `\n[goal] Unverified criteria: ${verdict.unmet.join("; ")}\nVerify each against real persisted state (read the file, run the check) — do not re-claim completion without fresh evidence.\n`
+          : "";
+        process.stderr.write(`${dim(`↻ goal check: not yet met — ${verdict.reason} (auto-continuing, ${rounds} left)`)}\n`);
+        await loop.send(
+          `${unmetNote}[goal] The goal "${goal}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
+          streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
+        );
+        saveSession(sessionPath, log);
+      }
+      if (format === "json") {
+        // goal/judge events already streamed via wireTrace; nothing extra
+      }
+      process.exit(goalMet ? 0 : 1);
+    }
   } finally {
     backend.close();
   }
+}
+
+async function cmdWorkflow(
+  positionals: string[],
+  flags: Record<string, string | boolean>,
+): Promise<void> {
+  const sub = positionals.shift() ?? "list";
+  if (sub === "list") {
+    const infos = await describeWorkflows(process.cwd());
+    const format = str(flags, "format") ?? "text";
+    if (format === "json") {
+      console.log(JSON.stringify({ workflows: infos }, null, 2));
+      return;
+    }
+    if (infos.length === 0) {
+      console.log(
+        "no workflows yet — add .aih/workflows/<name>.mjs exporting { phases: [...] }",
+      );
+      return;
+    }
+    for (const info of infos) {
+      console.log(
+        `${bold(info.name)}  ·  ${info.phases} phase(s)${info.description ? `  ·  ${info.description}` : ""}`,
+      );
+    }
+    return;
+  }
+  if (sub === "run") {
+    const name = positionals.shift();
+    if (!name) {
+      console.error("error: usage: aih workflow run <name> [--format json|text]");
+      process.exit(1);
+    }
+    const format = str(flags, "format") ?? "text";
+    if (format !== "text" && format !== "json") {
+      console.error(`error: unknown format "${format}" (use text|json)`);
+      process.exit(1);
+    }
+    let def;
+    try {
+      def = await loadWorkflow(process.cwd(), name);
+    } catch (err) {
+      console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    def.name = name;
+
+    const backend = await startBackend(flags);
+    const sessionPath = bool(flags, "ephemeral")
+      ? undefined
+      : (resolveSessionPath(flags) ?? join(SESSIONS_DIR, `${freshSessionName()}.jsonl`));
+    try {
+      const gate = makeSessionGate(flags);
+      const registry = new ToolRegistry(gate);
+      for (const def2 of await backend.listTools()) registry.register(def2);
+      const skills = registerSkillTool(registry);
+      if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
+      attachAudit(registry, flags);
+      const log = loadSession(sessionPath);
+      const llm = buildLlm(flags);
+      await probeWindow(flags);
+      const loop = new AgentLoop({
+        llm,
+        tools: registry,
+        log,
+        systemPrompt: withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) + loadMemoryBlock(),
+        maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
+        contextWindow: resolveContextWindow(flags),
+        compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      });
+      const send = async (prompt: string): Promise<string> => {
+        const result = await loop.send(prompt);
+        const events = log.all();
+        for (let i = events.length - 1; i >= 0; i -= 1) {
+          const e = events[i];
+          if (e.type === "assistant/message" && e.text.trim()) return e.text;
+        }
+        return "";
+      };
+      const quiet = format === "json";
+      const report = await runWorkflow(def, send, {
+        onPhase: (phase, report) => {
+          if (quiet) return;
+          if (report.ok) {
+            process.stderr.write(
+              `${green("✓")} ${phase.name} (${report.attempts} attempt(s), ${report.parallel} call(s), ${report.ms}ms)\n`,
+            );
+          } else {
+            process.stderr.write(
+              `${red("✗")} ${phase.name} failed after ${report.attempts} attempt(s): ${report.error}\n`,
+            );
+          }
+        },
+      });
+      saveSession(sessionPath, log);
+      if (format === "json") {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(
+          report.ok
+            ? `${green("workflow ok")} — ${report.phases.length} phase(s), ${report.ms}ms`
+            : `${red("workflow failed")} at phase "${report.failedPhase}" (${report.ms}ms)`,
+        );
+        for (const phase of report.phases) {
+          if (!phase.ok) console.log(`  ${red("✗")} ${phase.name}: ${phase.error}`);
+          else console.log(`  ${green("✓")} ${phase.name} (${phase.attempts} attempt(s))`);
+        }
+      }
+      process.exit(report.ok ? 0 : 1);
+    } finally {
+      backend.close();
+    }
+  }
+  console.error(`error: unknown workflow subcommand "${sub}" (list|run)`);
+  process.exit(1);
 }
 
 async function cmdChat(flags: Record<string, string | boolean>) {
@@ -801,7 +985,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     "\n\nYou are in plan mode (read-only): write-capable tools are hidden in this " +
     "mode. Investigate with the available tools, then present a concrete step-by-step " +
     "implementation plan. Do not attempt to change any state.";
-  const maxSteps = Number(str(flags, "max-steps") ?? 50) || 50;
+  const maxSteps = Number(str(flags, "max-steps") ?? Infinity) || Infinity;
   function makeLoop(): AgentLoop {
     return new AgentLoop({
       llm: buildLlm(flags),
@@ -1114,6 +1298,32 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     return { met, reason, unmet };
   }
 
+  // Most recent turnId on record (falls back to a synthetic id) so goal/judge
+  // events can be correlated with the turn they judged.
+  function lastTurnId(): string {
+    const events = log.all();
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i];
+      if ("turnId" in e && e.turnId) return e.turnId;
+    }
+    return `goal_${Date.now().toString(36)}`;
+  }
+
+  function recordGoalJudge(
+    verdict: { met: boolean; reason: string; unmet: string[] },
+    roundsLeft: number,
+  ): void {
+    log.append({
+      type: "goal/judge",
+      turnId: lastTurnId(),
+      met: verdict.met,
+      reason: verdict.reason,
+      unmet: verdict.unmet,
+      roundsLeft,
+    });
+    saveSession(sessionPath, log);
+  }
+
   async function runGoalCheck(): Promise<void> {
     if (!goalCondition) return;
     for (;;) {
@@ -1130,17 +1340,20 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       if (verdict.met) {
         goalCondition = "";
         goalRoundsLeft = 0;
+        recordGoalJudge(verdict, 0);
         tui.pushSystem(`✅ goal met — ${verdict.reason}`);
         return;
       }
       if (goalRoundsLeft <= 0) {
         goalCondition = "";
+        recordGoalJudge(verdict, 0);
         tui.pushSystem(
           `⏹ goal not met after auto-continue rounds — stopping (${verdict.reason})`,
         );
         return;
       }
       goalRoundsLeft -= 1;
+      recordGoalJudge(verdict, goalRoundsLeft);
       const unmetNote = verdict.unmet.length
         ? `\n[goal] Unverified criteria: ${verdict.unmet.join("; ")}\n` +
           `Verify each against real persisted state (read the file, run the check) — do not re-claim completion without fresh evidence.\n`
@@ -1425,7 +1638,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       });
       if (result.stopReason === "max_steps") {
         tui.pushSystem(
-          `⚠ step limit reached (${maxSteps}) — turn paused; send a message (e.g. "continue") to resume`,
+          `⚠ step limit reached (${maxSteps}) — the model was asked to wrap up; send a message (e.g. "continue") to resume`,
         );
       }
       if (result.stopReason === "max_tokens") {
@@ -1982,6 +2195,8 @@ async function main() {
       return cmdModels();
     case "init":
       return cmdInit(positionals, flags);
+    case "workflow":
+      return cmdWorkflow(positionals, flags);
     case "mcp":
       return cmdMcp(flags);
     case "version":

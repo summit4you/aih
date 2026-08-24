@@ -926,4 +926,179 @@ await srv.connect(new StdioServerTransport());
   assert(Tui.sparkline([1, 0, 2, 3]) === "▁▅█", "sparkline ignores non-positive points");
 }
 
+{
+  // Tool rows: plain full-width lines (no background, no border); the whole
+  // command wraps instead of being clipped. edit diffs render side-by-side
+  // (left=removed, right=added) with red/green tinted cells.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const cmd =
+    "cd /app/agents/aih && npm install pkg-a pkg-b pkg-c --save-dev && npm run test -- --grep \"long pattern\" && echo done";
+  tui.pushTool("run_cmd", { command: cmd }, "c1");
+  tui.pushTool("write_file", { path: "/tmp/foo.txt", content: "x".repeat(3000) }, "c2");
+  tui.pushTool("edit", { path: "/tmp/foo.txt", old_string: "old line", new_string: "new line" }, "c3");
+  tui.resolveTool("c1", true, { done: true });
+  tui.resolveTool("c2", true, { path: "/tmp/foo.txt" });
+  tui.resolveTool("c3", true, {
+    _diff: [{ t: "del", s: "old line" }, { t: "add", s: "new line" }],
+  });
+  const raw = tui.transcriptLines();
+  const body = raw.map((s) => s.replace(/\x1b\[[0-9;]*m/g, ""));
+  const flat = body
+    .map((l) => l.trimEnd())
+    .join(" ")
+    .replace(/\s+/g, " ");
+  assert(flat.includes(cmd), "run_cmd row shows the full command across wrapped lines (no clip)");
+  assert(
+    flat.includes("/tmp/foo.txt") && !flat.includes("xxxx"),
+    "write_file row shows the path, not the 3000-char content",
+  );
+  assert(!raw.some((l) => l.includes("48;5;236")), "tool rows carry no background box");
+  assert(!raw.some((l) => l.includes("┃")), "tool rows carry no left border");
+  const diffLine = raw.find((l) => l.includes("48;5;237") && l.includes("48;5;233"));
+  assert(!!diffLine, "edit diff renders side-by-side (red del cell + green add cell)");
+  const diffBody = diffLine!.replace(/\x1b\[[0-9;]*m/g, "");
+  assert(diffBody.includes("old line") && diffBody.includes("new line"), "diff shows original left, modified right");
+  assert(diffBody.indexOf("old line") < diffBody.indexOf("new line"), "removed side is left, added side is right");
+  assert(diffBody.includes("┃") === false, "diff cells have no border");
+  assert(body.every((l) => l.length <= 80), "tool rows fit the full history width (80 cols)");
+}
+
+// --- Post-write auto-formatting (roadmap F#27, opencode formatters) --------
+{
+  const { formatAfterWrite, detectFormatter } = await import("./formatter.js");
+  const { chmodSync } = await import("node:fs");
+  const root = process.cwd();
+  const base = `${root}/.aih-smoke-fmt`;
+  rmSync(base, { recursive: true, force: true });
+  mkdirSync(`${base}/plain`, { recursive: true });
+  mkdirSync(`${base}/cfg`, { recursive: true });
+  mkdirSync(`${base}/bin/node_modules/.bin`, { recursive: true });
+
+  // 1) no formatter configured anywhere up the tree → untouched result
+  writeFileSync(`${base}/plain/a.js`, "const x=1;\n");
+  const r1 = await formatAfterWrite(`${base}/plain/a.js`, base);
+  assert(r1.formatted === undefined && r1.formatNote === undefined, "formatter: no config → no-op (no formatted flag)");
+  assert(detectFormatter(`${base}/plain/a.js`) === undefined, "formatter: detection returns undefined without config");
+  assert(detectFormatter(`${base}/plain/a.txt`) === undefined, "formatter: non-formattable extension ignored");
+
+  // 2) prettier configured (dep) but no binary → formatNote, never throws
+  writeFileSync(`${base}/cfg/package.json`, JSON.stringify({ name: "cfg", devDependencies: { prettier: "3.0.0" } }));
+  writeFileSync(`${base}/cfg/code.js`, "const   x   = 1;\n");
+  const r2 = await formatAfterWrite(`${base}/cfg/code.js`, base);
+  assert(r2.formatted === false && typeof r2.formatNote === "string" && r2.formatter === "prettier", "formatter: configured but missing binary → formatNote, not fatal");
+
+  // 3) a real (fake) prettier binary → formatted:true + changed:true, file rewritten
+  writeFileSync(`${base}/bin/package.json`, JSON.stringify({ name: "bin", devDependencies: { prettier: "3.0.0" } }));
+  writeFileSync(
+    `${base}/bin/node_modules/.bin/prettier`,
+    "#!/bin/sh\nf=\"$3\"; [ -f \"$f\" ] || f=\"$2\"; [ -f \"$f\" ] || f=\"$1\"; sed -i 's/  */ /g' \"$f\"\n",
+  );
+  chmodSync(`${base}/bin/node_modules/.bin/prettier`, 0o755);
+  writeFileSync(`${base}/bin/code.js`, "const   x   =   1;\n");
+  const before = readFileSync(`${base}/bin/code.js`, "utf8");
+  const r3 = await formatAfterWrite(`${base}/bin/code.js`, base);
+  const after = readFileSync(`${base}/bin/code.js`, "utf8");
+  assert(r3.formatted === true && r3.formatter === "prettier" && r3.changed === true, "formatter: real binary success → formatted + changed");
+  assert(before !== after, "formatter: the file on disk was actually rewritten");
+
+  // 4) the write tools merge the outcome into their result (write_file)
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerDevTools } = await import("./dev-tools.js");
+  const reg = new ToolRegistry(new AutoApprove());
+  registerDevTools(reg, base);
+  const wf = reg.get("write_file")!;
+  const res = (await wf.execute({ path: `${base}/bin/merge.js`, content: "const   y   =   2;\n" }, { turnId: "t", inject: () => {} })) as Record<string, unknown>;
+  assert(res.formatted === true && res.formatter === "prettier", "write_file result carries the formatted flag");
+  rmSync(base, { recursive: true, force: true });
+}
+
+// --- Deterministic workflows (roadmap F#33 / P1#6) -------------------------
+{
+  const wfDir = ".aih-smoke-wf";
+  rmSync(wfDir, { recursive: true, force: true });
+  mkdirSync(`${wfDir}/.aih/workflows`, { recursive: true });
+  const wfRun = (args: string[]) =>
+    spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", cwd: wfDir, env: process.env });
+
+  // list in an empty dir
+  const emptyDir = ".aih-smoke-wf-empty";
+  rmSync(emptyDir, { recursive: true, force: true });
+  mkdirSync(emptyDir, { recursive: true });
+  const listEmpty = spawnSync(process.execPath, [cli, "workflow", "list"], { encoding: "utf8", cwd: emptyDir, env: process.env });
+  assert(listEmpty.status === 0 && listEmpty.stdout.includes("no workflows yet"), "workflow list in empty dir is a clean no-op");
+
+  writeFileSync(
+    `${wfDir}/.aih/workflows/good.mjs`,
+    `export default { name: "good", description: "smoke", phases: [
+      { name: "p1", prompt: "say hi", expect: "Added via mock.", retries: 0 },
+      { name: "p2", prompts: ["a", "b"], expect: "Added via mock.", retries: 0 },
+    ] };`,
+  );
+  const list = wfRun(["workflow", "list"]);
+  assert(list.status === 0 && list.stdout.includes("good") && list.stdout.includes("2 phase(s)"), "workflow list shows name + phase count");
+
+  const runOk = wfRun(["workflow", "run", "good", "--mock", "--ephemeral"]);
+  assert(runOk.status === 0 && runOk.stdout.includes("workflow ok") && runOk.stdout.includes("p2"), "workflow run (mock) passes both phases");
+
+  const runOkJson = wfRun(["workflow", "run", "good", "--mock", "--ephemeral", "--format", "json"]);
+  const rep = JSON.parse(runOkJson.stdout);
+  assert(rep.ok === true && rep.phases.length === 2 && rep.phases[1].parallel === 2, "workflow JSON report: ok, 2 phases, parallel fan-out recorded");
+
+  // expect-gate failure → fail-fast, exit 1, failedPhase named
+  writeFileSync(
+    `${wfDir}/.aih/workflows/bad.mjs`,
+    `export default { name: "bad", phases: [
+      { name: "gate", prompt: "x", expect: "NEVER-APPEARS", retries: 1 },
+      { name: "after", prompt: "y", expect: "Added via mock.", retries: 0 },
+    ] };`,
+  );
+  const runBad = wfRun(["workflow", "run", "bad", "--mock", "--ephemeral"]);
+  assert(runBad.status === 1 && runBad.stdout.includes('failed at phase "gate"'), "workflow expect-gate failure fails fast with exit 1");
+  const badRep = JSON.parse(
+    wfRun(["workflow", "run", "bad", "--mock", "--ephemeral", "--format", "json"]).stdout,
+  );
+  assert(
+    badRep.ok === false && badRep.failedPhase === "gate" && badRep.phases.length === 1 && badRep.phases[0].attempts === 2,
+    "workflow failure report names the failed phase, bounded retries, later phases skipped",
+  );
+
+  // unknown workflow → clean error
+  const runMissing = wfRun(["workflow", "run", "nope", "--mock", "--ephemeral"]);
+  assert(runMissing.status === 1 && runMissing.stderr.includes('workflow "nope" not found'), "workflow run of a missing name errors cleanly");
+
+  rmSync(wfDir, { recursive: true, force: true });
+  rmSync(emptyDir, { recursive: true, force: true });
+}
+
+// --- run --goal: judge-verified auto-continuation + goal/judge event (P0#3) ---
+{
+  const goalDir = ".aih-smoke-goal";
+  rmSync(goalDir, { recursive: true, force: true });
+  mkdirSync(goalDir, { recursive: true });
+  const goalRun = spawnSync(
+    process.execPath,
+    [cli, "run", "do the thing", "--mock", "--yes", "--session", "g", "--goal", "the thing is done"],
+    { encoding: "utf8", cwd: goalDir, env: { ...process.env, AIH_GOAL_ROUNDS: "1" } },
+  );
+  assert(goalRun.status === 1, "run --goal exits 1 when the judge never reports met (mock)");
+  assert(goalRun.stderr.includes("goal not met after auto-continue rounds"), "run --goal reports the bounded stop");
+  // the judge verdict must be persisted as a structured goal/judge event
+  const sessFile = `${goalDir}/.aih/sessions/g.jsonl`;
+  const sess = existsSync(sessFile) ? readFileSync(sessFile, "utf8") : "";
+  assert(
+    sess.includes('"goal/judge"') && sess.includes('"unmet"'),
+    "run --goal persists a structured goal/judge event in the session log",
+  );
+  rmSync(goalDir, { recursive: true, force: true });
+}
+
 console.log("\nAIH cli smoke test passed.");

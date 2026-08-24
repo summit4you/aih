@@ -65,6 +65,12 @@ const HIDE = `${CSI}?25l`;
 const SHOW = `${CSI}?25h`;
 const BOX_BG = `${CSI}48;5;236m`; // dark-theme surface (near-black)
 const LIGHT_BG = `${CSI}48;5;254m`; // light-theme surface (near-white)
+// Diff cells (opencode-style, no border): left = removed (red tint),
+// right = added (green tint).
+const DEL_BG = `${CSI}48;5;237m`; // dark-theme removed cell (red tint)
+const ADD_BG = `${CSI}48;5;233m`; // dark-theme added cell (green tint)
+const DEL_BG_LIGHT = `${CSI}48;5;225m`; // light-theme removed cell
+const ADD_BG_LIGHT = `${CSI}48;5;194m`; // light-theme added cell
 const REV = `${CSI}7m`; // reverse video: selection that works on any theme
 const RESET = `${CSI}0m`;
 // Terminal background report (OSC 11), 16-bit RRRR/GGGG/BBBB, BEL or ST terminated.
@@ -241,17 +247,51 @@ function highlightCode(line: string): string {
   return out + line.slice(last);
 }
 
-function fmtArgs(args: unknown): string {
+// opencode-style per-tool "title" argument: the row shows its full value
+// (no truncation) instead of a capped k=v dump — e.g. run_cmd shows the whole
+// command, write_file shows the path.
+const TOOL_TITLE_ARG: Record<string, string> = {
+  run_cmd: "command",
+  read_file: "path",
+  write_file: "path",
+  edit: "path",
+  apply_patch: "path",
+  glob: "pattern",
+  grep: "pattern",
+  webfetch: "url",
+  websearch: "query",
+  question: "question",
+  todo: "content",
+  task: "description",
+};
+
+function fmtArgs(name: string, args: unknown): string {
   if (args == null) return "";
   if (typeof args !== "object" || Array.isArray(args)) {
     const s = JSON.stringify(args);
-    return s.length > 60 ? s.slice(0, 57) + "…" : s;
+    return s.length > 200 ? s.slice(0, 197) + "…" : s;
   }
-  const parts = Object.entries(args as Record<string, unknown>).map(
-    ([k, v]) => `${k}=${JSON.stringify(v)}`,
-  );
+  const a = args as Record<string, unknown>;
+  const title = TOOL_TITLE_ARG[name];
+  if (title && typeof a[title] === "string") {
+    let s = String(a[title]).replace(/\s*\n+\s*/g, " ").trim();
+    const rest = Object.entries(a)
+      .filter(([k, v]) => k !== title && typeof v === "string" && (v as string).length <= 40)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`);
+    if (rest.length) s = `${s} ${rest.join(" ")}`;
+    return s;
+  }
+  const parts = Object.entries(a).map(([k, v]) => {
+    let sv: string;
+    if (typeof v === "string") sv = v.length > 120 ? `<${v.length} chars>` : JSON.stringify(v);
+    else {
+      const j = JSON.stringify(v);
+      sv = j == null ? "" : j.length > 120 ? j.slice(0, 117) + "…" : j;
+    }
+    return `${k}=${sv}`;
+  });
   const s = parts.join(" ");
-  return s.length > 60 ? s.slice(0, 57) + "…" : s;
+  return s.length > 400 ? s.slice(0, 397) + "…" : s;
 }
 
 type Unit =
@@ -303,8 +343,18 @@ constructor(opts: TuiOptions) {
   }
 
  /** Current theme (test/UI hook). */
- isDark(): boolean {
+  isDark(): boolean {
     return this.#dark;
+  }
+
+  /** All rendered transcript lines (test/text-replay hook). */
+  transcriptLines(): string[] {
+    const body: string[] = [];
+    for (const u of this.#units()) {
+      const lines = u.kind === "item" ? this.#block(u.item) : this.#groupLines(u);
+      for (const r of lines) body.push(r);
+    }
+    return body;
   }
 
  /** Background surface for input box / user rows / panel, by theme. */
@@ -392,7 +442,7 @@ constructor(opts: TuiOptions) {
     this.#items.push({
       role: "tool",
       text: name,
-      tool: { name, args: fmtArgs(args), callId, ok: undefined },
+      tool: { name, args: fmtArgs(name, args), callId, ok: undefined },
     });
     this.#follow();
     this.requestPaint();
@@ -1117,15 +1167,44 @@ constructor(opts: TuiOptions) {
   #wrap(raw: string, limit: number): string[] {
     const out: string[] = [];
     for (const seg of raw.split("\n")) {
+      const words = seg ? seg.split(/\s+/).filter(Boolean) : [];
       let line = "";
-      for (const ch of seg) {
-        if (cols(line) + (wide(ch) ? 2 : 1) > limit) {
-          out.push(line);
-          line = "";
+      const flush = (): void => {
+        out.push(line);
+        line = "";
+      };
+      for (const word of words) {
+        let rest = word;
+        while (rest.length > 0) {
+          const sep = line ? 1 : 0;
+          const avail = Math.max(1, limit - cols(line) - sep);
+          if (cols(rest) <= avail) {
+            line = line ? `${line} ${rest}` : rest;
+            rest = "";
+            continue;
+          }
+          // Word does not fit the remaining space but fits a fresh line:
+          // break at the word boundary (never split "npm" into "np"/"m").
+          if (line && cols(word) <= limit) {
+            flush();
+            continue;
+          }
+          // Word longer than the whole line: hard-split at display width.
+          let cut = 0;
+          let n = 0;
+          while (cut < rest.length) {
+            const w = wide(rest[cut]) ? 2 : 1;
+            if (n + w > avail) break;
+            n += w;
+            cut += 1;
+          }
+          if (cut === 0) cut = 1;
+          line = line ? `${line} ${rest.slice(0, cut)}` : rest.slice(0, cut);
+          rest = rest.slice(cut);
+          flush();
         }
-        line += ch;
       }
-      out.push(line);
+      flush();
     }
     return out.length ? out : [""];
   }
@@ -1224,7 +1303,7 @@ constructor(opts: TuiOptions) {
     if (!this.#groupOpen.get(g.start)) {
       return [this.#clip(`${icon} ${accent(t.name)} ×${g.items.length}${muted("   click to expand")}`, this.#bodyCols())];
     }
-    const rows = g.items.map((it) => this.#toolRow(it));
+    const rows = g.items.flatMap((it) => this.#toolRow(it));
     rows.push(this.#clip(muted("   click to collapse"), this.#bodyCols()));
     return rows;
   }
@@ -1367,7 +1446,7 @@ constructor(opts: TuiOptions) {
           i === 0 ? cyan("▣") + dim(line.slice(1)) : dim(`  ${line}`),
         );
       case "tool": {
-        const rows = [this.#toolRow(item)];
+        const rows = this.#toolRow(item);
         const t = item.tool;
         if (t && t.ok === false && t.error) {
           for (const line of this.#wrap(t.error, this.#bodyCols())) rows.push(this.#clip(`   ${red(line)}`, this.#bodyCols()));
@@ -1384,12 +1463,7 @@ constructor(opts: TuiOptions) {
           if (t.outputCapped) rows.push(this.#clip(dim("   … output truncated at 32KB"), this.#bodyCols()));
         }
         if (item.tool?.ok && item.tool.diff && item.tool.diff.length) {
-          for (const d of item.tool.diff) {
-            rows.push(d.t === "add" ? `   ${green(`+ ${d.s}`)}` : `   ${red(`- ${d.s}`)}`);
-          }
-          if (item.tool.truncated) {
-            rows.push(dim(`   … ${item.tool.truncated} more line(s)`));
-          }
+          rows.push(...this.#diffRows(item));
         }
         if (item.tool?.ok && item.tool.todos && item.tool.todos.length) {
           for (const t of item.tool.todos) rows.push(this.#todoRow(t));
@@ -1401,17 +1475,81 @@ constructor(opts: TuiOptions) {
     }
   }
 
-  #toolRow(item: TuiItem): string {
+  #toolRow(item: TuiItem): string[] {
     const t = item.tool;
-    if (!t) return this.#clip(item.text, this.#bodyCols());
-    const args = t.args ? ` ${muted(t.args)}` : "";
-    if (t.ok === undefined) {
-      return this.#clip(`${warn("▶")} ${t.name}${args}`, this.#bodyCols());
+    const bodyCols = this.#bodyCols();
+    if (!t) return [this.#clip(item.text, bodyCols)];
+    const icon = t.ok === undefined ? warn("▶") : t.ok ? success("✓") : danger("✗");
+    const name = t.ok === false ? danger(`${t.name} failed`) : t.name;
+    const argText = (t.args ?? "").replace(/\s*\n+\s*/g, " ").trim();
+    // All tool rows are plain full-width lines (no background, no border);
+    // the argument text wraps onto extra lines instead of being clipped.
+    const line = (s: string): string => this.#clip(s, bodyCols);
+    if (!argText) return [line(`${icon} ${name}`)];
+    const nameVisible = t.ok === false ? t.name.length + 8 : t.name.length;
+    const first = Math.max(8, bodyCols - 5 - nameVisible);
+    const wrapped = this.#wrap(argText, first);
+    const rows = [line(`${icon} ${name} ${muted(wrapped[0])}`)];
+    for (let i = 1; i < wrapped.length; i += 1) {
+      rows.push(line(`   ${muted(wrapped[i])}`));
     }
-    if (t.ok) {
-      return this.#clip(`${success("✓")} ${t.name}${args}`, this.#bodyCols());
+    return rows;
+  }
+
+  /** Zip each del run with the add run that follows it (side-by-side pairs). */
+  #diffPairs(d: DiffLine[]): Array<{ del: string; add: string }> {
+    const pairs: Array<{ del: string; add: string }> = [];
+    let i = 0;
+    while (i < d.length) {
+      if (d[i].t === "del") {
+        const dels: string[] = [];
+        while (i < d.length && d[i].t === "del") {
+          dels.push(d[i].s);
+          i += 1;
+        }
+        const adds: string[] = [];
+        while (i < d.length && d[i].t === "add") {
+          adds.push(d[i].s);
+          i += 1;
+        }
+        const n = Math.max(dels.length, adds.length);
+        for (let k = 0; k < n; k += 1) {
+          pairs.push({ del: dels[k] ?? "", add: adds[k] ?? "" });
+        }
+      } else {
+        while (i < d.length && d[i].t === "add") {
+          pairs.push({ del: "", add: d[i].s });
+          i += 1;
+        }
+      }
     }
-    return this.#clip(`${danger("✗")} ${danger(`${t.name} failed`)}${args}`, this.#bodyCols());
+    return pairs;
+  }
+
+  /**
+   * Side-by-side diff (opencode style): left cell = removed (red tint),
+   * right cell = added (green tint), no border, full history width.
+   */
+  #diffRows(item: TuiItem): string[] {
+    const t = item.tool;
+    if (!t || !t.diff || !t.diff.length) return [];
+    const bodyCols = this.#bodyCols();
+    const leftW = Math.max(4, Math.floor((bodyCols - 1) / 2));
+    const rightW = Math.max(4, bodyCols - 1 - leftW);
+    const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
+    const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
+    const surf = this.#surface();
+    const cell = (bg: string, text: string, w: number): string =>
+      `${bg}${this.#clip(text, w)}${RESET}`;
+    const rows = this.#diffPairs(t.diff).map(
+      (p) =>
+        `${cell(p.del ? delBg : surf, p.del ? `- ${p.del}` : "", leftW)} ` +
+        `${cell(p.add ? addBg : surf, p.add ? `+ ${p.add}` : "", rightW)}`,
+    );
+    if (t.truncated) {
+      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
+    }
+    return rows;
   }
 
   #userRow(line: string): string {

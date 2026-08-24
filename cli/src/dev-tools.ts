@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import type { ToolRegistry } from "@aih/core";
 import { lineDiff } from "./diff.js";
 import { buildChildEnv } from "./env-policy.js";
+import { formatAfterWrite } from "./formatter.js";
 
 const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
@@ -103,7 +104,9 @@ export function registerDevTools(
       }
       mkdirSync(resolve(file, ".."), { recursive: true });
       writeFileSync(file, content);
-      return { path: file, bytes: Buffer.byteLength(content), new_file: previous === "", _diff: lineDiff(previous, content) };
+      // F#27: post-write auto-format (prettier/biome/eslint), never blocks.
+      const fmt = await formatAfterWrite(file, cwd);
+      return { path: file, bytes: Buffer.byteLength(content), new_file: previous === "", _diff: lineDiff(previous, content), ...fmt };
     },
   });
 

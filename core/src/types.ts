@@ -104,6 +104,16 @@ export type SessionEvent =
   | {
       seq: number;
       ts: number;
+      type: "goal/judge";
+      turnId: string;
+      met: boolean;
+      reason: string;
+      unmet: string[];
+      roundsLeft?: number;
+    }
+  | {
+      seq: number;
+      ts: number;
       type: "app/event";
       source: string;
       payload: unknown;
