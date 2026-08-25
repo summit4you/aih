@@ -261,6 +261,29 @@ export class AgentLoop {
 
       if (response.finishReason === "length") {
         truncated = true;
+        // Every tool call inside a length-truncated assistant message gets a
+        // synthetic failure: streamed arguments may have been cut mid-JSON, so
+        // executing them risks acting on salvaged-but-wrong input, and leaving
+        // them unanswered breaks the assistant-toolCalls→tool-result pairing
+        // the next request needs (providers 400 otherwise). The error tells
+        // the model to re-issue the call cleanly.
+        for (const call of response.toolCalls) {
+          this.#log.append({
+            type: "tool/call",
+            turnId,
+            callId: call.id,
+            name: call.name,
+            args: call.args,
+          });
+          this.#log.append({
+            type: "tool/result",
+            turnId,
+            callId: call.id,
+            ok: false,
+            error:
+              "model response hit the output token limit before this call completed — arguments may be truncated; re-issue the call",
+          });
+        }
         if (shouldCompact) {
           const c = await this.#compactOrSkip(turnId);
           if (c.usage) usage = addUsage(usage, c.usage);
@@ -348,6 +371,25 @@ export class AgentLoop {
             });
           }
           i = j;
+        }
+        // Abort mid-batch: calls that were never executed still need results,
+        // or the assistant's toolCalls go orphaned in the derived conversation
+        // (invalid request on the next turn).
+        for (let k = i; k < calls.length; k += 1) {
+          this.#log.append({
+            type: "tool/call",
+            turnId,
+            callId: calls[k].id,
+            name: calls[k].name,
+            args: calls[k].args,
+          });
+          this.#log.append({
+            type: "tool/result",
+            turnId,
+            callId: calls[k].id,
+            ok: false,
+            error: "turn cancelled before this call was executed",
+          });
         }
       }
 

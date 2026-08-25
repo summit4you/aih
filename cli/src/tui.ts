@@ -2263,24 +2263,37 @@ constructor(opts: TuiOptions) {
     rows.push(row(this.#statusRow(leftW)));
 
     const lines = rows.map((r) => r.left + (r.right ?? ""));
-    const geomChanged = this.#lastLines.length !== lines.length;
-    const clear = this.#clearNext || geomChanged ? `${CSI}2J` : "";
-    if (this.#clearNext || geomChanged) this.#lastLines = [];
-    this.#clearNext = false;
+    // Row-level diff against the previous frame (pi-style): rewrite only rows
+    // whose string changed, erase surplus rows when the frame got shorter
+    // (input box unwrapped / terminal resized), and never clear the whole
+    // screen outside an explicit #clearNext (resize/restore). #clip pads rows
+    // to full width, so a shorter replacement overwrites its old tail.
+    const prevLen = this.#lastLines.length;
     const curRow = Math.max(1, cursorIdx + 1);
     const curCol = Math.min(width - 1, 4 + cols((il.segs[il.ci] ?? "").slice(0, il.col)));
-    if (!clear && lines.every((line, i) => line === this.#lastLines[i])) {
+    if (
+      !this.#clearNext &&
+      prevLen === lines.length &&
+      lines.every((line, i) => line === this.#lastLines[i])
+    ) {
       process.stdout.write(`${CSI}${curRow};${curCol + 1}H`);
       return;
     }
-    let out = `${CSI}?2026h${HIDE}${CSI}H${clear}`;
+    let out = `${CSI}?2026h${HIDE}${CSI}H`;
+    if (this.#clearNext) out += `${CSI}2J`;
     const panelCol = width - pw + 1;
     for (let i = 0; i < rows.length; i += 1) {
-      if (this.#lastLines[i] === lines[i]) continue;
+      if (!this.#clearNext && this.#lastLines[i] === lines[i]) continue;
       out += `${CSI}${i + 1};1H${rows[i].left}`;
       if (rows[i].right) out += `${CSI}${i + 1};${panelCol}H${rows[i].right}`;
     }
+    if (!this.#clearNext) {
+      for (let i = rows.length; i < prevLen; i += 1) {
+        out += `${CSI}${i + 1};1H${CSI}2K`;
+      }
+    }
     this.#lastLines = lines;
+    this.#clearNext = false;
     out += `${CSI}${curRow};${curCol + 1}H${SHOW}${CSI}?2026l`;
     process.stdout.write(out);
   }

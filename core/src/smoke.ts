@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   AgentLoop,
   AutoApprove,
@@ -201,6 +201,35 @@ assert(
   seqs.every((s, i) => i === 0 || s === seqs[i - 1] + 1),
   "seq continues monotonically after reload",
 );
+// Storage hardening: torn tail repaired, interior corruption tolerated,
+// empty log never clobbers an existing file.
+{
+  const p = join(mkdtempSync(join(tmpdir(), "aih-core-")), "torn.jsonl");
+  const good1 = JSON.stringify({ seq: 0, ts: 1, type: "turn/start", turnId: "t" });
+  const good2 = JSON.stringify({ seq: 1, ts: 2, type: "user/message", turnId: "t", text: "hi" });
+  writeFileSync(p, `${good1}\n${good2}\n{"seq":2,"ts":3,"type":"tool/ca`, "utf8"); // torn final line
+  const torn = new SessionStore(p).load();
+  assert(torn !== undefined && torn.all().length === 2, "load drops a torn trailing line and keeps valid events");
+  assert(
+    readFileSync(p, "utf8") === `${good1}\n${good2}\n`,
+    "load atomically repairs the file to the valid prefix",
+  );
+  assert(!existsSync(`${p}.tmp-` + process.pid) && !readdirSync(dirname(p)).some((f) => f.includes(".tmp-")), "no temp files left behind");
+
+  const interior = `${good1}\n{corrupt\n${good2}\n`;
+  const p2 = join(mkdtempSync(join(tmpdir(), "aih-core-")), "interior.jsonl");
+  writeFileSync(p2, interior, "utf8");
+  const kept = new SessionStore(p2).load();
+  assert(kept !== undefined && kept.all().length === 2, "interior corruption still yields the parseable events");
+  assert(readFileSync(p2, "utf8") === interior, "interior corruption leaves the file untouched (no evidence destroyed)");
+
+  const empty = new SessionLog();
+  new SessionStore(p).save(empty);
+  assert(
+    readFileSync(p, "utf8") === `${good1}\n${good2}\n`,
+    "saving an empty log never truncates an existing session file",
+  );
+}
 rmSync(storePath, { force: true });
 
 let fetchCalls = 0;
@@ -666,10 +695,27 @@ const truncLoop = new AgentLoop({
 });
 const truncResult = await truncLoop.send("go");
 assert(truncResult.stopReason === "max_tokens", "finish_reason=length ends the turn as max_tokens");
+const truncEvents = truncLoop.log.all();
+const t1 = truncEvents.find((e) => e.type === "tool/result" && e.callId === "t1") as
+  | Extract<SessionEvent, { type: "tool/result" }>
+  | undefined;
 assert(
-  !truncLoop.log.all().some((e) => e.type === "tool/call"),
-  "truncated step's tool calls are not executed (possibly incomplete args)",
+  !!t1 && t1.ok === false && String(t1.error).includes("re-issue"),
+  "truncated step's tool call is failed with a re-issue hint (never executed)",
 );
+{
+  // Pairing invariant: every tool/call in a log has exactly one tool/result.
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (const e of truncEvents) {
+    if (e.type === "tool/call") calls.add(e.callId);
+    if (e.type === "tool/result" && !results.has(e.callId)) results.add(e.callId);
+  }
+  assert(
+    [...calls].every((c) => results.has(c)) && calls.size === results.size,
+    "length-truncation leaves no orphaned tool calls (call↔result pairing intact)",
+  );
+}
 const plainTrunc = await new AgentLoop({
   llm: new MockLLM([{ text: "cut off mid-sentence", stopReason: "end_turn", finishReason: "length" }]),
   tools: truncTools,
@@ -680,6 +726,45 @@ const okFinish = await new AgentLoop({
   tools: truncTools,
 }).send("go");
 assert(okFinish.stopReason === "end_turn", "normal finish_reason=stop stays end_turn");
+
+// Abort mid-batch: the un-executed calls get synthetic cancelled results, so
+// no assistant toolCalls are ever left without a paired result.
+{
+  const canceler: ToolDefinition = {
+    name: "canceler",
+    description: "cancels the turn",
+    kind: "write",
+    permission: "allow",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async () => {
+      loopRef!.cancel();
+      return { ok: true };
+    },
+  };
+  const abortTools = new ToolRegistry(gate);
+  abortTools.register(canceler);
+  let loopRef: AgentLoop | undefined;
+  const abortLoop = new AgentLoop({
+    llm: new MockLLM([
+      {
+        text: "",
+        toolCalls: [toolCall("a1", "canceler", {}), toolCall("a2", "canceler", {})],
+        stopReason: "tool_use",
+      },
+    ]),
+    tools: abortTools,
+  });
+  loopRef = abortLoop;
+  const r = await abortLoop.send("go");
+  assert(r.stopReason === "cancelled", "cancelled turn reports stopReason=cancelled");
+  const a2 = abortLoop.log.all().find((e) => e.type === "tool/result" && e.callId === "a2") as
+    | Extract<SessionEvent, { type: "tool/result" }>
+    | undefined;
+  assert(
+    !!a2 && a2.ok === false && String(a2.error).includes("cancelled before"),
+    "abort mid-batch pairs the skipped call with a synthetic cancelled result",
+  );
+}
 
 const truncStreamLlm = new OpenAICompatibleLLM({
   baseUrl: "https://example.invalid/v1",
