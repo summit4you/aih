@@ -741,6 +741,8 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | Steering 中途改向 / Follow-up 排队 | — | ✅ | ◐ | — | ✅ busy 输入自动 steer；follow-up 自动续跑（P#35） |
 | 缓存命中观测（CH%） | — | ◐ | ◐ | — | ✅ `/usage` 行 + 面板 CH%（P#41，需 provider 上报） |
 | 模型元数据快照同步（models.dev） | — | ✅ refresh | — | — | ✅ fail-closed 刷新脚本 + 27 模型快照（P#48） |
+| Extension API（代码级插件） | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on（P#39，信任门约束） |
+| Session 树 / 分支导航 | — | ◐ | ✅ Pi | — | ✅ parentId 链 + `/tree` 视图（P#37，旧文件零迁移） |
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
