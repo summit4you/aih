@@ -65,6 +65,7 @@ import {
   ensureProjectTrust,
   hasProjectAssets,
 } from "./project-trust.js";
+import { loadExtensions } from "./extensions.js";
 import {
   findPruneCandidates,
   placeholderFor,
@@ -936,6 +937,9 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     for (const def of await backend.listTools()) registry.register(def);
     const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
     registerArchiveReadTool(registry);
+    void loadExtensions(registry, {
+      enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
+    });
     if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
     attachAudit(registry, flags);
 
@@ -1220,6 +1224,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   let registry = new ToolRegistry(gate);
   let skills: Skill[] = [];
   const tuiRef: { current: Tui | null } = { current: null };
+  // P#39 — TUI slash commands contributed by extensions.
+  const extensionCommands = new Map<string, { run(args: string): void | Promise<void> }>();
   function rebuildRegistry(): void {
     registry = new ToolRegistry(gate);
     for (const def of backendDefs) {
@@ -1227,6 +1233,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     registry.planMode(agentMode === "plan");
     skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
+    registerArchiveReadTool(registry);
+    void loadExtensions(registry, {
+      enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
+      commands: extensionCommands,
+    });
     if (!bool(flags, "no-dev")) {
       registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan");
     }
@@ -2372,6 +2383,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
     }
     if (input.startsWith("/")) {
+      // P#39: extension-contributed commands get first crack at unknown
+      // slash names.
+      const extName = input.slice(1).split(" ")[0];
+      const extCmd = extensionCommands.get(extName);
+      if (extCmd) {
+        await extCmd.run(input.slice(1 + extName.length).trim());
+        return;
+      }
       tui.pushSystem(
         `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /skills /inject /events /clear /exit`,
       );
