@@ -69,6 +69,7 @@ import {
 } from "./cost.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
+import { peekWorkspaceIdentity, compareIdentity } from "./workspace-identity.js";
 import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
 import { builtinHooks, composeHooks } from "./hooks.js";
 import { loadBoard, spawnJob, cancelJob, jobById, summarize } from "./jobs.js";
@@ -1908,6 +1909,29 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         }
       }
       const restored = log.restoreTo(target.seq);
+      // MK#47: identity gate — a checkpoint carries the workspace UUID it was
+      // taken in. A mismatch means this session's checkpoints belong to a
+      // DIFFERENT workspace (e.g. the log was forked across repos): refuse
+      // rather than silently rolling back foreign context. Unknown (no marker
+      // either side, e.g. unwritable fs) is advisory and does not block.
+      const cpWt: { workspaceId?: string } | undefined = target.worktree;
+      if (cpWt?.workspaceId) {
+        const now = peekWorkspaceIdentity();
+        const check = compareIdentity(now, { uuid: cpWt.workspaceId, path: "" });
+        if (check === "mismatch") {
+          tui.pushError(
+            `restore refused: checkpoint #${target.seq} was recorded in a different workspace ` +
+              `(marker ${cpWt.workspaceId.slice(0, 8)}… vs here ${now?.uuid.slice(0, 8)}…) — ` +
+              `the history was probably forked across repositories`,
+          );
+          return;
+        }
+        if (check === "unknown") {
+          tui.pushSystem(
+            "note: no local workspace marker (.aih/workspace.json) — cannot verify this checkpoint's origin",
+          );
+        }
+      }
       // Append-only: snapshot the FULL pre-restore history to a side file so
       // the discarded suffix stays auditable (the live file will be rewritten
       // to the restored prefix below).

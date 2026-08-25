@@ -5,6 +5,9 @@ export type ToolKind = "read" | "write";
 /**
  * Git worktree snapshot attached to checkpoint events (F#28 increment):
  * branch, HEAD sha and a capped changed-file list captured at checkpoint time.
+ * MK#47: `workspaceId` adds the LOGICAL workspace identity (stable UUID from
+ * .aih/workspace.json) so restore/resume can prove "same workspace" across
+ * path moves — path equality is diagnostic, uuid equality is the gate.
  */
 export interface WorktreeSummary {
   /** Current branch name (`null` = detached HEAD or undetermined). */
@@ -17,6 +20,14 @@ export interface WorktreeSummary {
   dirtyCount: number;
   /** True when there are no local changes. */
   clean: boolean;
+  /**
+   * MK#47 — logical workspace identity (UUID from .aih/workspace.json).
+   * Stable across path moves; a mismatch on restore means the checkpoint was
+   * taken in a DIFFERENT workspace. Absent when identity could not be
+   * established (no write access / marker unreadable) — unknown is advisory,
+   * mismatch is the hard gate.
+   */
+  workspaceId?: string;
 }
 
 export interface JsonSchemaProperty {

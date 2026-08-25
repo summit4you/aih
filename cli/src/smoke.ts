@@ -1751,6 +1751,31 @@ await srv.connect(new StdioServerTransport());
   const lines = formatWorktreeSummary(snap!);
   assert(lines[0].startsWith("worktree: main @ "), "formatted summary names branch@sha");
   assert(lines.slice(1).some((l) => l.trim().length > 0), "formatted summary includes dirty entries");
+
+  // MK#47 — workspace identity marker on the same repo.
+  {
+    const wi = await import("./workspace-identity.js");
+    const id1 = wi.workspaceIdentity({ cwd: repo });
+    assert(!!id1 && /^[0-9a-f-]{36}$/.test(id1!.uuid), "workspaceIdentity creates a UUID marker");
+    const raw = JSON.parse(readFileSync(`${repo}/.aih/workspace.json`, "utf8")) as { workspaceId: string };
+    assert(raw.workspaceId === id1!.uuid, "marker file persists the uuid verbatim");
+    const id2 = wi.workspaceIdentity({ cwd: repo });
+    assert(!!id2 && id2!.uuid === id1!.uuid, "identity is stable across reads");
+    // Peek does not create anything in a fresh directory.
+    const fresh = mkdtempSync(join(tmpdir(), "aih-wsid-"));
+    assert(wi.peekWorkspaceIdentity({ cwd: fresh }) === undefined, "peek returns undefined when no marker exists");
+    assert(!existsSync(`${fresh}/.aih/workspace.json`), "peek never creates the marker");
+    assert(!!wi.peekWorkspaceIdentity({ cwd: repo }), "peek finds an existing marker");
+    // Compare semantics: uuid equality decides; paths are irrelevant; unknown ≠ mismatch.
+    const moved = { uuid: id1!.uuid, path: "/somewhere/else" };
+    assert(wi.compareIdentity(id1!, moved) === "match", "path move alone is NOT a mismatch (logical identity)");
+    assert(wi.compareIdentity(id1!, { uuid: "00000000-0000-0000-0000-000000000000", path: repo }) === "mismatch", "different uuid = mismatch");
+    assert(wi.compareIdentity(undefined, id1!) === "unknown" && wi.compareIdentity(id1!, undefined) === "unknown", "missing identity either side = unknown (advisory)");
+    // gitStatusSummary embeds the identity into checkpoint snapshots.
+    const snapWithId = gitStatusSummary({ cwd: repo });
+    assert(!!snapWithId && snapWithId.workspaceId === id1!.uuid, "checkpoint worktree snapshot carries workspaceId");
+    rmSync(fresh, { recursive: true, force: true });
+  }
   rmSync(repo, { recursive: true, force: true });
 
   // CLI checkpoint embeds the snapshot into the event (cwd = this repo).
