@@ -137,9 +137,19 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   // newer real turn → usage wins again.
   const real = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000), mk(2, 3, 15_000, 5)]);
   assert(real.tokens === 15_000 && real.source === "usage", "newer turn/end returns to provider-truth usage");
-  // legacy compaction event without the stamp (old session file) → none, not
-  // the stale pre-compaction value.
-  assert(lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2)]).source === "none", "unstamped legacy compaction → none");
+  // legacy compaction event without the stamp (old session file) → local
+  // estimate over post-compaction events, never the stale pre-compaction value.
+  const legacy = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2)]);
+  assert(legacy.source === "estimate" && legacy.tokens < 100_000, "unstamped legacy compaction → local estimate, not stale usage");
+
+  // Garbage provider usage (cumulative/free-tier inflation) is skipped when a
+  // window is known: 28M reported on a 200k-window model must not reach the
+  // panel; a sane newer/older sample still wins; nothing sane → estimate.
+  const garbage = mk(5, 6, 28_200_904, 7_697);
+  assert(lastContextTokens([garbage], 200_000).source === "estimate", "implausible usage skipped (window known)");
+  assert(lastContextTokens([garbage], 0).tokens === 28_200_904, "without a window the raw value passes through (cannot judge)");
+  const saneNewer = lastContextTokens([mk(0, 1, 120_000, 5), garbage, mk(9, 10, 130_000, 5)], 200_000);
+  assert(saneNewer.tokens === 130_000 && saneNewer.source === "usage", "sane newer usage beats older garbage");
 
   assert(tokensPerSecond([]) === 0, "TPS is 0 with no events");
   assert(fmtCost(12.5) === "$12.50", "fmtCost formats >=0.01 to 2 decimals");

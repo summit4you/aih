@@ -73,11 +73,13 @@ import {
   saveToArchive,
 } from "./prune.js";
 import {
-  aggregateUsage,  fmtCost,
+  aggregateUsage,
+  fmtCost,
   fmtTps,
   cacheHitRate,
   lastContextTokens,
   resolvePrice,
+  sanePromptTokens,
   streamingTps,
   tokensPerSecond,
   totalCost,
@@ -1303,7 +1305,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // Seed the context-usage counter from the restored session's last completed
   // turn so `-c`/`--session` resume shows the real context immediately instead
   // of 0 (opencode/mimo derive this from the restored history on resume).
-  const seedCtx = lastContextTokens(log.all());
+  // Window-bounded so garbage provider usage (28M-token prompts) is skipped
+  // in favor of the local estimate.
+  const seedCtx = lastContextTokens(log.all(), resolveContextWindow(flags));
   let usedTokens = seedCtx.tokens;
   let peakTokens = usedTokens;
 
@@ -1377,7 +1381,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       providerLabel = re.provider ?? "custom";
       // Context size belongs to the conversation, not the model: re-seed from
       // the log (same as `-c` resume) instead of zeroing the panel.
-      usedTokens = lastContextTokens(log.all()).tokens;
+      usedTokens = lastContextTokens(log.all(), resolveContextWindow(flags)).tokens;
       loop = makeLoop();
     } catch (err) {
       // A failed switch (e.g. target provider has no API key) must not kill
@@ -1631,6 +1635,20 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   }
 
   const questionCalls = new Set<string>();
+  // opencode parity: after a compaction, show what the summarizer produced —
+  // not just a status line. Preview of the newest compaction summary.
+  const summaryPreview = (): string => {
+    for (let i = log.all().length - 1; i >= 0; i -= 1) {
+      const e = log.all()[i];
+      if (e.type === "compaction") {
+        const body = (e.summary ?? "").trim();
+        if (!body) return "";
+        const lines = body.split("\n");
+        return `\n${dim("── compaction summary ──")}\n${lines.slice(0, 8).join("\n")}${lines.length > 8 ? `\n${dim("… full summary in the session log (/events)")}` : ""}`;
+      }
+    }
+    return "";
+  };
   log.subscribe((event: SessionEvent) => {
     if (event.type === "tool/call") {
       if (event.name === "question") {
@@ -1654,9 +1672,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         const window = resolveContextWindow(flags);
         const pct = usedTokens ? Math.round((usedTokens / window) * 100) : null;
         tui.pushSystem(
-          pct !== null
-            ? `context ~${pct}% — compacted (earlier messages summarized, continuing)`
-            : "compacted (earlier messages summarized, continuing)",
+          (pct !== null ? `context ~${pct}% — compacted` : "compacted") +
+            " (earlier messages summarized, continuing)" +
+            summaryPreview(),
         );
       }
     });
@@ -2365,7 +2383,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         const pct = limit ? Math.round(Math.min(1, r.after / limit) * 100) : null;
         const drop = r.before > 0 ? Math.round(((r.before - r.after) / r.before) * 100) : 0;
         tui.pushSystem(
-          `compacted: ~${r.before} → ~${r.after} tokens (-${drop}%)\ncontext now ${r.after}/${limit}${pct !== null ? ` (${pct}%)` : ""} — earlier messages summarized, full history stays in the session log`,
+          `compacted: ~${r.before} → ~${r.after} tokens (-${drop}%)\ncontext now ${r.after}/${limit}${pct !== null ? ` (${pct}%)` : ""} — earlier messages summarized, full history stays in the session log` +
+            summaryPreview(),
         );
       } catch (err) {
         tui.pushSystem(`compact failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -2460,12 +2479,18 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
       saveSession(sessionPath, log);
       const usage = result.usage;
-      if (result.contextNow != null) {
+      // Belt-and-braces vs garbage provider usage (agent-loop already gates
+      // its own contextNow): only adopt wire numbers bounded by the window.
+      const win = resolveContextWindow(flags);
+      const sane = (n: unknown): n is number => sanePromptTokens(n, win);
+      if (result.contextNow != null && sane(result.contextNow)) {
         usedTokens = result.contextNow;
-      } else if (result.contextTokens) {
+      } else if (sane(result.contextTokens)) {
         usedTokens = Math.max(usedTokens, result.contextTokens);
-      } else if (usage) {
+      } else if (usage && sane(usage.promptTokens)) {
         usedTokens = Math.max(usedTokens, usage.promptTokens ?? 0);
+      } else {
+        usedTokens = lastContextTokens(log.all(), win).tokens;
       }
       peakTokens = Math.max(peakTokens, usedTokens);
       const dur = Date.now() - started;

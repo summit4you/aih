@@ -275,8 +275,18 @@ export class AgentLoop {
       usage = addUsage(usage, response.usage);
       if (typeof response.genMs === "number") genMs += response.genMs;
       const promptTokens = response.usage?.promptTokens ?? 0;
-      if (promptTokens > contextTokens) contextTokens = promptTokens;
-      if (promptTokens > 0) contextNow = promptTokens;
+      // Free-tier gateways sometimes report cumulative/garbage prompt_tokens
+      // (observed 28M on a ~500k-token conversation). Trust the wire number
+      // only when it is plausibly bounded by the window; otherwise keep the
+      // local chars÷4 estimate so compaction triggers and any UI stay sane.
+      const plausible =
+        promptTokens > 0 &&
+        (this.#contextWindow <= 0 || promptTokens <= this.#contextWindow * 2);
+      const effectiveContext = plausible
+        ? promptTokens
+        : Math.max(contextNow, this.#estimateContext());
+      if (plausible && promptTokens > contextTokens) contextTokens = promptTokens;
+      contextNow = effectiveContext;
 
       this.#log.append({
         type: "assistant/message",
@@ -292,7 +302,7 @@ export class AgentLoop {
       // compact no later than 80% even when the reserve is larger.
       const shouldCompact =
         this.#contextWindow > 0 &&
-        promptTokens >= Math.min(
+        effectiveContext >= Math.min(
           this.#compactAt * this.#contextWindow,
           this.#contextWindow - this.#compactReserve(),
         );

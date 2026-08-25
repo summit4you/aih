@@ -149,6 +149,7 @@ export function aggregateUsage(events: readonly SessionEvent[]): TokenUsage {
  */
 export function lastContextTokens(
   events: readonly SessionEvent[],
+  window = 0,
 ): { tokens: number; source: "usage" | "estimate" | "none" } {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
@@ -157,14 +158,69 @@ export function lastContextTokens(
       // ESTIMATE, never provider truth. opencode parity: display values come
       // from real usage where available; estimates are labeled as such.
       const est = e.contextAfter ?? 0;
-      return { tokens: est, source: est > 0 ? "estimate" : "none" };
+      return est > 0
+        ? { tokens: est, source: "estimate" }
+        : { tokens: estimateContextTokens(events), source: "estimate" };
     }
     if (e.type === "turn/end") {
       const p = e.usage?.promptTokens;
-      if (typeof p === "number" && p > 0) return { tokens: p, source: "usage" };
+      // Free-tier gateways report cumulative/garbage prompt_tokens (observed
+      // 28M on a ~500k-token conversation). Skip implausible values and keep
+      // walking back; when nothing sane remains, derive locally.
+      if (sanePromptTokens(p, window)) return { tokens: p as number, source: "usage" };
     }
   }
-  return { tokens: 0, source: "none" };
+  if (events.length === 0) return { tokens: 0, source: "none" };
+  return { tokens: estimateContextTokens(events), source: "estimate" };
+}
+
+/**
+ * Local context-size estimate (chars÷4 heuristic, pi-style) over exactly what
+ * deriveMessages would send: the latest compaction summary plus every event
+ * after it. Server-reported promptTokens from free-tier gateways can be
+ * garbage (observed 28M on a ~500k-token conversation), so the context panel
+ * derives from this instead of trusting the wire numbers.
+ */
+export function estimateContextTokens(events: readonly SessionEvent[]): number {
+  let cutoff = -1;
+  let chars = 0;
+  for (const e of events) {
+    if (e.type === "compaction") {
+      cutoff = e.seq;
+      chars = e.summary?.length ?? 0; // earlier summaries are superseded
+    }
+  }
+  for (const e of events) {
+    if (e.seq <= cutoff) continue;
+    switch (e.type) {
+      case "user/message":
+        chars += e.text.length;
+        break;
+      case "assistant/message":
+        chars += e.text.length + JSON.stringify(e.toolCalls ?? []).length;
+        break;
+      case "tool/call":
+        chars += e.name.length + JSON.stringify(e.args ?? {}).length;
+        break;
+      case "tool/result":
+        chars += JSON.stringify(e.result ?? e.error ?? "").length;
+        break;
+      default:
+        break;
+    }
+  }
+  return Math.max(0, Math.round(chars / 4));
+}
+
+/**
+ * Display-trust test for server-reported prompt size: positive and, when the
+ * window is known, within 2× of it. Free-tier gateways have returned
+ * cumulative/garbage prompt_tokens that would otherwise pin the panel at
+ * absurd values (and mis-trigger auto-compaction).
+ */
+export function sanePromptTokens(n: unknown, window: number): boolean {
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return false;
+  return window <= 0 || n <= window * 2;
 }
 
 /** Cumulative cost (USD) across the whole event log at a given price. */
