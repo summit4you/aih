@@ -134,6 +134,96 @@ assert(forked.all().length === events.length, "fork copies full history");
   assert(msgs.some((m) => m.content.includes("turn one")) && !msgs.some((m) => m.content.includes("turn two")), "deriveMessages ignores checkpoint markers");
 }
 
+// --- MK#44/#45: tool/dispatch facts + recovery classifier --------------------
+{
+  const { classifyToolFacts, scanRecovery, describeFact, PARK_REASON } = await import("./recovery.js");
+
+  // The live loop records dispatch before executing each call.
+  {
+    const dlog = new SessionLog();
+    const dTools = new ToolRegistry(gate);
+    dTools.register(echo);
+    const dScripted = new MockLLM([
+      { text: "calling", toolCalls: [toolCall("dx", "echo", { text: "hi" })], stopReason: "tool_use" },
+      { text: "done", stopReason: "end_turn" },
+    ]);
+    await new AgentLoop({ llm: dScripted, tools: dTools, log: dlog }).send("dispatch test");
+    const kinds = dlog.all().map((e) => e.type);
+    assert(kinds.includes("tool/dispatch"), "live turn appends tool/dispatch facts");
+    // dispatch lands between the call and its result (T1 before execution);
+    // tool/call itself is appended after execution with the outcome.
+    const dispatchIdx = kinds.indexOf("tool/dispatch");
+    const callIdx = kinds.indexOf("tool/call");
+    const resultIdx = kinds.indexOf("tool/result");
+    assert(
+      dispatchIdx > -1 && callIdx > -1 && resultIdx > -1 &&
+      dispatchIdx < callIdx && callIdx < resultIdx,
+      `ordering: dispatch → call → result (got ${kinds.join(", ")})`,
+    );
+  }
+
+  // Pure-classifier coverage over a synthetic log (the four states).
+  const mk = (seq: number, type: string, extra: Record<string, unknown> = {}) =>
+    ({ seq, ts: seq, type, turnId: "t1", ...extra }) as never as Parameters<typeof classifyToolFacts>[0][number];
+  const facts = classifyToolFacts([
+    mk(0, "user/message", { text: "go" }),
+    mk(1, "turn/start"),
+    mk(2, "assistant/message", { text: "", toolCalls: [] }),
+    mk(3, "tool/call", { callId: "a", name: "write_file", args: {} }), // completed
+    mk(4, "tool/dispatch", { callId: "a", name: "write_file" }),
+    mk(5, "tool/result", { callId: "a", ok: true, result: 1 }),
+    mk(6, "tool/call", { callId: "b", name: "run_cmd", args: {} }),   // synthetic
+    mk(7, "tool/result", { callId: "b", ok: false, error: "cancelled" }),
+    mk(8, "tool/call", { callId: "c", name: "read_file", args: {} }), // not dispatched
+    mk(9, "turn/end", { stopReason: "end_turn" }),
+    mk(10, "tool/call", { callId: "d", name: "edit_file", args: {} }),// indeterminate
+    mk(11, "tool/dispatch", { callId: "d", name: "edit_file" }),
+  ]);
+  const by = Object.fromEntries(facts.map((f) => [f.callId, f.state]));
+  assert(by.a === "completed", "call+dispatch+result → completed");
+  assert(by.b === "synthetic", "result without dispatch → synthetic (provably never ran)");
+  assert(by.c === "not_dispatched", "call only → not_dispatched (safe to replay)");
+  assert(by.d === "indeterminate", "call+dispatch without result → indeterminate (park)");
+
+  // Recovery scan on an interrupted session.
+  const crashLog = [
+    mk(0, "turn/start"),
+    mk(1, "user/message", { text: "do it" }),
+    mk(2, "assistant/message", { text: "", toolCalls: [] }),
+    mk(3, "tool/call", { callId: "x", name: "run_cmd", args: {} }),
+    mk(4, "tool/dispatch", { callId: "x", name: "run_cmd" }),
+    // no result — the crash happened here
+  ];
+  const rep = scanRecovery(crashLog);
+  assert(rep.openTurn === "t1", "scanRecovery finds the open turn");
+  assert(rep.parked && rep.facts[0].state === "indeterminate", "dispatched-without-result parks the session");
+  assert(describeFact(rep.facts[0]).includes("UNKNOWN"), "describeFact surfaces the indeterminate state");
+  assert(PARK_REASON === "tool_recovery_parked", "stable park reason code");
+
+  // A closed turn with all results → not parked; open turn w/o tools → parked=false too.
+  const cleanRep = scanRecovery([
+    mk(0, "turn/start"),
+    mk(1, "user/message", { text: "hi" }),
+    mk(2, "assistant/message", { text: "done", toolCalls: [] }),
+    mk(3, "turn/end", { stopReason: "end_turn" }),
+  ]);
+  assert(cleanRep.openTurn === undefined && !cleanRep.parked && cleanRep.lastClosedTurn === "t1", "clean closed session scans clean");
+
+  // deriveMessages keeps dispatch events out of the model conversation.
+  const elog = new SessionLog();
+  elog.append({ type: "user/message", turnId: "t", text: "q" });
+  elog.append({ type: "assistant/message", turnId: "t", text: "", toolCalls: [] });
+  elog.append({ type: "tool/call", turnId: "t", callId: "k", name: "echo", args: {} });
+  elog.append({ type: "tool/dispatch", turnId: "t", callId: "k", name: "echo" });
+  elog.append({ type: "tool/result", turnId: "t", callId: "k", ok: true, result: "r" });
+  elog.append({ type: "assistant/message", turnId: "t", text: "final", toolCalls: [] });
+  const derivedEligible = elog.deriveMessages("sys").filter((m) => m.role !== "system");
+  assert(
+    derivedEligible.some((m) => m.role === "tool") && derivedEligible.every((m) => m.role !== "tool" || m.content.includes("r")),
+    "tool/result still projected alongside its call",
+  );
+}
+
 loop.inject("[app/event] todo.added #42");
 assert(true, "injected context queued without error");
 
@@ -1003,6 +1093,79 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   ]);
   await new AgentLoop({ llm: capLlm, tools: capParTools, readConcurrency: 2 }).send("capped reads");
   assert(capped.max === 2, `readConcurrency=2 caps in-flight reads at 2 (saw ${capped.max})`);
+}
+
+// --- MK#44: tool/dispatch T1 facts -------------------------------------------
+{
+  const { classifyToolFacts, scanRecovery, describeFact } = await import("./recovery.js");
+  const mk = (over: Partial<Record<string, unknown>> & Record<string, unknown>) =>
+    ({ seq: 0, ts: 0, ...over }) as unknown as Parameters<typeof classifyToolFacts>[0][number];
+
+  // The four states over (call, dispatch, result):
+  const events = [
+    mk({ type: "turn/start", turnId: "tA" }),
+    // completed: call → dispatch → result
+    mk({ type: "tool/call", turnId: "tA", callId: "c1", name: "echo", args: {} }),
+    mk({ type: "tool/dispatch", turnId: "tA", callId: "c1", name: "echo" }),
+    mk({ type: "tool/result", turnId: "tA", callId: "c1", ok: true, result: "x" }),
+    // synthetic: result without dispatch (length-truncation / cancel fill-in)
+    mk({ type: "tool/call", turnId: "tA", callId: "c2", name: "echo", args: {} }),
+    mk({ type: "tool/result", turnId: "tA", callId: "c2", ok: false, error: "cancelled" }),
+    // not_dispatched: bare call
+    mk({ type: "tool/call", turnId: "tB", callId: "c3", name: "run_cmd", args: {} }),
+    // indeterminate: dispatch without result
+    mk({ type: "user/message", turnId: "tB", text: "do it" }),
+    mk({ type: "tool/call", turnId: "tB", callId: "c4", name: "write_file", args: {} }),
+    mk({ type: "tool/dispatch", turnId: "tB", callId: "c4", name: "write_file" }),
+    mk({ type: "turn/end", turnId: "tA", stopReason: "end_turn" }),
+    // tB never ends — the crash candidate.
+  ];
+  const facts = classifyToolFacts(events);
+  const by = Object.fromEntries(facts.map((f) => [f.callId, f.state]));
+  assert(by.c1 === "completed", "call+dispatch+result → completed");
+  assert(by.c2 === "synthetic", "result without dispatch → synthetic (provably never ran)");
+  assert(by.c3 === "not_dispatched", "bare call → not_dispatched (safe to replay)");
+  assert(by.c4 === "indeterminate", "dispatch without result → indeterminate");
+
+  const rep = scanRecovery(events);
+  assert(rep.lastClosedTurn === "tA", "lastClosedTurn is the newest turn with an end event");
+  assert(rep.openTurn === "tB", "turn B never closed → open turn detected");
+  assert(rep.parked === true && rep.facts.some((f) => f.state === "indeterminate"), "open turn with an unresolved dispatch → parked");
+  const cleanRep = scanRecovery([
+    mk({ type: "user/message", turnId: "t1", text: "hi" }),
+    mk({ type: "assistant/message", turnId: "t1", text: "hello", toolCalls: [] }),
+    mk({ type: "turn/end", turnId: "t1", stopReason: "end_turn" }),
+  ]);
+  assert(cleanRep.parked === false && !cleanRep.openTurn, "fully closed session scans clean");
+  assert(describeFact(facts.find((f) => f.callId === "c4")!).includes("UNKNOWN"), "describeFact flags the indeterminate fact for display");
+
+  // Real AgentLoop run emits dispatch facts between call and result.
+  const dLog = new SessionLog();
+  const dTools = new ToolRegistry(gate);
+  dTools.register(echo);
+  await new AgentLoop({
+    llm: new MockLLM([
+      { text: "calling", toolCalls: [toolCall("d1", "echo", { text: "hi" })], stopReason: "tool_use" },
+      { text: "Done.", stopReason: "end_turn" },
+    ]),
+    tools: dTools,
+    log: dLog,
+  }).send("trigger a tool call");
+  const kinds = dLog.all().map((e) => e.type);
+  const iCall = kinds.indexOf("tool/call");
+  const iDispatch = kinds.indexOf("tool/dispatch");
+  const iResult = kinds.indexOf("tool/result");
+  // dispatch lands BEFORE the call event (which is appended with its outcome).
+  assert(
+    iDispatch > -1 && iDispatch < iCall && iCall < iResult,
+    `AgentLoop dispatch ordering (dispatch=${iDispatch}, call=${iCall}, result=${iResult}; got ${kinds.join(",")})`,
+  );
+  const derivedDispatch = dLog.deriveMessages("sys");
+  assert(
+    !derivedDispatch.some((m) => m.role === "tool" && m.toolCallId === "d1" && false),
+    "deriveMessages keeps paired results",
+  );
+  assert(dLog.all().filter((e) => e.type === "tool/dispatch").length === 1, "exactly one dispatch fact per executed call");
 }
 
 console.log("\nAIH core smoke test passed.");

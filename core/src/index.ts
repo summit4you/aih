@@ -1,5 +1,12 @@
 export { SessionLog } from "./session-log.js";
 export type { SessionListener, SessionEventInput } from "./session-log.js";
+export {
+  classifyToolFacts,
+  scanRecovery,
+  describeFact,
+  PARK_REASON,
+} from "./recovery.js";
+export type { ToolFact, ToolRecoveryState, RecoveryReport } from "./recovery.js";
 export { SessionStore } from "./session-store.js";
 export { AgentLoop } from "./agent-loop.js";
 export type { AgentLoopOptions } from "./agent-loop.js";

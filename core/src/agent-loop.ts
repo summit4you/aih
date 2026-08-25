@@ -348,6 +348,15 @@ export class AgentLoop {
               turnId,
               inject: (ctxText) => this.inject(ctxText),
             });
+          // MK#44 (T1): dispatch facts land BEFORE the tool/call event (the
+          // assistant's call is appended with its outcome below) but BEFORE
+          // execution. Once dispatched the tool MAY have run — crash recovery
+          // uses the call→dispatch→result triple to distinguish "never
+          // dispatched" (safe to replay) from "dispatched, outcome unknown"
+          // (park). Dispatch is model-invisible: deriveMessages skips it.
+          for (const call of batch) {
+            this.#log.append({ type: "tool/dispatch", turnId, callId: call.id, name: call.name });
+          }
           const outcomes = isRead
             ? await mapConcurrent(batch, this.#readConcurrency, runOne)
             : [await runOne(batch[0])];

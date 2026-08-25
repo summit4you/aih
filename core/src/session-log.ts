@@ -163,6 +163,9 @@ export class SessionLog {
         }
         continue;
        }
+      // MK#44: dispatch facts are Runtime bookkeeping, not conversation —
+      // the model never sees them.
+      if (event.type === "tool/dispatch") continue;
        pushMessage(event);
      }
      // Invariant (opencode/MiMo-Code parity): the model-visible conversation

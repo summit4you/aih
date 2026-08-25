@@ -105,6 +105,29 @@ export type SessionEvent =
   | {
       seq: number;
       ts: number;
+      type: "tool/dispatch";
+      turnId: string;
+      callId: string;
+      name: string;
+      /**
+       * MK#44 (T1) — appended AFTER all preflight checks pass and BEFORE the
+       * implementation runs. Model-invisible (deriveMessages skips it). A
+       * crash between this event and the tool/result means the side effect
+       * may have happened: recovery must treat that call as indeterminate,
+       * never as "not executed". Calls with a result but no dispatch are
+       * synthetic (length-truncation / cancel fill-ins) — provably never ran.
+       */
+    }
+  | {
+      seq: number;
+      ts: number;
+      type: "tool/dispatch";
+      turnId: string;
+      callId: string;
+    }
+  | {
+      seq: number;
+      ts: number;
       type: "tool/result";
       turnId: string;
       callId: string;
