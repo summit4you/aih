@@ -256,8 +256,17 @@ export class AgentLoop {
         toolCalls: response.toolCalls,
       });
 
+      // P#36 (hybrid budget): prefer the REAL prompt size from the last
+      // request over chars/4 estimates; trigger compaction at
+      // tokens > window − reserve so it fires BEFORE the provider rejects
+      // the request, not after. compactAt (default 0.8) remains the floor:
+      // compact no later than 80% even when the reserve is larger.
       const shouldCompact =
-        this.#contextWindow > 0 && promptTokens >= this.#compactAt * this.#contextWindow;
+        this.#contextWindow > 0 &&
+        promptTokens >= Math.min(
+          this.#compactAt * this.#contextWindow,
+          this.#contextWindow - this.#compactReserve(),
+        );
 
       if (response.finishReason === "length") {
         truncated = true;
@@ -440,6 +449,16 @@ export class AgentLoop {
       ...(contextTokens ? { contextTokens } : {}),
       ...(contextNow ? { contextNow } : {}),
     };
+  }
+
+  /**
+   * P#36 (hybrid budget) — token headroom between the compaction trigger and
+   * the hard window: compaction fires at window minus this reserve. Mirrors
+   * the preserveRecentBudget reserve (20k cap / 20% of window).
+   */
+  #compactReserve(): number {
+    if (this.#contextWindow <= 0) return 0;
+    return Math.min(20_000, Math.floor(this.#contextWindow * RESERVED_RATIO));
   }
 
   #estimateTokens(messages: ChatMessage[]): number {
