@@ -524,18 +524,25 @@ export class AgentLoop {
   // projection deriveMessages applies, without mutating the log.
   #estimateContextWith(compact: { summary?: string; recent?: ChatMessage[] } | undefined): number {
     const messages = this.#log.deriveMessages(this.#systemPrompt);
-    // Cheap approximation: replace the current leading-summary contribution
-    // with the new one. deriveMessages already folds the LAST compaction in;
-    // the delta between old and new summary is what changes.
-    const prev = this.#lastCompaction();
-    const prevSummaryLen = prev ? `# Summary of the earlier conversation\n${prev.summary}`.length : 0;
-    const nextSummaryLen = compact?.summary ? `# Summary of the earlier conversation\n${compact.summary}`.length : 0;
-    const recentExtra = (compact?.recent ?? []).reduce(
-      (n, m) => n + m.content.length + (m.toolCalls?.length ?? 0) * 32,
-      0,
-    );
-    const chars = messages.reduce((n, m) => n + m.content.length + (m.toolCalls?.length ?? 0) * 32, 0);
-    return Math.max(1, Math.round((chars - prevSummaryLen + nextSummaryLen + recentExtra * 2) / 4));
+    // P#36-fix: estimate the FUTURE projection cleanly — system prompt with
+    // the NEW summary, plus only the events AFTER the compaction point.
+    // The previous delta-math double-counted the recent tail (deriveMessages
+    // already includes it AND we added compact.recent again), which inflated
+    // the stamped contextAfter on long sessions (observed 15M+).
+    const prevLen = this.#lastCompaction()
+      ? `# Summary of the earlier conversation\n${this.#lastCompaction()!.summary}`.length
+      : 0;
+    const nextHeaderLen = compact?.summary
+      ? `# Summary of the earlier conversation\n${compact.summary}`.length
+      : 0;
+    const sum = (m: { content: string; toolCalls?: unknown[] }) =>
+      m.content.length + (m.toolCalls?.length ?? 0) * 32;
+    const systemMsg = messages[0]?.role === "system" ? messages[0] : undefined;
+    const rest = systemMsg ? messages.slice(1) : messages;
+    let chars = nextHeaderLen + rest.reduce((n, m) => n + sum(m), 0);
+    if (systemMsg && !nextHeaderLen) chars += systemMsg.content.length; // no summary: keep original system
+    else if (systemMsg) chars += Math.max(0, systemMsg.content.length - prevLen); // swap old summary for new
+    return Math.max(1, Math.round(chars / 4));
   }
 
   // Largest single summarization request we attempt (leaving room for the
