@@ -149,12 +149,35 @@ export function loadLayers(): ConfigLayer[] {
   }
   const primaryCfg = readConfig(primary);
   if (Object.keys(primaryCfg).length > 0) layers.push({ path: primary, config: primaryCfg });
-  for (const name of PROJECT_CONFIG_FILES) {
-    const projectPath = join(process.cwd(), name);
-    const project = readConfig(projectPath);
-    if (Object.keys(project).length > 0) layers.push({ path: projectPath, config: project });
+  // P#40 trust gate: project layers (aih.json / .aih/config.json) load only
+  // when this directory is trusted. Untrusted → project files are invisible
+  // to config resolution; a warning surfaces via projectTrustState().
+  if (projectTrustState() === "trusted") {
+    for (const name of PROJECT_CONFIG_FILES) {
+      const projectPath = join(process.cwd(), name);
+      const project = readConfig(projectPath);
+      if (Object.keys(project).length > 0) layers.push({ path: projectPath, config: project });
+    }
   }
   return layers;
+}
+
+/**
+ * P#40 — module-level trust state, set once at CLI startup from the
+ * resolveTrust flow. "trusted" → project config layers load normally;
+ * anything else → they are skipped (fail closed). Kept as state rather than
+ * an async check inside loadLayers because loadLayers is sync and called in
+ * many hot paths.
+ */
+let _trustState: "trusted" | "untrusted" | "unset" =
+  process.env.AIH_TRUST_ALL_PROJECTS === "1" ? "trusted" : "unset";
+
+export function setProjectTrustState(s: "trusted" | "untrusted"): void {
+  _trustState = s;
+}
+
+export function projectTrustState(): "trusted" | "untrusted" | "unset" {
+  return _trustState;
 }
 
 function merged(layers: ConfigLayer[]): AihConfig {

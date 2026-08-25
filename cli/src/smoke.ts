@@ -320,10 +320,13 @@ assert(
     `${cwDir}/aih.json`,
     JSON.stringify({ model: "m1", contextWindow: 50000, providers: { p1: { model: "p1-model", contextWindow: 55555 } } }),
   );
-  const runIn = (args: string[], env: Record<string, string> = {}) => {
-    const e = { ...process.env, ...env };
-    if (!("AIH_CONTEXT_WINDOW" in env)) delete e.AIH_CONTEXT_WINDOW;
-    return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: e, cwd: cwDir });
+  // P#40: the trust gate would hide this temp dir's aih.json (it is never in
+  // the user's trust store) — mark it trusted for the duration of the block.
+  const baseEnv: NodeJS.ProcessEnv = { ...process.env, AIH_TRUST_ALL_PROJECTS: "1" };
+  const runIn = (args: string[], envOverrides: Record<string, string> = {}) => {
+    const merged: NodeJS.ProcessEnv = { ...baseEnv, ...envOverrides };
+    if (!("AIH_CONTEXT_WINDOW" in envOverrides)) delete merged.AIH_CONTEXT_WINDOW;
+    return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: merged, cwd: cwDir });
   };
 
   let r = runIn(["config", "--provider", "p1"]);
@@ -440,6 +443,8 @@ assert(
   const catDir = ".aih-smoke-cat";
   rmSync(catDir, { recursive: true, force: true });
   mkdirSync(catDir, { recursive: true });
+  // P#40: trust gate would hide the temp dir's aih.json — trust it for this block.
+  process.env.AIH_TRUST_ALL_PROJECTS = "1";
   writeFileSync(
     `${catDir}/aih.json`,
     JSON.stringify({
@@ -457,8 +462,9 @@ assert(
     }),
   );
   const runIn = (args: string[]) => {
-    // strip ambient AIH_MODEL / AIH_BASE_URL so aih.json providers decide
-    const e = { ...process.env };
+    // strip ambient AIH_MODEL / AIH_BASE_URL so aih.json providers decide;
+    // P#40: temp dir is never in the trust store → mark trusted for this block
+    const e: NodeJS.ProcessEnv = { ...process.env, AIH_TRUST_ALL_PROJECTS: "1" };
     delete e.AIH_MODEL;
     delete e.AIH_BASE_URL;
     return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", cwd: catDir, env: e });
@@ -526,6 +532,7 @@ assert(
   assert(objListed.stdout.includes("gamma-1m"), "`aih models` lists object-form models[] entries");
 
   rmSync(catDir, { recursive: true, force: true });
+  delete process.env.AIH_TRUST_ALL_PROJECTS;
 }
 
 
@@ -615,7 +622,8 @@ assert(
   // stays free to serve the in-process HTTP registry while the CLI fetches it.
   const { execFile } = await import("node:child_process");
   const runIn = (args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> => {
-    const e = { ...process.env };
+    // P#40: registry URL lives in the project aih.json — trust the temp dir
+    const e: NodeJS.ProcessEnv = { ...process.env, AIH_TRUST_ALL_PROJECTS: "1" };
     delete e.AIH_SKILL_REGISTRY;
     return new Promise((resolve) => {
       execFile(
@@ -2218,7 +2226,7 @@ await srv.connect(new StdioServerTransport());
 
 {
   // E#18: named agent profiles (--as <name>) — config load + rules + prompt
-  const { loadAgentProfile, listAgentProfiles } = await import("./config.js");
+  const { loadAgentProfile, listAgentProfiles, setProjectTrustState } = await import("./config.js");
   const { RulesetGate, DenyAll } = await import("@aih/core");
   const { mkdtempSync: mkd, writeFileSync: wfs } = await import("node:fs");
   const { tmpdir: td } = await import("node:os");
@@ -2226,6 +2234,8 @@ await srv.connect(new StdioServerTransport());
   const profDir = mkd(jj(td(), "aih-profiles-"));
   const prevCwd = process.cwd();
   try {
+    // P#40: the temp dir's aih.json carries agents — trust it for this block
+    process.env.AIH_TRUST_ALL_PROJECTS = "1";
     wfs(
       jj(profDir, "aih.json"),
       JSON.stringify({
@@ -2239,6 +2249,9 @@ await srv.connect(new StdioServerTransport());
       }),
     );
     process.chdir(profDir);
+    // P#40: in-process trust state was resolved at startup (before chdir) —
+    // mark this temp dir trusted so its aih.json layers are visible.
+    setProjectTrustState("trusted");
     const names = listAgentProfiles();
     assert(names.includes("readonly") && names.includes("permissive"), "listAgentProfiles finds configured profiles");
     const ro = loadAgentProfile("readonly");
@@ -2255,6 +2268,7 @@ await srv.connect(new StdioServerTransport());
     assert(gate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === undefined, "unmatched tool falls through to base gate");
   } finally {
     process.chdir(prevCwd);
+    delete process.env.AIH_TRUST_ALL_PROJECTS;
     rmSync(profDir, { recursive: true, force: true });
   }
 }

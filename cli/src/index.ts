@@ -60,9 +60,13 @@ import {
   saveSkillRegistry,
   type ModelCatalogEntry,
 } from "./config.js";
+import { projectTrustState, setProjectTrustState } from "./config.js";
 import {
-  aggregateUsage,
-  fmtCost,
+  ensureProjectTrust,
+  hasProjectAssets,
+} from "./project-trust.js";
+import {
+  aggregateUsage,  fmtCost,
   fmtTps,
   lastContextTokens,
   resolvePrice,
@@ -548,8 +552,15 @@ export function agentProfilePrompt(flags: Record<string, string | boolean>): str
   return profile?.prompt ? `\n\n[agent profile: ${asName}] ${profile.prompt}` : "";
 }
 
-export function registerSkillTool(registry: ToolRegistry): Skill[] {
-  const skills = discoverSkills();
+export function registerSkillTool(
+  registry: ToolRegistry,
+  opts?: { projectTrusted?: boolean },
+): Skill[] {
+  // P#40 trust gate: project-scope skills load only for trusted directories.
+  // User + builtin skills are unaffected (they are not repo-controlled).
+  const skills = discoverSkills().filter(
+    (s) => s.scope !== "project" || opts?.projectTrusted !== false,
+  );
   if (!skills.length) return skills;
   registry.register({
     name: "load_skill",
@@ -884,7 +895,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     const gate = makeSessionGate(flags);
     const registry = new ToolRegistry(gate);
     for (const def of await backend.listTools()) registry.register(def);
-    const skills = registerSkillTool(registry);
+    const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
     if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
     attachAudit(registry, flags);
 
@@ -1088,7 +1099,7 @@ async function cmdWorkflow(
       const gate = makeSessionGate(flags);
       const registry = new ToolRegistry(gate);
       for (const def2 of await backend.listTools()) registry.register(def2);
-      const skills = registerSkillTool(registry);
+      const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
       if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
       attachAudit(registry, flags);
       const log = loadSession(sessionPath);
@@ -1172,7 +1183,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       if (agentMode === "build" || def.kind !== "write") registry.register(def);
     }
     registry.planMode(agentMode === "plan");
-    skills = registerSkillTool(registry);
+    skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
     if (!bool(flags, "no-dev")) {
       registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan");
     }
@@ -3312,6 +3323,32 @@ function cmdScript(name: string) {
 
 async function main() {
   const { command, positionals, flags } = parseArgs(process.argv.slice(2));
+
+  // P#40 — project trust gate: resolve trust for the working directory BEFORE
+  // anything reads config/skills. One-shot flags win; TTY chat prompts once
+  // (persisted per directory in the USER-level trust file); non-interactive
+  // commands fail closed to untrusted unless AIH_TRUST_ALL_PROJECTS=1.
+  {
+    const interactive = process.stdin.isTTY === true && !bool(flags, "yes");
+    const flag = bool(flags, "trust") ? ("trust" as const) : bool(flags, "no-trust") ? ("no-trust" as const) : undefined;
+    const outcome = await ensureProjectTrust({
+      interactive,
+      flag,
+      defaultPolicy: process.env.AIH_TRUST_ALL_PROJECTS === "1" ? "allow" : "deny",
+    });
+    setProjectTrustState(outcome === "granted" || outcome === "already-granted" ? "trusted" : "untrusted");
+    if (
+      (outcome === "denied" || outcome === "already-denied") &&
+      hasProjectAssets(process.cwd()) &&
+      !bool(flags, "help") && !bool(flags, "version")
+    ) {
+      console.error(
+        `note: project AIH configuration in ${process.cwd()} is NOT trusted — ` +
+          `project aih.json/.aih assets are ignored this run ` +
+          `(use --trust to allow once, or answer the prompt in an interactive session)`,
+      );
+    }
+  }
 
   if (bool(flags, "version", "v")) {
     console.log(VERSION);
