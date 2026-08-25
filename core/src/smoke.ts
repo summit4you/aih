@@ -1160,6 +1160,25 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
     mk({ type: "turn/end", turnId: "t1", stopReason: "end_turn" }),
   ]);
   assert(cleanRep.parked === false && !cleanRep.openTurn, "fully closed session scans clean");
+
+  // P#37: session tree — linear default + explicit branch points.
+  const tlog = new SessionLog();
+  const e0 = tlog.append({ type: "user/message", turnId: "tA", text: "trunk start" });
+  const e1 = tlog.append({ type: "assistant/message", turnId: "tA", text: "reply", toolCalls: [] });
+  const nodes = tlog.tree();
+  assert(nodes.length === 2 && nodes[0].parentId === null, "tree: root has no parent");
+  assert(nodes[1].parentId === e0.seq, "tree: implicit parent is the previous event");
+  // Explicit branch: an event declaring parentId pointing back into history.
+  const br = tlog.append({
+    type: "user/message",
+    turnId: "tB",
+    text: "branch start",
+    ...( { parentId: e0.seq } as object ),
+  } as Parameters<SessionLog["append"]>[0]);
+  assert(tlog.branchPoints().includes(br.seq), "explicit parentId marks a branch point");
+  const tnodes = tlog.tree();
+  const brNode = tnodes.find((n) => n.seq === br.seq);
+  assert(!!brNode && brNode.parentId === e0.seq, "tree preserves the explicit parent link");
   assert(describeFact(facts.find((f) => f.callId === "c4")!).includes("UNKNOWN"), "describeFact flags the indeterminate fact for display");
 
   // Real AgentLoop run emits dispatch facts between call and result.

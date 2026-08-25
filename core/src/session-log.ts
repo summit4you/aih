@@ -21,7 +21,10 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
   : never;
 
-export type SessionEventInput = DistributiveOmit<SessionEvent, "seq" | "ts">;
+export type SessionEventInput = DistributiveOmit<
+  SessionEvent & Partial<import("./types.js").SessionTreeNode>,
+  "seq" | "ts"
+>;
 
 export class SessionLog {
   #events: SessionEvent[] = [];
@@ -58,6 +61,37 @@ export class SessionLog {
   subscribe(listener: SessionListener): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  /**
+   * P#37 — tree view of the session: nodes with their parent seq (explicit
+   * or the implicit previous event). Roots are events whose parent differs
+   * from the linear default.
+   */
+  tree(): { seq: number; type: SessionEvent["type"]; parentId: number | null; summary: string }[] {
+    const out: { seq: number; type: SessionEvent["type"]; parentId: number | null; summary: string }[] = [];
+    this.#events.forEach((e, i) => {
+      const explicit = (e as { parentId?: number }).parentId;
+      out.push({
+        seq: e.seq,
+        type: e.type,
+        parentId: typeof explicit === "number" ? explicit : i > 0 ? this.#events[i - 1].seq : null,
+        summary:
+          e.type === "user/message"
+            ? (e as { text?: string }).text?.slice(0, 60) ?? ""
+            : e.type === "checkpoint"
+              ? (e as { note?: string }).note ?? ""
+              : "",
+      });
+    });
+    return out;
+  }
+
+  /** Branch points: events that were explicitly forked/branched from. */
+  branchPoints(): number[] {
+    return this.#events
+      .filter((e) => typeof (e as { parentId?: number }).parentId === "number")
+      .map((e) => e.seq);
   }
 
   fork(fromSeq = 0): SessionLog {

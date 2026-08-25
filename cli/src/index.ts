@@ -1496,6 +1496,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/checkpoint",
       "/restore",
       "/fork",
+      "/tree",
       "/dream",
       "/distill",
       "/tidy",
@@ -2056,6 +2057,27 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     // D#10: /fork — branch the current (or latest) session into a new session file
     // from an event boundary. The source file is left untouched (append-only).
+    // P#37 — /tree: render the session as a tree (branch points from
+    // explicit parentId links; linear sessions show a single trunk).
+    if (input === "/tree" || input.startsWith("/tree ")) {
+      const nodes = log.tree();
+      const branchSeqs = new Set(log.branchPoints());
+      const lines: string[] = ["session tree:"];
+      for (const n of nodes) {
+        const isBranchRoot = branchSeqs.has(n.seq);
+        const indent = isBranchRoot ? "├─ " : "│  ";
+        const label =
+          n.type === "checkpoint"
+            ? `#${n.seq} checkpoint${n.summary ? ` — ${n.summary}` : ""}`
+            : n.type === "user/message"
+              ? `#${n.seq} user: ${n.summary}`
+              : `#${n.seq} ${n.type}`;
+        lines.push(`${indent}${label}`);
+      }
+      if (branchSeqs.size === 0) lines.push("(linear session — no branches; /fork to create one)");
+      tui.pushSystem(lines.join("\n"));
+      return;
+    }
     if (input === "/fork" || input.startsWith("/fork ")) {
       if (busy) {
         tui.pushSystem("finish the current turn before forking");
@@ -2392,7 +2414,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /tree /skills /inject /events /clear /exit`,
       );
       return;
     }

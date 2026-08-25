@@ -1,5 +1,16 @@
 export type PermissionAction = "allow" | "ask" | "deny";
 
+/**
+ * P#37 — session tree: every event may declare its parent event seq. The
+ * default (undefined) means "child of the previous event", so existing
+ * session files are already linear chains and need no migration. A fork or
+ * restore sets parentId explicitly to the source event, creating a branch.
+ */
+export interface SessionTreeNode {
+  parentId?: number;
+}
+
+
 export type ToolKind = "read" | "write";
 
 /**
