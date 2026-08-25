@@ -1303,7 +1303,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // Seed the context-usage counter from the restored session's last completed
   // turn so `-c`/`--session` resume shows the real context immediately instead
   // of 0 (opencode/mimo derive this from the restored history on resume).
-  let usedTokens = lastContextTokens(log.all());
+  const seedCtx = lastContextTokens(log.all());
+  let usedTokens = seedCtx.tokens;
   let peakTokens = usedTokens;
 
   const sessionName = sessionPath
@@ -1375,9 +1376,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       modelLabel = re.model.value ?? modelId;
       providerLabel = re.provider ?? "custom";
       // Context size belongs to the conversation, not the model: re-seed from
-      // the log (same as `-c` resume) instead of zeroing the panel. Only the
-      // window (limit) changes with the model.
-      usedTokens = lastContextTokens(log.all());
+      // the log (same as `-c` resume) instead of zeroing the panel.
+      usedTokens = lastContextTokens(log.all()).tokens;
       loop = makeLoop();
     } catch (err) {
       // A failed switch (e.g. target provider has no API key) must not kill

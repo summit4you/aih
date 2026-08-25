@@ -147,20 +147,24 @@ export function aggregateUsage(events: readonly SessionEvent[]): TokenUsage {
  * predates the summary and would flash the stale pre-compaction size.
  * 0 when no completed turn recorded prompt tokens (e.g. a mock-only session).
  */
-export function lastContextTokens(events: readonly SessionEvent[]): number {
+export function lastContextTokens(
+  events: readonly SessionEvent[],
+): { tokens: number; source: "usage" | "estimate" | "none" } {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === "compaction") {
-      // Newest turn-boundary is a compaction: prefer its stamp; fall back to
-      // 0 only when the event predates stamping (old session file).
-      return e.contextAfter ?? 0;
+      // Newest turn-boundary is a compaction: its stamp is a chars/4
+      // ESTIMATE, never provider truth. opencode parity: display values come
+      // from real usage where available; estimates are labeled as such.
+      const est = e.contextAfter ?? 0;
+      return { tokens: est, source: est > 0 ? "estimate" : "none" };
     }
     if (e.type === "turn/end") {
       const p = e.usage?.promptTokens;
-      if (typeof p === "number" && p > 0) return p;
+      if (typeof p === "number" && p > 0) return { tokens: p, source: "usage" };
     }
   }
-  return 0;
+  return { tokens: 0, source: "none" };
 }
 
 /** Cumulative cost (USD) across the whole event log at a given price. */

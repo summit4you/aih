@@ -131,22 +131,15 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
       summary: "earlier work summarized",
       ...(contextAfter !== undefined ? { contextAfter } : {}),
     }) as SessionEvent;
-  // compaction newest → stamp wins.
-  assert(
-    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000)]) === 12_000,
-    "lastContextTokens prefers the compaction stamp when it is the newest boundary",
-  );
+  // compaction newest → stamp wins (labeled as estimate).
+  const est = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000)]);
+  assert(est.tokens === 12_000 && est.source === "estimate", "compaction stamp wins and is labeled estimate");
   // newer real turn → usage wins again.
-  assert(
-    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000), mk(2, 3, 15_000, 5)]) === 15_000,
-    "lastContextTokens returns to real usage once a newer turn/end exists",
-  );
-  // legacy compaction event without the stamp (old session file) → 0, not the
-  // stale pre-compaction value.
-  assert(
-    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2)]) === 0,
-    "lastContextTokens falls back to 0 for unstamped legacy compaction events",
-  );
+  const real = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000), mk(2, 3, 15_000, 5)]);
+  assert(real.tokens === 15_000 && real.source === "usage", "newer turn/end returns to provider-truth usage");
+  // legacy compaction event without the stamp (old session file) → none, not
+  // the stale pre-compaction value.
+  assert(lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2)]).source === "none", "unstamped legacy compaction → none");
 
   assert(tokensPerSecond([]) === 0, "TPS is 0 with no events");
   assert(fmtCost(12.5) === "$12.50", "fmtCost formats >=0.01 to 2 decimals");
