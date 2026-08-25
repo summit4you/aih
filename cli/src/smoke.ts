@@ -2583,4 +2583,39 @@ await srv.connect(new StdioServerTransport());
   assert(tui.searchTools("   ").n === 0, "/find: blank query → no matches");
 }
 
+// --- P#46 phase 1: eval experiment framework --------------------------------
+{
+  const { expandCells, judgeOutput, runAttempt } = await import("./eval.js");
+  const tasks = [
+    { id: "t1", prompt: "say OK", expect: [] },
+    { id: "t2", prompt: "echo hi then deploy", expect: [] },
+  ];
+  const models = [{ model: "mock" }];
+  const cells = expandCells(tasks, models, 2);
+  assert(cells.length === 4, "expandCells: 2 tasks x 1 model x 2 reps = 4 cells");
+  assert(
+    cells[0].repetition === 1 && cells[1].repetition === 2,
+    "cells are ordered task → model → repetition",
+  );
+
+  assert(judgeOutput("all OK done", ["OK"]) === true, "judgeOutput passes when expectation present");
+  assert(judgeOutput("nothing here", ["OK"]) === false, "judgeOutput fails on missing expectation");
+  assert(judgeOutput("nonempty", []) === true, "judgeOutput with no expectations needs non-empty output");
+
+  // One real attempt against the mock LLM in an isolated workdir.
+  const { mkdtempSync } = await import("node:fs");
+  const outDir = mkdtempSync("/tmp/aih-eval-");
+  const cliRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const res = runAttempt(await import("node:path").then((m) => m.join(cliRoot, "cli")), {
+    cwd: process.cwd(),
+    outDir,
+    task: tasks[0],
+    model: "mock",
+    repetition: 1,
+    timeoutMs: 60_000,
+  });
+  assert(res.cellId === "t1__mock__r1", "attempt cellId is task__model__rep");
+  assert(res.status === "passed", `mock attempt passes (got ${res.status}: ${res.failureReason ?? ""})`);
+}
+
 console.log("\nAIH cli smoke test passed.");
