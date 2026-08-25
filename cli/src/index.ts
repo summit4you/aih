@@ -1837,6 +1837,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
 
     tui.push({ role: "user", text: line });
 
+    // P#35 — steering: while a turn is running, plain text input is queued
+    // into the running loop (lands after the current tool batch) instead of
+    // being rejected; slash commands that need a quiet session still refuse.
+    if (busy && !input.startsWith("/")) {
+      loop.steer(input);
+      tui.pushSystem("↳ steering — will land before the next step of the running turn");
+      return;
+    }
+
     if (input === "/exit" || input === "/quit") {
       tui.stop();
       backend.close();
@@ -2389,6 +2398,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     try {
       const started = Date.now();
       const result = await evalTurn(input);
+      // P#35: drain any follow-ups queued during the turn and run them as
+      // fresh turns (steering messages already landed mid-turn).
+      for (;;) {
+        const queued = loop.drainQueued("followUp");
+        if (queued.length === 0) break;
+        for (const q of queued) {
+          tui.pushSystem(`→ follow-up: ${q}`);
+          await evalTurn(q);
+          saveSession(sessionPath, log);
+        }
+      }
       saveSession(sessionPath, log);
       const usage = result.usage;
       if (result.contextNow != null) {

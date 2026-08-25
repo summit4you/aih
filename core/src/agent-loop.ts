@@ -128,6 +128,10 @@ export class AgentLoop {
   #readConcurrency: number;
   #onPromptInput?: (messages: ChatMessage[]) => void;
   #inbox: string[] = [];
+  /** P#35 — user steering messages queued mid-turn; drained before the next LLM call. */
+  #steering: string[] = [];
+  /** P#35 — follow-up messages queued for the NEXT natural turn boundary. */
+  #followUp: string[] = [];
   #activeAbort: AbortController | null = null;
 
   constructor(options: AgentLoopOptions) {
@@ -154,6 +158,31 @@ export class AgentLoop {
 
   inject(context: string): void {
     this.#inbox.push(context);
+  }
+
+  /**
+   * P#35 — steer the running agent: queue a user instruction that lands
+   * after the CURRENT tool batch, before the next LLM call. Unlike abort,
+   * the turn continues with the new guidance in context.
+   */
+  steer(text: string): void {
+    this.#steering.push(text);
+  }
+
+  /** P#35 — queue a message for the next natural turn (not mid-turn). */
+  followUp(text: string): void {
+    this.#followUp.push(text);
+  }
+
+  hasQueued(): boolean {
+    return this.#steering.length > 0 || this.#followUp.length > 0;
+  }
+
+  /** Drain queued messages. mode "steering": both queues; else follow-up only. */
+  drainQueued(mode: "steering" | "followUp" = "steering"): string[] {
+    const out = this.#followUp.splice(0);
+    if (mode === "steering") out.unshift(...this.#steering.splice(0));
+    return out;
   }
 
   cancel(): void {
@@ -419,6 +448,15 @@ export class AgentLoop {
             turnId,
             text: `[injected context] ${item}`,
           });
+        }
+      }
+
+      // P#35 — steering: user messages queued mid-turn land right here, after
+      // the current tool batch and before the next LLM call, so the agent can
+      // change course without aborting the turn.
+      if (this.#steering.length > 0) {
+        for (const item of this.#steering.splice(0)) {
+          this.#log.append({ type: "user/message", turnId, text: item });
         }
       }
 
