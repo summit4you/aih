@@ -15,9 +15,26 @@ allow/ask/deny 三级权限、append-only 会话审计、可插拔技能层与�
 
 ---
 
-## Quick Start
+## Installation
+
+**macOS / Linux / WSL** — one-line install (requires [Node.js](https://nodejs.org/) ≥ 20):
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash
+```
+
+**Windows PowerShell**:
+
+```powershell
+irm https://raw.githubusercontent.com/summit4you/aih/main/scripts/install.ps1 | iex
+```
+
+**Options**: `--version <ver>` (指定版本)、`--dir <path>` (自定义目录)、`--no-modify-path`
+
+**From source** (开发者):
+
+```sh
+git clone https://github.com/summit4you/aih && cd aih
 npm run bootstrap   # 安装依赖
 npm run doctor      # 就绪检查
 npm run check       # 构建 + 契约一致性校验
@@ -693,7 +710,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ 审计 + **脱敏/计时 + 技能驱动 `secretPatterns`**（D#11） |
 | 工具输出搜索 / 全量落盘 | — | ◐ | ◐ | — | ✅ `/find` + `run_cmd keep_output`（T#22） |
 | 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
-| curl\|bash 一键安装 | — | ◐ | ✅ | — | ✅ |
+| curl\|bash 一键安装 | ✅ | ◐ | ✅ | — | ✅ |
 | CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
 | serve/attach 多前端 | ✅ Web | ✅ | ✅ | — | ✅ **HTTP/SSE** `serve`+`attach`（P2#8） |
 | XDG 数据目录规范 | ✅ | ◐ | ◐ | — | ✅ `AIH_HOME`>XDG>默认 + `~/.aih` 兼容（P2#9） |

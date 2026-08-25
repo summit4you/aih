@@ -9,6 +9,15 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **One-line installer**: `scripts/install` (bash, macOS/Linux/WSL) and
+  `scripts/install.ps1` (PowerShell, Windows) — curl|bash / irm|iex installers
+  that download from GitHub Releases, detect platform, check Node.js ≥ 20,
+  extract to `~/.local/share/aih` (XDG), symlink to `~/.local/bin`, and auto-
+  configure PATH. Supports `--binary` (local tarball), `--version`, `--dir`,
+  `--no-modify-path`. Idempotent (skips if already at same version).
+- **Package script rewrite**: `scripts/package` now produces a self-contained
+  tarball with an ESM launcher (`aih`) + bundled `node_modules/` — no
+  `npm install` needed at install time. Release flow: `gh release create`.
 - **Deterministic workflows** (F#33 / P1#6): `.aih/workflows/<name>.mjs` modules
   exporting `phases`; `aih workflow list` / `aih workflow run <name>
   [--format json]`. Phases run sequentially; each phase is one agent call

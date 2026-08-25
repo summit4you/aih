@@ -4,10 +4,6 @@ dist/
 dist-release/
 *.tsbuildinfo
 
-# 打包/安装脚本（本地生成，不入库）
-install
-scripts/package
-
 # 本地运行/会话数据（provider 端点、密钥、窗口配置不入库）
 .aih/
 start.sh

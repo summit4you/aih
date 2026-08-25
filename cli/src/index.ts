@@ -3335,6 +3335,8 @@ function isDirectRun(): boolean {
   }
 }
 
+export { main };
+
 if (isDirectRun()) {
   main().catch((err) => {
     const cause =

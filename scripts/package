@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Build a distributable tarball for GitHub Releases.
+#
+# Output: dist-release/aih-<version>-node.tar.gz
+#   Contents:
+#     aih              ← launcher (executable shell script)
+#     lib/core/        ← @aih/core dist + package.json
+#     lib/cli/         ← @aih/cli  dist + package.json
+#     lib/mcp-server/  ← @aih/mcp-server dist + package.json
+#     node_modules/    ← production deps only
+#
+# Usage:
+#   bash scripts/package               # default output dir
+#   OUT_DIR=release bash scripts/package
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+VERSION=$(grep -oE 'const VERSION = "[^"]+"' cli/src/index.ts | head -1 | sed 's/.*"\(.*\)"/\1/')
+[ -n "$VERSION" ] || VERSION=$(node -p "require('./package.json').version")
+OUT_DIR=${OUT_DIR:-dist-release}
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "==> building"
+npm run build >/dev/null
+
+echo "==> staging lib/ (workspaces dist + manifests)"
+mkdir -p "$STAGE/lib"
+for ws in core cli mcp-server; do
+  mkdir -p "$STAGE/lib/$ws"
+  cp -r "$ws/dist" "$STAGE/lib/$ws/dist"
+  cp "$ws/package.json" "$STAGE/lib/$ws/package.json"
+done
+
+echo "==> resolving runtime deps (prod only)"
+S17=$(node -p "require('./cli/package.json').dependencies['@modelcontextprotocol/sdk']")
+ZOD=$(node -p "require('./mcp-server/package.json').dependencies['zod']")
+SW=$(node -p "require('./cli/package.json').dependencies['string-width']")
+cat > "$STAGE/package.json" <<EOF
+{
+  "name": "aih",
+  "version": "$VERSION",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "$S17",
+    "string-width": "$SW",
+    "zod": "$ZOD"
+  }
+}
+EOF
+(cd "$STAGE" && npm install --omit=dev --no-audit --no-fund >/dev/null)
+
+mkdir -p "$STAGE/node_modules/@aih"
+for ws in core cli mcp-server; do
+  ln -s "../../lib/$ws" "$STAGE/node_modules/@aih/$ws"
+done
+
+echo "==> writing launcher"
+cat > "$STAGE/aih" <<'LAUNCHER'
+#!/usr/bin/env node
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// Point require at our bundled node_modules so deps resolve.
+const require = createRequire(join(__dirname, "node_modules/", "@aih/cli/package.json"));
+const { main } = await import(join(__dirname, "lib/cli/dist/index.js"));
+main().catch((err) => {
+  console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});
+LAUNCHER
+chmod +x "$STAGE/aih"
+
+echo "==> sanity: launcher resolves from the staged tree"
+(cd "$STAGE" && node aih --version >/dev/null)
+
+mkdir -p "$OUT_DIR"
+TARBALL="$OUT_DIR/aih-$VERSION-node.tar.gz"
+tar -czf "$TARBALL" -C "$STAGE" .
+echo "==> packaged $TARBALL ($(du -h "$TARBALL" | cut -f1))"
+echo ""
+echo "  Release steps:"
+echo "    1. Create a GitHub release:  gh release create v$VERSION $TARBALL"
+echo "    2. Users install with:"
+echo "       curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash"
+echo "       powershell -ep Bypass -c \"irm https://raw.githubusercontent.com/summit4you/aih/main/scripts/install.ps1 | iex\""

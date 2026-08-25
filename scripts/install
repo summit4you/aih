@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# AIH one-line installer — macOS / Linux / WSL
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash
+#   curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary aih-0.2.0-node.tar.gz
+#   curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --dir /opt/aih
+#
+# Options:
+#   --binary <path>   Install from a local tarball (skip download)
+#   --dir <path>      Custom install directory (default: ~/.local/share/aih)
+#   --no-modify-path  Don't add ~/.local/bin to PATH
+#   --version <ver>   Install a specific version (default: latest)
+#   --help            Show this help
+
+set -euo pipefail
+
+# ── defaults ──────────────────────────────────────────────────────────
+APP="aih"
+GITHUB_REPO="summit4you/aih"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
+GITHUB_DL="https://github.com/${GITHUB_REPO}/releases/download"
+MIN_NODE_MAJOR=20
+
+INSTALL_DIR="${INSTALL_DIR:-}"
+BINARY=""
+VERSION=""
+MODIFY_PATH=true
+
+# ── colors ────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+info()  { printf "${CYAN}==> %s${RESET}\n" "$*"; }
+ok()    { printf "${GREEN}==> %s${RESET}\n" "$*"; }
+warn()  { printf "${YELLOW}==> %s${RESET}\n" "$*"; }
+err()   { printf "${RED}==> %s${RESET}\n" "$*" >&2; exit 1; }
+
+# ── parse args ────────────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --binary)        BINARY="$2"; shift 2 ;;
+    --dir)           INSTALL_DIR="$2"; shift 2 ;;
+    --version)       VERSION="$2"; shift 2 ;;
+    --no-modify-path) MODIFY_PATH=false; shift ;;
+    --help|-h)
+      sed -n '2,/^$/{ s/^# \?//; p }' "$0"
+      exit 0
+      ;;
+    *) err "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+# ── platform detection ────────────────────────────────────────────────
+detect_platform() {
+  local os arch
+
+  case "$(uname -s)" in
+    Linux*)   os="linux" ;;
+    Darwin*)  os="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*)  os="windows" ;;
+    *) err "unsupported OS: $(uname -s)" ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64)   arch="x64" ;;
+    aarch64|arm64)  arch="arm64" ;;
+    *) err "unsupported architecture: $(uname -m)" ;;
+  esac
+
+  # macOS Rosetta detection
+  if [ "$os" = "darwin" ] && [ "$arch" = "x64" ]; then
+    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+      arch="arm64"
+      info "Rosetta detected — installing arm64 binary"
+    fi
+  fi
+
+  PLATFORM="${os}-${arch}"
+}
+
+# ── node check ────────────────────────────────────────────────────────
+check_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    err "Node.js >= ${MIN_NODE_MAJOR} is required but not found.\n       Install from https://nodejs.org/ or use nvm:\n         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash\n         nvm install ${MIN_NODE_MAJOR}"
+  fi
+  local major
+  major=$(node -p 'process.versions.node.split(".")[0]')
+  if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then
+    err "Node.js >= ${MIN_NODE_MAJOR} required, found $(node -v).\n       Upgrade: nvm install ${MIN_NODE_MAJOR}"
+  fi
+  ok "node $(node -v)"
+}
+
+# ── version resolution ────────────────────────────────────────────────
+resolve_version() {
+  if [ -n "$VERSION" ]; then
+    VERSION="${VERSION#v}"
+    return
+  fi
+  info "resolving latest version from GitHub..."
+  if command -v curl >/dev/null 2>&1; then
+    VERSION=$(curl -fsSL "${GITHUB_API}/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -1 | sed 's/.*"v\?\([^"]*\)".*/\1/')
+  elif command -v wget >/dev/null 2>&1; then
+    VERSION=$(wget -qO- "${GITHUB_API}/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -1 | sed 's/.*"v\?\([^"]*\)".*/\1/')
+  else
+    err "curl or wget is required for installation"
+  fi
+  [ -n "$VERSION" ] || err "could not determine latest version"
+  ok "latest version: v${VERSION}"
+}
+
+# ── download ──────────────────────────────────────────────────────────
+download_tarball() {
+  local url="${GITHUB_DL}/v${VERSION}/aih-${VERSION}-node.tar.gz"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  TARBALL="${tmpdir}/aih-${VERSION}-node.tar.gz"
+  STAGE_DIR="${tmpdir}/extract"
+
+  info "downloading ${url}..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fSL --progress-bar -o "$TARBALL" "$url" \
+      || err "download failed — check https://github.com/${GITHUB_REPO}/releases/tag/v${VERSION}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --show-progress -O "$TARBALL" "$url" \
+      || err "download failed — check https://github.com/${GITHUB_REPO}/releases/tag/v${VERSION}"
+  fi
+  ok "downloaded $(du -h "$TARBALL" | cut -f1)"
+}
+
+# ── install from local binary ─────────────────────────────────────────
+install_from_binary() {
+  local binary="$1"
+  [ -f "$binary" ] || err "binary not found: $binary"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  STAGE_DIR="${tmpdir}/extract"
+  mkdir -p "$STAGE_DIR"
+  tar -xzf "$binary" -C "$STAGE_DIR"
+  # extract version from tarball filename if not already set
+  if [ -z "$VERSION" ]; then
+    VERSION=$(basename "$binary" | sed -n 's/^aih-\([0-9][0-9.]*\).*/\1/p')
+  fi
+  ok "extracted $(du -sh "$STAGE_DIR" | cut -f1)"
+}
+
+# ── install ───────────────────────────────────────────────────────────
+do_install() {
+  local target="${INSTALL_DIR:-${HOME}/.local/share/aih}"
+  local bin_dir="${HOME}/.local/bin"
+
+  # already installed at this version?
+  if [ -x "${target}/aih" ]; then
+    local existing
+    existing=$("${target}/aih" --version 2>/dev/null || true)
+    if [ "$existing" = "$VERSION" ]; then
+      ok "aih v${VERSION} is already installed at ${target}"
+      return 0
+    fi
+  fi
+
+  info "installing to ${target}..."
+  mkdir -p "$target"
+  # copy extracted contents
+  cp -a "${STAGE_DIR}/." "$target/"
+  chmod +x "${target}/aih" 2>/dev/null || true
+
+  # create bin symlink
+  mkdir -p "$bin_dir"
+  ln -sfn "${target}/aih" "${bin_dir}/aih"
+  ok "symlinked ${bin_dir}/aih → ${target}/aih"
+
+  # PATH check
+  if $MODIFY_PATH; then
+    if echo "$PATH" | tr ':' '\n' | grep -Fxq "$bin_dir"; then
+      ok "\$PATH already includes ${bin_dir}"
+    else
+      local shell_name
+      shell_name=$(basename "${SHELL:-/bin/sh}")
+      local rc=""
+      case "$shell_name" in
+        zsh)  rc="${HOME}/.zshrc" ;;
+        bash) rc="${HOME}/.bashrc"; [ -f "${HOME}/.bash_profile" ] && rc="${HOME}/.bash_profile" ;;
+        fish) rc="${HOME}/.config/fish/config.fish" ;;
+        *)    rc="${HOME}/.profile" ;;
+      esac
+      if [ "$shell_name" = "fish" ]; then
+        echo "set -gx PATH \"${bin_dir}\" \$PATH" >> "$rc"
+      else
+        echo '' >> "$rc"
+        echo "# AIH — added by install script" >> "$rc"
+        echo "export PATH=\"${bin_dir}:\$PATH\"" >> "$rc"
+      fi
+      warn "added ${bin_dir} to ${rc}"
+      warn "restart your shell or run: export PATH=\"${bin_dir}:\$PATH\""
+    fi
+  fi
+}
+
+# ── verify ────────────────────────────────────────────────────────────
+verify() {
+  local target="${INSTALL_DIR:-${HOME}/.local/share/aih}"
+  if [ -x "${target}/aih" ]; then
+    local v
+    v=$("${target}/aih" --version 2>/dev/null || true)
+    echo ""
+    ok "${BOLD}aih v${v} installed successfully!${RESET}"
+    echo ""
+    echo "  Binary:  ${target}/aih"
+    echo "  Docs:    https://github.com/${GITHUB_REPO}"
+    echo ""
+    echo "  Quick start:"
+    echo "    aih --help          # show commands"
+    echo "    aih config          # show configuration"
+    echo "    aih skills list     # list installed skills"
+    echo ""
+    if ! echo "$PATH" | tr ':' '\n' | grep -Fxq "${HOME}/.local/bin"; then
+      warn "Make sure ~/.local/bin is in your PATH:"
+      echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+      echo ""
+    fi
+  else
+    err "installation verification failed — ${target}/aih not executable"
+  fi
+}
+
+# ── main ──────────────────────────────────────────────────────────────
+main() {
+  echo ""
+  echo "${BOLD}AIH Installer${RESET} — universal agent harness"
+  echo ""
+
+  detect_platform
+  info "platform: ${PLATFORM}"
+  check_node
+
+  if [ -n "$BINARY" ]; then
+    install_from_binary "$BINARY"
+  else
+    resolve_version
+    download_tarball
+  fi
+
+  do_install
+  verify
+}
+
+main "$@"
