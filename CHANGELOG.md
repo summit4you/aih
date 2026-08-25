@@ -9,6 +9,16 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **Per-model context window (F#34)**: `providers.<name>.models[]` entries now accept
+  the object form `{ "model": "<id>", "contextWindow": <n> }` (mixable with plain
+  model-id strings). The model-level value overrides the provider-level
+  `contextWindow` for that model only, so one provider can serve models with very
+  different windows (e.g. 1M vs 190k) and the TUI context panel, `/model` picker
+  and `aih config` all report the right number. Resolution order:
+  `--context-window` > `AIH_CONTEXT_WINDOW` > live llama.cpp `/slots` probe >
+  `models[<id>].contextWindow` > `providers.<name>.contextWindow` > global > 128k.
+  `aih.json` for the bundled opencode provider now declares each model's real
+  window (x-preview-f-free / nemotron-3-ultra-free = 1M).
 - **One-line installer**: `scripts/install` (bash, macOS/Linux/WSL) and
   `scripts/install.ps1` (PowerShell, Windows) — curl|bash / irm|iex installers
   that download from GitHub Releases, detect platform, check Node.js ≥ 20,

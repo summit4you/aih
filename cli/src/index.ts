@@ -48,6 +48,7 @@ import {
   loadPermissionRules,
   loadAgentProfile,
   listAgentProfiles,
+  normalizeModelEntries,
   providerEntry,
   loadPrices,
   resolveLlm,
@@ -173,7 +174,8 @@ Options:
       --provider <name>       pick provider from aih.json providers
       --context-window <n>    model context window in tokens
                               (env AIH_CONTEXT_WINDOW > live /slots detection [llama.cpp] >
-                              aih.json providers.<name>.contextWindow / contextWindow)
+                              aih.json models[<id>].contextWindow >
+                              providers.<name>.contextWindow / contextWindow)
   -s, --server "<command>"    MCP server launch command; defaults to the
                               bundled todo-app server. For multiple servers set
                               \"mcpServers\" in aih.json (tools merged, duplicates
@@ -218,7 +220,8 @@ Environment:
   AIH_MODEL, AIH_BASE_URL, AIH_API_KEY, AIH_RETRIES, NO_COLOR
   AIH_HOME (explicit user data dir) / XDG_DATA_HOME (default ~/.local/share/aih)
   AIH_CONTEXT_WINDOW (default 131072; live /slots detection [llama.cpp] beats aih.json
-    providers.<name>.contextWindow; explicit flag/env always wins),
+    models[<id>].contextWindow > providers.<name>.contextWindow > global;
+    explicit flag/env always wins),
   AIH_COMPACT_AT (0.8), AIH_GOAL_ROUNDS (3)
   AIH_MEMORY_BUDGET (4000 chars of .aih/memory.md injected per turn)
   AIH_CMD_TIMEOUT_MS (120000 default run_cmd timeout)
@@ -346,8 +349,9 @@ function isLocalEndpoint(baseUrl: string | undefined): boolean {
 /**
  * Resolve the model's context window for a command:
  * `--context-window` > `AIH_CONTEXT_WINDOW` > live detection (llama.cpp `/slots`,
- * min per-slot n_ctx) > aih.json (`providers.<name>.contextWindow` for the active
- * provider, else global `contextWindow`) > default 128k.
+ * min per-slot n_ctx) > aih.json model-level (`providers.<name>.models[]` object
+ * entry `{ model, contextWindow }`, F#34) > provider-level
+ * (`providers.<name>.contextWindow`) > global `contextWindow` > default 128k.
  * Non-numeric / non-positive values are treated as unset.
  */
 export function resolveContextWindow(flags: Record<string, string | boolean>): number {
@@ -3104,12 +3108,12 @@ function cmdModels() {
   ]);
   const providers = (cfg.providers ?? {}) as Record<
     string,
-    { model?: string; models?: string[]; baseUrl?: string }
+    { model?: string; models?: Array<string | { model: string }>; baseUrl?: string }
   >;
   for (const [name, p] of Object.entries(providers)) {
     const ids = [
       ...(p.model !== undefined ? [p.model] : []),
-      ...(p.models ?? []).filter((m) => m !== p.model),
+      ...normalizeModelEntries(p.models).map((e) => e.id).filter((m) => m !== p.model),
     ];
     if (!ids.length) ids.push("-");
     for (const mid of ids) rows.push([name, mid, p.baseUrl ?? "-"]);

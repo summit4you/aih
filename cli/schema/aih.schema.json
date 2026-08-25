@@ -19,7 +19,24 @@
         "properties": {
           "baseUrl": { "type": "string" },
           "model": { "type": "string", "description": "Primary model for this provider." },
-          "models": { "type": "array", "items": { "type": "string" }, "description": "Extra selectable models (ctrl-p picker / `aih models`)." },
+          "models": {
+            "type": "array",
+            "description": "Extra selectable models (ctrl-p picker / `aih models`). Entries are model-id strings, or objects `{ model, contextWindow }` to declare a per-model context window (F#34).",
+            "items": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "object",
+                  "required": ["model"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": { "type": "string" },
+                    "contextWindow": { "type": "integer", "minimum": 1 }
+                  }
+                }
+              ]
+            }
+          },
           "apiKeyEnv": { "type": "string", "description": "Env var holding the API key (default AIH_<NAME>_API_KEY)." },
           "contextWindow": { "type": "integer", "minimum": 1 },
           "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra request headers (e.g. client identity)." }

@@ -282,9 +282,10 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
 
 **窗口按模型设置 + 自动检测**（优先级：`--context-window` > `AIH_CONTEXT_WINDOW` >
 **实时探测**（llama.cpp `/slots`，取各 slot `n_ctx` 最小值=单请求有效窗口）> `aih.json` 的
-`providers.<name>.contextWindow` / `contextWindow` > 默认 128k）。llama.cpp 服务端把总窗口
-按并行槽数（`parallel`）分好后，就在 `/slots` 里以每 slot 的 `n_ctx` 上报，因此"2 并行 256k"
-自动解析为 128k，无需手算；非 llama.cpp 端点或探测失败时静默回落到配置值：
+**模型级** `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`
+> 默认 128k）。llama.cpp 服务端把总窗口按并行槽数（`parallel`）分好后，就在 `/slots` 里
+以每 slot 的 `n_ctx` 上报，因此"2 并行 256k"自动解析为 128k，无需手算；非 llama.cpp 端点
+或探测失败时静默回落到配置值：
 
 ```jsonc
 // aih.json — 配置值作为探测失败时的回退（可选）
@@ -293,6 +294,23 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
     "qwen":     { "model": "qwen3-27b",  "contextWindow": 131072 },
     "deepseek": { "model": "deepseek",   "contextWindow": 65536  }
   } }
+```
+
+**按模型声明窗口（F#34）**：一个 provider 挂多个模型时，provider 级 `contextWindow`
+对所有模型一刀切。`models[]` 支持对象形式 `{ "model": "<id>", "contextWindow": <n> }`，
+只对该模型生效（字符串与对象可混用），TUI 面板 / `/model` 切换 / `aih config` 全部跟随：
+
+```jsonc
+{ "providers": {
+    "opencode": {
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "model": "big-pickle",
+      "contextWindow": 200000,                       // 主模型（provider 级）
+      "models": [
+        { "model": "x-preview-f-free", "contextWindow": 1000000 },  // 1M
+        { "model": "hy3-free",         "contextWindow": 190000 }    // 190k
+      ]
+    } } }
 ```
 
 ```sh
@@ -569,7 +587,7 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `XDG_DATA_HOME` | XDG 数据基目录（全局配置落到 `$XDG_DATA_HOME/aih`） |
 | `AIH_RETRIES` (1) | LLM 429/5xx 自动重试次数（鉴权错误不重试） |
 | `NO_COLOR` | 关闭彩色输出 |
-| `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `providers.<name>.contextWindow` / `contextWindow`） |
+| `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`） |
 | `AIH_GOAL_ROUNDS` (3) | `/goal` 与 `run --goal` 的额外续跑轮数上限 |
 | `AIH_MEMORY_BUDGET` (4000) | 每轮注入 memory.md 的字符预算 |
 | `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd 默认超时 |

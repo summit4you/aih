@@ -459,6 +459,40 @@ assert(
     "models[] extra inherits the provider baseUrl",
   );
 
+  // F#34 — per-model contextWindow: models[] accepts object form
+  // { model, contextWindow }; the model-level value overrides the provider's
+  // contextWindow for that model only (siblings keep the provider tier).
+  writeFileSync(
+    `${catDir}/aih.json`,
+    JSON.stringify({
+      defaultProvider: "gamma",
+      providers: {
+        gamma: {
+          baseUrl: "http://g.example/v1",
+          contextWindow: 131072,
+          model: "gamma-main",
+          models: ["gamma-free-1", { model: "gamma-1m", contextWindow: 1000000 }],
+        },
+      },
+    }),
+  );
+  const oneM = JSON.parse(runIn(["config", "--provider", "gamma", "--model", "gamma-1m"]).stdout);
+  assert(
+    oneM.contextWindow.effective === 1000000 &&
+      String(oneM.contextWindow.source).includes("models[gamma-1m].contextWindow"),
+    "model-level contextWindow overrides the provider tier",
+  );
+  const sibling = JSON.parse(runIn(["config", "--provider", "gamma", "--model", "gamma-free-1"]).stdout);
+  assert(
+    sibling.contextWindow.effective === 131072 &&
+      String(sibling.contextWindow.source).includes("providers.gamma.contextWindow"),
+    "sibling models[] entries keep the provider contextWindow",
+  );
+  const primary = JSON.parse(runIn(["config", "--provider", "gamma"]).stdout);
+  assert(primary.contextWindow.effective === 131072, "primary model uses the provider contextWindow");
+  const objListed = runIn(["models"]);
+  assert(objListed.stdout.includes("gamma-1m"), "`aih models` lists object-form models[] entries");
+
   rmSync(catDir, { recursive: true, force: true });
 }
 

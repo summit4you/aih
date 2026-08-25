@@ -34,13 +34,26 @@ export interface ProviderConfig {
    * Additional selectable models for this provider (beyond the primary
    * `model`). All share the provider's baseUrl/headers/apiKeyEnv; each shows
    * up as its own entry in the ctrl-p model picker / `aih models`.
+   *
+   * Entries are usually plain model-id strings; the object form
+   * `{ model, contextWindow }` (F#34) declares a per-model context window
+   * that overrides the provider-level `contextWindow` for that model only.
+   * Both forms can be mixed freely.
    */
-  models?: string[];
+  models?: Array<string | ModelEntry>;
   apiKeyEnv?: string;
   /** context window (max input tokens) for this provider's model */
   contextWindow?: number;
   /** extra request headers for this provider (e.g. client identity for rate-limit pools) */
   headers?: Record<string, string>;
+}
+
+/** F#34 — object form of one `providers.<name>.models[]` entry. */
+export interface ModelEntry {
+  /** model id served by that provider */
+  model: string;
+  /** per-model context window; overrides the provider-level value */
+  contextWindow?: number;
 }
 
 export interface McpServerConfig {
@@ -147,6 +160,51 @@ export function loadLayers(): ConfigLayer[] {
 function merged(layers: ConfigLayer[]): AihConfig {
   const out: AihConfig = {};
   for (const { config } of layers) Object.assign(out, config);
+  return out;
+}
+
+/** F#34 — per-model context window declared on the active provider's
+ *  `models[]` entry (`{ model, contextWindow }` object form). Later layers
+ *  override earlier ones; plain string entries and other providers are
+ *  ignored. */
+function modelLevelWindow(
+  layers: ConfigLayer[],
+  providerName: string | undefined,
+  modelId: string | undefined,
+): number | undefined {
+  if (!providerName || !modelId) return undefined;
+  let found: number | undefined;
+  for (const { config } of layers) {
+    const p = config.providers?.[providerName];
+    if (!p?.models) continue;
+    for (const e of normalizeModelEntries(p.models)) {
+      if (e.id === modelId && e.contextWindow !== undefined) found = e.contextWindow;
+    }
+  }
+  return found;
+}
+
+/** F#34 — normalize a provider's `models[]` into ids plus optional per-model
+ *  context windows. Accepts the legacy string form and the `{ model,
+ *  contextWindow }` object form; malformed entries are skipped silently so a
+ *  single bad line can't break catalog loading. */
+export function normalizeModelEntries(
+  models: Array<string | ModelEntry> | undefined,
+): Array<{ id: string; contextWindow?: number }> {
+  const out: Array<{ id: string; contextWindow?: number }> = [];
+  for (const m of models ?? []) {
+    if (typeof m === "string") {
+      if (m.trim()) out.push({ id: m });
+      continue;
+    }
+    if (m && typeof m === "object" && typeof (m as ModelEntry).model === "string" && (m as ModelEntry).model.trim()) {
+      const cw = (m as ModelEntry).contextWindow;
+      out.push({
+        id: ((m as ModelEntry).model),
+        ...(typeof cw === "number" && Number.isFinite(cw) && cw > 0 ? { contextWindow: cw } : {}),
+      });
+    }
+  }
   return out;
 }
 
@@ -327,18 +385,20 @@ export function loadModelCatalog(activeProvider?: string, activeModel?: string):
   const out: ModelCatalogEntry[] = [];
   for (const [name, p] of Object.entries(mergedCfg.providers ?? {})) {
     // A provider may expose several selectable models: the primary `model`
-    // plus any `models[]` extras. Each becomes its own catalog entry.
-    const modelIds = [
-      ...(p.model !== undefined ? [p.model] : []),
-      ...(p.models ?? []).filter((m) => m !== p.model),
+    // plus any `models[]` extras (string ids or F#34 `{ model, contextWindow }`
+    // objects). Each becomes its own catalog entry.
+    const extras = normalizeModelEntries(p.models).filter((e) => e.id !== p.model);
+    const entries = [
+      ...(p.model !== undefined ? [{ id: p.model, contextWindow: p.contextWindow }] : []),
+      ...extras.map((e) => ({ id: e.id, contextWindow: e.contextWindow ?? p.contextWindow })),
     ];
-    if (!modelIds.length) continue;
-    for (const mid of modelIds) {
+    if (!entries.length) continue;
+    for (const { id: mid, contextWindow } of entries) {
       out.push({
         provider: name,
         model: mid,
         ...(p.baseUrl !== undefined ? { baseUrl: p.baseUrl } : {}),
-        ...(p.contextWindow !== undefined ? { contextWindow: p.contextWindow } : {}),
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
         active:
           activeProvider === name &&
           (activeModel === undefined || mid === activeModel),
@@ -411,16 +471,23 @@ export function resolveLlm(opts: {  flagModel?: string;
 
   const headers = { ...(provider?.headers ?? {}) };
 
+  // F#34 — the active model's own models[] entry overrides the provider tier.
+  const mWindow = modelLevelWindow(layers, providerName, model.value);
   const contextWindow =
     opts.flagContextWindow !== undefined
       ? { value: opts.flagContextWindow, source: "flag --context-window" }
       : opts.envContextWindow !== undefined
         ? { value: opts.envContextWindow, source: "env AIH_CONTEXT_WINDOW" }
-        : provider?.contextWindow !== undefined
-          ? { value: String(provider.contextWindow), source: `providers.${providerName}.contextWindow` }
-          : fromLayers(layers, (c) =>
-              c.contextWindow !== undefined ? String(c.contextWindow) : undefined,
-          );
+        : mWindow !== undefined
+          ? {
+              value: String(mWindow),
+              source: `providers.${providerName}.models[${model.value}].contextWindow`,
+            }
+          : provider?.contextWindow !== undefined
+            ? { value: String(provider.contextWindow), source: `providers.${providerName}.contextWindow` }
+            : fromLayers(layers, (c) =>
+                c.contextWindow !== undefined ? String(c.contextWindow) : undefined,
+            );
 
   return { model, baseUrl, apiKeyEnv, provider: providerName, headers, contextWindow, layers };
 }
