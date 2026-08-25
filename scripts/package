@@ -61,12 +61,14 @@ echo "==> writing launcher"
 cat > "$STAGE/aih" <<'LAUNCHER'
 #!/usr/bin/env node
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Point require at our bundled node_modules so deps resolve.
 const require = createRequire(join(__dirname, "node_modules/", "@aih/cli/package.json"));
-const { main } = await import(join(__dirname, "lib/cli/dist/index.js"));
+// Windows: dynamic import() rejects drive-letter paths ("C:\..." parses as
+// protocol "c:") — convert to a file:// URL first.
+const { main } = await import(pathToFileURL(join(__dirname, "lib/cli/dist/index.js")).href);
 main().catch((err) => {
   console.error(`✗ ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
