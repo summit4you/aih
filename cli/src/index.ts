@@ -745,8 +745,21 @@ function saveSession(path: string | undefined, log: SessionLog): void {
   new SessionStore(path).save(log);
 }
 
-function replayHistory(tui: Tui, events: readonly SessionEvent[]): void {
+/** Question text from a `question` tool call's args (undefined if absent). */
+export function questionText(args: unknown): string | undefined {
+  const q = (args as { question?: unknown } | undefined)?.question;
+  return typeof q === "string" && q.trim() ? q : undefined;
+}
+
+/** The user's answer from a `question` tool result (undefined if absent). */
+export function questionAnswer(result: unknown): string | undefined {
+  const a = (result as { answer?: unknown } | undefined)?.answer;
+  return typeof a === "string" && a.trim() ? a : undefined;
+}
+
+export function replayHistory(tui: Tui, events: readonly SessionEvent[]): void {
   const userLines: string[] = [];
+  const questionCalls = new Set<string>();
   tui.beginBatch();
   try {
     for (const e of events) {
@@ -756,9 +769,21 @@ function replayHistory(tui: Tui, events: readonly SessionEvent[]): void {
       } else if (e.type === "assistant/message" && e.text) {
         tui.push({ role: "assistant", text: e.text });
       } else if (e.type === "tool/call") {
-        tui.pushTool(e.name, e.args, e.callId);
+        if (e.name === "question") {
+          // Replay the "❓ <question>" line (askQuestion isn't called on
+          // resume) and remember the callId so the result renders the answer
+          // instead of a duplicate tool item.
+          tui.pushSystem(`❓ ${questionText(e.args) ?? ""}`.trim());
+          questionCalls.add(e.callId);
+        } else {
+          tui.pushTool(e.name, e.args, e.callId);
+        }
       } else if (e.type === "tool/result") {
-        tui.resolveTool(e.callId, e.ok, e.result);
+        if (questionCalls.delete(e.callId)) {
+          tui.pushSystem(`→ ${questionAnswer(e.result) ?? "(no answer)"}`);
+        } else {
+          tui.resolveTool(e.callId, e.ok, e.result);
+        }
       } else if (e.type === "compaction") {
         tui.pushSystem("── compacted (earlier context summarized) ──");
       }
@@ -1505,11 +1530,23 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     );
   }
 
+  const questionCalls = new Set<string>();
   log.subscribe((event: SessionEvent) => {
     if (event.type === "tool/call") {
-      tui.pushTool(event.name, event.args, event.callId);
+      if (event.name === "question") {
+        // The "❓ <question>" line is pushed when the question is asked
+        // (askQuestion); a tool item would duplicate the question text.
+        // Remember the callId so the result renders the answer instead.
+        questionCalls.add(event.callId);
+      } else {
+        tui.pushTool(event.name, event.args, event.callId);
+      }
     } else if (event.type === "tool/result") {
-      tui.resolveTool(event.callId, event.ok !== false, event.result);
+      if (questionCalls.delete(event.callId)) {
+        tui.pushSystem(`→ ${questionAnswer(event.result) ?? "(no answer)"}`);
+      } else {
+        tui.resolveTool(event.callId, event.ok !== false, event.result);
+      }
      } else if (event.type === "assistant/message" && streaming === false && event.text) {
         tui.push({ role: "assistant", text: event.text });
       } else if (event.type === "compaction") {

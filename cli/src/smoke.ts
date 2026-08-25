@@ -1350,6 +1350,76 @@ await srv.connect(new StdioServerTransport());
   assert(!pairBody.includes("┃"), "wide diff cells keep the borderless style");
 }
 
+// --- question tool renders once (question + answer), not duplicated --------
+{
+  const { Tui } = await import("./tui.js");
+  const { replayHistory, questionText, questionAnswer } = await import("./index.js");
+  const Q = "你的本地 Qwen 模型是通过什么方式运行的？";
+  const A = "llama.cpp 我只需要你给出一个命令行的示例";
+
+  assert(questionText({ question: Q, options: ["x"] }) === Q, "questionText extracts the question");
+  assert(questionText({}) === undefined, "questionText is undefined when absent");
+  assert(questionAnswer({ answer: A, duration_ms: 1 }) === A, "questionAnswer extracts the answer");
+  assert(questionAnswer({}) === undefined, "questionAnswer is undefined when absent");
+  assert(questionAnswer(undefined) === undefined, "questionAnswer is undefined for undefined result");
+
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const ev = (seq: number, e: Record<string, unknown>) => ({ seq, ts: seq, ...e });
+  const events = [
+    ev(1, { type: "turn/start", turnId: "t1" }),
+    ev(2, { type: "user/message", turnId: "t1", text: "帮我配置本地模型" }),
+    ev(3, { type: "assistant/message", turnId: "t1", text: "先看下：", toolCalls: [{ id: "c1", name: "question", args: { question: Q, options: ["Ollama", "vLLM"] } }] }),
+    ev(4, { type: "tool/call", turnId: "t1", callId: "c1", name: "question", args: { question: Q, options: ["Ollama", "vLLM"] } }),
+    ev(5, { type: "tool/result", turnId: "t1", callId: "c1", ok: true, result: { answer: A, duration_ms: 41708 } }),
+    ev(6, { type: "assistant/message", turnId: "t1", text: "好的，命令这样写：", toolCalls: [] }),
+    ev(7, { type: "turn/end", turnId: "t1", stopReason: "end_turn" }),
+  ] as SessionEvent[];
+  replayHistory(tui, events);
+  const body = tui
+    .transcriptLines()
+    .map((s) => s.replace(/\x1b\[[0-9;]*m/g, ""))
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const qCount = body.filter((l) => l.includes(Q)).length;
+  assert(qCount === 1, `question appears exactly once (got ${qCount})`);
+  assert(body.some((l) => l.includes(A)), "the user's answer is shown");
+  assert(!body.some((l) => l.includes("question") && l.includes(Q)), "no 'question' tool row duplicates the question text");
+
+  // Cancelled question (ok:false, no result) still renders the question + a
+  // "(no answer)" marker, without duplicating the question.
+  const tui2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const cancelled = [
+    ev(1, { type: "turn/start", turnId: "t2" }),
+    ev(2, { type: "tool/call", turnId: "t2", callId: "c2", name: "question", args: { question: Q } }),
+    ev(3, { type: "tool/result", turnId: "t2", callId: "c2", ok: false, error: "user cancelled the question" }),
+    ev(4, { type: "turn/end", turnId: "t2", stopReason: "end_turn" }),
+  ] as SessionEvent[];
+  replayHistory(tui2, cancelled);
+  const body2 = tui2
+    .transcriptLines()
+    .map((s) => s.replace(/\x1b\[[0-9;]*m/g, ""))
+    .map((l) => l.trim())
+    .filter(Boolean);
+  assert(body2.filter((l) => l.includes(Q)).length === 1, "cancelled question appears exactly once");
+  assert(body2.some((l) => l.includes("(no answer)")), "cancelled question shows a (no answer) marker");
+}
+
 // --- Post-write auto-formatting (roadmap F#27, opencode formatters) --------
 {
   const { formatAfterWrite, detectFormatter } = await import("./formatter.js");
