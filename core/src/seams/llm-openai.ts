@@ -301,6 +301,11 @@ function mapUsage(u: any): TokenUsage {
     promptTokens: u.prompt_tokens ?? 0,
     completionTokens: u.completion_tokens ?? 0,
     totalTokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
+    // P#41: OpenAI puts the cached count in prompt_tokens_details; some
+    // gateways flatten it to cached_tokens / cache_read_input_tokens.
+    ...(Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) > 0
+      ? { cachedTokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) }
+      : {}),
   };
 }
 

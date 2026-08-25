@@ -68,6 +68,7 @@ import {
 import {
   aggregateUsage,  fmtCost,
   fmtTps,
+  cacheHitRate,
   lastContextTokens,
   resolvePrice,
   streamingTps,
@@ -1464,10 +1465,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       // F#30: cost + throughput (only when the model has a price table entry)
       const price = currentPrice();
       const usage = aggregateUsage(log.all());
+      // P#41: cache hit rate (undefined when the provider never reports it)
+      const chr = cacheHitRate(log.all());
       return {
         used: usedTokens,
         limit: resolveContextWindow(flags),
         trend,
+        ...(chr !== undefined ? { cacheRate: chr } : {}),
         ...(price && usage.totalTokens > 0
           ? { cost: totalCost(log.all(), price) }
           : {}),
@@ -2106,6 +2110,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       } else if (total > 0) {
         lines.push("cost: — (no price table entry for the active model; set `prices` in aih.json)");
       }
+      // P#41: prompt-cache hit rate (only when the provider reports cache data)
+      const chr = cacheHitRate(log.all());
+      if (chr !== undefined) lines.push(`cache hit rate: ${Math.round(chr * 100)}% of prompt tokens`);
       const tps = tokensPerSecond(log.all());
       if (tps > 0) lines.push(`throughput: ${fmtTps(tps)} (session average)`);
       const stps = streamingTps(log.all());

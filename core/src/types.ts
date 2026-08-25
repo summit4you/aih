@@ -205,6 +205,13 @@ export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /**
+   * P#41 — tokens served from the provider's prompt cache (OpenAI
+   * `prompt_tokens_details.cached_tokens`; Anthropic cache_read analog).
+   * Absent/0 when the provider doesn't report it. Drives the cache-hit-rate
+   * observation in /usage and the context panel.
+   */
+  cachedTokens?: number;
 }
 
 export interface LLMRequest {

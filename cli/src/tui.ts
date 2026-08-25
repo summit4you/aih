@@ -51,6 +51,8 @@ export interface TuiOptions {
     tps?: number;
     /** F#30: streaming TPS — completion tokens / real generation ms (0 = n/a) */
     stps?: number;
+    /** P#41: prompt-cache hit rate 0..1 (absent when unobservable) */
+    cacheRate?: number;
   };
   completions?(): string[];
   onTab?(): void;
@@ -1604,6 +1606,7 @@ constructor(opts: TuiOptions) {
     cost?: number;
     tps?: number;
     stps?: number;
+    cacheRate?: number;
   } | null {
     const u = this.#opts.ctxUsage?.();
     if (!u || !(u.limit > 0)) return null;
@@ -1694,6 +1697,9 @@ constructor(opts: TuiOptions) {
       }
       if (typeof ctx.stps === "number" && ctx.stps > 0) {
         extras.push(`stream ${ctx.stps >= 100 ? Math.round(ctx.stps) : ctx.stps.toFixed(1)} tok/s`);
+      }
+      if (typeof ctx.cacheRate === "number") {
+        extras.push(`CH ${Math.round(ctx.cacheRate * 100)}%`);
       }
       if (extras.length) lines.push(muted(extras.join(" · ")));
       if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));

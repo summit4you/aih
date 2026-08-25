@@ -185,11 +185,30 @@ export function streamingTps(events: readonly SessionEvent[]): number {
   return completion / (genMs / 1000);
 }
 
-/** Human cost string: "$0.0042" for small, "$1.23" for larger. */
-export function fmtCost(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "$0.00";
-  if (n < 0.01) return `$${n.toFixed(4)}`;
-  return `$${n.toFixed(2)}`;
+
+/**
+ * P#41 — prompt-cache hit rate over the session: cached prompt tokens /
+ * total prompt tokens across turns that reported a cache figure. 0 when the
+ * provider never reports cachedTokens (rate is unobservable, not zero-hit).
+ */
+export function cacheHitRate(events: readonly SessionEvent[]): number | undefined {
+  let cached = 0;
+  let prompt = 0;
+  for (const e of events) {
+    if (e.type !== "turn/end") continue;
+    const c = e.usage?.cachedTokens;
+    if (typeof c !== "number" || c <= 0) continue;
+    cached += c;
+    prompt += e.usage?.promptTokens ?? 0;
+  }
+  if (prompt <= 0) return undefined;
+  return Math.min(1, cached / prompt);
+}
+
+/** Human cache-rate string: "CH 87%" or "" when unobservable. */
+export function fmtCacheRate(rate: number, observedTurns: number): string {
+  if (observedTurns === 0) return "";
+  return `CH ${Math.round(rate * 100)}%`;
 }
 
 /** Human TPS string, e.g. "128 tok/s". */
@@ -197,4 +216,11 @@ export function fmtTps(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "";
   if (n >= 100) return `${Math.round(n)} tok/s`;
   return `${n.toFixed(1)} tok/s`;
+}
+
+/** Human cost string: "$0.0042" for small, "$1.23" for larger. */
+export function fmtCost(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "$0.00";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
 }

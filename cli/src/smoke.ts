@@ -8,6 +8,7 @@ import {
   fmtCost,
   fmtTps,
   lastContextTokens,
+  cacheHitRate,
   DEFAULT_PRICES,
 } from "./cost.js";
 import type { SessionEvent } from "@aih/core";
@@ -89,6 +90,33 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   const tps = tokensPerSecond(events);
   assert(Math.abs(tps - 1_000_000) < 1e-6, `tokensPerSecond = 1e6 tok/s (got ${tps})`);
   assert(tokensPerSecond([mk(0, 1, 100, 100)]) === 0, "TPS is 0 with a single turn");
+
+  // P#41: cache hit rate — only turns reporting cachedTokens count.
+  const mkCached = (seq: number, ts: number, prompt: number, cached: number): SessionEvent =>
+    ({
+      seq,
+      ts,
+      type: "turn/end",
+      turnId: `c${seq}`,
+      stopReason: "end_turn",
+      usage: { promptTokens: prompt, completionTokens: 0, totalTokens: prompt, ...(cached > 0 ? { cachedTokens: cached } : {}) },
+    }) as SessionEvent;
+  // 8000 cached of 10000 prompt = 80%
+  assert(
+    cacheHitRate([mkCached(0, 1, 10_000, 8_000)]) === 0.8,
+    "cacheHitRate = cached/prompt when the provider reports it",
+  );
+  // turns without cache data are excluded, not treated as zero-hit
+  const mixed = [mkCached(0, 1, 10_000, 8_000), mk(1, 2, 20_000, 0)];
+  // mixed: one reporting turn + one non-reporting turn → rate from the
+  // reporting turn only (unobservable turns are excluded, not zero-hit).
+  assert(
+    cacheHitRate([mkCached(0, 1, 10_000, 8_000), mk(1, 2, 20_000, 0)]) === 0.8,
+    "cacheHitRate excludes turns without cache figures instead of diluting",
+  );
+  assert(cacheHitRate([mk(0, 1, 20_000, 5)]) === undefined, "no reported cache → undefined");
+  assert(cacheHitRate([]) === undefined, "empty session → no rate");
+
 
   // lastContextTokens: compaction-aware seeding. When the newest turn-boundary
   // is a compaction event (no LLM turn ran since), the stamped post-compaction
