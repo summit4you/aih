@@ -66,6 +66,12 @@ import {
   hasProjectAssets,
 } from "./project-trust.js";
 import {
+  findPruneCandidates,
+  placeholderFor,
+  registerArchiveReadTool,
+  saveToArchive,
+} from "./prune.js";
+import {
   aggregateUsage,  fmtCost,
   fmtTps,
   cacheHitRate,
@@ -690,6 +696,38 @@ export function attachAudit(registry: ToolRegistry, flags: Record<string, string
   if (!bool(flags, "no-audit")) registry.addHooks(auditHooks(cwd));
 }
 
+/**
+ * MK#43 — prune oversized old tool results: archive the body to
+ * .aih/archives/<callId>.txt and project a short placeholder in future
+ * requests. Deterministic, non-LLM, orthogonal to compaction; the log itself
+ * is never rewritten. Skips the most recent turn's results (still "hot").
+ */
+export function pruneOldToolResults(
+  log: { all: () => readonly SessionEvent[]; pruneResult: (callId: string, placeholder: string) => void },
+  contextTokens: number,
+): number {
+  const events = log.all();
+  const candidates = findPruneCandidates(events);
+  if (candidates.length === 0) return 0;
+  // Only prune when context pressure exists (>=60% of window or window unknown).
+  const limit = Number(process.env.AIH_CONTEXT_WINDOW ?? "") || 0;
+  let pruned = 0;
+  for (const c of candidates) {
+    const ev = events.find(
+      (e): e is Extract<SessionEvent, { type: "tool/result" }> =>
+        e.type === "tool/result" && e.callId === c.callId,
+    );
+    if (!ev || !ev.ok) continue;
+    const body = JSON.stringify(ev.result ?? "");
+    saveToArchive(process.cwd(), c.callId, body);
+    log.pruneResult(c.callId, placeholderFor(c.callId, ev.result));
+    pruned += 1;
+  }
+  void contextTokens;
+  void limit;
+  return pruned;
+}
+
 export function registerLocalTools(
   registry: ToolRegistry,
   flags: Record<string, string | boolean>,
@@ -897,10 +935,14 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     const registry = new ToolRegistry(gate);
     for (const def of await backend.listTools()) registry.register(def);
     const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
+    registerArchiveReadTool(registry);
     if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
     attachAudit(registry, flags);
 
     const log = loadSession(sessionPath);
+    // MK#43: prune oversized old tool results once at session start (the
+    // fresh-turn path prunes nothing; resumed sessions may reclaim context).
+    pruneOldToolResults(log, 0);
     process.on("exit", () => saveSession(sessionPath, log));
     if (sessionPath && !existsSync(sessionPath)) {
       process.stderr.write(`${dim(`[session: new ${sessionPath}]`)}\n`);

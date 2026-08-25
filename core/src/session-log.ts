@@ -12,6 +12,8 @@ export type SessionEventInput = DistributiveOmit<SessionEvent, "seq" | "ts">;
 export class SessionLog {
   #events: SessionEvent[] = [];
   #listeners = new Set<SessionListener>();
+  /** MK#43 — callId → placeholder body for pruned tool results. */
+  #pruned = new Map<string, string>();
 
   append(event: SessionEventInput): SessionEvent {
     const full = Object.freeze({
@@ -103,6 +105,19 @@ export class SessionLog {
     this.#events = other.all().map((e) => ({ ...e }));
   }
 
+  /**
+   * MK#43 — replace the model-visible body of a tool result with a short
+   * placeholder (the full text stays in this log). Projection-only: events
+   * are immutable; deriveMessages consults these overrides.
+   */
+  pruneResult(callId: string, placeholder: string): void {
+    this.#pruned.set(callId, placeholder);
+  }
+
+  prunedResult(callId: string): string | undefined {
+    return this.#pruned.get(callId);
+  }
+
   deriveMessages(systemPrompt?: string): ChatMessage[] {
     let compact: Extract<SessionEvent, { type: "compaction" }> | undefined;
     for (const event of this.#events) {
@@ -140,11 +155,16 @@ export class SessionLog {
             call.type === "tool/call" &&
             (!compact || call.seq >= compact.seq)
           ) {
+            // MK#43: pruned results project the placeholder instead of the
+            // full body (the original stays in the log).
+            const prunedBody = this.#pruned.get(event.callId);
             messages.push({
               role: "tool",
               toolCallId: event.callId,
               name: call.name,
-              content: JSON.stringify(event.ok ? event.result : { error: event.error }),
+              content:
+                prunedBody ??
+                JSON.stringify(event.ok ? event.result : { error: event.error }),
             });
           }
           break;
