@@ -1305,7 +1305,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       });
       modelLabel = re.model.value ?? modelId;
       providerLabel = re.provider ?? "custom";
-      usedTokens = 0;
+      // Context size belongs to the conversation, not the model: re-seed from
+      // the log (same as `-c` resume) instead of zeroing the panel. Only the
+      // window (limit) changes with the model.
+      usedTokens = lastContextTokens(log.all());
       loop = makeLoop();
     } catch (err) {
       // A failed switch (e.g. target provider has no API key) must not kill
