@@ -107,16 +107,25 @@ export function aggregateUsage(events: readonly SessionEvent[]): TokenUsage {
 }
 
 /**
- * Context size (prompt tokens) at the LAST completed turn in the log. Used to
- * seed the context-usage counter when resuming a saved session (`-c`), so the
- * panel reflects history immediately instead of starting at 0 — matching
- * opencode/mimo, which derive the shown number from the restored message list
- * on resume rather than an independent zero-initialized counter. 0 when no
- * completed turn recorded prompt tokens (e.g. a mock-only session).
+ * Context size (prompt tokens) at the LAST turn boundary in the log. Used to
+ * seed the context-usage counter when resuming a saved session (`-c`) or after
+ * a model switch, so the panel reflects history immediately instead of 0 —
+ * matching opencode/mimo, which derive the shown number from the restored
+ * message list on resume rather than an independent zero-initialized counter.
+ *
+ * Compaction-aware: if the newest boundary is a compaction event (no LLM turn
+ * ran since), use its stamped post-compaction estimate — the last turn/end
+ * predates the summary and would flash the stale pre-compaction size.
+ * 0 when no completed turn recorded prompt tokens (e.g. a mock-only session).
  */
 export function lastContextTokens(events: readonly SessionEvent[]): number {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
+    if (e.type === "compaction") {
+      // Newest turn-boundary is a compaction: prefer its stamp; fall back to
+      // 0 only when the event predates stamping (old session file).
+      return e.contextAfter ?? 0;
+    }
     if (e.type === "turn/end") {
       const p = e.usage?.promptTokens;
       if (typeof p === "number" && p > 0) return p;

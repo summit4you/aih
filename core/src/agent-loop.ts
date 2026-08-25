@@ -445,6 +445,33 @@ export class AgentLoop {
     return this.#estimateTokens(this.#log.deriveMessages(this.#systemPrompt));
   }
 
+  // Latest compaction event in the log (for post-compaction size estimation).
+  #lastCompaction(): Extract<SessionEvent, { type: "compaction" }> | undefined {
+    for (let i = this.#log.all().length - 1; i >= 0; i--) {
+      const e = this.#log.all()[i];
+      if (e.type === "compaction") return e;
+    }
+    return undefined;
+  }
+
+  // Context size if `compact` were the newest compaction event — same
+  // projection deriveMessages applies, without mutating the log.
+  #estimateContextWith(compact: { summary?: string; recent?: ChatMessage[] } | undefined): number {
+    const messages = this.#log.deriveMessages(this.#systemPrompt);
+    // Cheap approximation: replace the current leading-summary contribution
+    // with the new one. deriveMessages already folds the LAST compaction in;
+    // the delta between old and new summary is what changes.
+    const prev = this.#lastCompaction();
+    const prevSummaryLen = prev ? `# Summary of the earlier conversation\n${prev.summary}`.length : 0;
+    const nextSummaryLen = compact?.summary ? `# Summary of the earlier conversation\n${compact.summary}`.length : 0;
+    const recentExtra = (compact?.recent ?? []).reduce(
+      (n, m) => n + m.content.length + (m.toolCalls?.length ?? 0) * 32,
+      0,
+    );
+    const chars = messages.reduce((n, m) => n + m.content.length + (m.toolCalls?.length ?? 0) * 32, 0);
+    return Math.max(1, Math.round((chars - prevSummaryLen + nextSummaryLen + recentExtra * 2) / 4));
+  }
+
   // Largest single summarization request we attempt (leaving room for the
   // template + output). If the head exceeds this we split it into chunks.
   #topBudget(): number {
@@ -675,6 +702,11 @@ export class AgentLoop {
       summary: text.slice(0, 12000),
       ...(recent.length > 0 ? { recent } : {}),
       ...(opts?.trigger ? { trigger: opts.trigger } : {}),
+      // Stamp the post-compaction context size (estimate of the projected
+      // message list AFTER the append below — computed from the summary text
+      // + tail we are about to persist). UI/resume read this instead of the
+      // stale pre-compaction turn/end usage.
+      contextAfter: this.#estimateContextWith({ ...this.#lastCompaction(), summary: text.slice(0, 12000), recent: recent.length > 0 ? recent : undefined }),
     });
     return { usage, applied: true };
   }

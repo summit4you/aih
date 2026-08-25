@@ -7,6 +7,7 @@ import {
   tokensPerSecond,
   fmtCost,
   fmtTps,
+  lastContextTokens,
   DEFAULT_PRICES,
 } from "./cost.js";
 import type { SessionEvent } from "@aih/core";
@@ -88,6 +89,37 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   const tps = tokensPerSecond(events);
   assert(Math.abs(tps - 1_000_000) < 1e-6, `tokensPerSecond = 1e6 tok/s (got ${tps})`);
   assert(tokensPerSecond([mk(0, 1, 100, 100)]) === 0, "TPS is 0 with a single turn");
+
+  // lastContextTokens: compaction-aware seeding. When the newest turn-boundary
+  // is a compaction event (no LLM turn ran since), the stamped post-compaction
+  // estimate wins over the stale pre-compaction turn/end usage — otherwise a
+  // /model switch or `-c` resume flashes the pre-compaction size.
+  const mkCompact = (seq: number, ts: number, contextAfter?: number): SessionEvent =>
+    ({
+      seq,
+      ts,
+      type: "compaction",
+      turnId: `c${seq}`,
+      summary: "earlier work summarized",
+      ...(contextAfter !== undefined ? { contextAfter } : {}),
+    }) as SessionEvent;
+  // compaction newest → stamp wins.
+  assert(
+    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000)]) === 12_000,
+    "lastContextTokens prefers the compaction stamp when it is the newest boundary",
+  );
+  // newer real turn → usage wins again.
+  assert(
+    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000), mk(2, 3, 15_000, 5)]) === 15_000,
+    "lastContextTokens returns to real usage once a newer turn/end exists",
+  );
+  // legacy compaction event without the stamp (old session file) → 0, not the
+  // stale pre-compaction value.
+  assert(
+    lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2)]) === 0,
+    "lastContextTokens falls back to 0 for unstamped legacy compaction events",
+  );
+
   assert(tokensPerSecond([]) === 0, "TPS is 0 with no events");
   assert(fmtCost(12.5) === "$12.50", "fmtCost formats >=0.01 to 2 decimals");
   assert(fmtCost(0.0042) === "$0.0042", "fmtCost formats <0.01 to 4 decimals");

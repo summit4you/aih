@@ -109,6 +109,14 @@ export type SessionEvent =
       summary: string;
       recent?: ChatMessage[];
       trigger?: "auto" | "manual";
+      /**
+       * Estimated prompt-token size of the projected (post-compaction)
+       * message list, stamped when the event is written. UI/resume seeds the
+       * context counter from this when the compaction is the newest
+       * turn-boundary event — otherwise a model switch or `-c` resume flashes
+       * the stale pre-compaction size (last turn/end predates the summary).
+       */
+      contextAfter?: number;
     }
   | {
       seq: number;

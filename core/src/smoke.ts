@@ -467,6 +467,17 @@ assert(
   compactResult.contextNow != null && compactResult.contextNow < 900,
   "contextNow drops below pre-compaction prompt size after compaction",
 );
+// Compaction events carry a post-compaction context stamp so the UI/resume
+// seeding can stay honest across /model switches and `-c` resume (the
+// "compact shows no effect until next input" bug). The consumer-side test
+// (lastContextTokens preferring the stamp) lives in cli/src/smoke.ts.
+{
+  const cev = compactLog.all().find((e) => e.type === "compaction");
+  assert(
+    cev?.type === "compaction" && typeof cev.contextAfter === "number" && cev.contextAfter > 0,
+    `compaction event stamps contextAfter (${cev?.type === "compaction" ? cev.contextAfter : "missing"})`,
+  );
+}
 
 // User-query invariant (opencode/MiMo-Code parity): a compaction that folds
 // the turn's user message into the summary and stores no replay tail must not
