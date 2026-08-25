@@ -567,6 +567,29 @@ assert(
     cev?.type === "compaction" && typeof cev.contextAfter === "number" && cev.contextAfter > 0,
     `compaction event stamps contextAfter (${cev?.type === "compaction" ? cev.contextAfter : "missing"})`,
   );
+  // MK#42: the summary must carry verifiable coverage — digest over the
+  // covered prefix, verified by deriveMessages; a corrupted log fails open.
+  assert(
+    cev?.type === "compaction" && typeof cev.coverage?.digest === "string" && cev.coverage.digest.length === 32,
+    "compaction event carries a coverage digest",
+  );
+  const derivedOk = compactLog.deriveMessages("sys");
+  assert(
+    derivedOk.some((m) => m.role === "user" && m.content.includes("echo hi")),
+    "valid coverage: projection applies (tail user message visible)",
+  );
+  // Tamper with an event covered by the summary → digest mismatch → fail
+  // open to raw history (the pre-compaction messages become visible again).
+  const tampered = SessionLog.fromEvents(
+    compactLog.all().map((e) =>
+      e.type === "user/message" ? { ...e, text: (e as { text?: string }).text + " TAMPERED" } : e,
+    ),
+  );
+  const tamperedDerived = tampered.deriveMessages("sys");
+  assert(
+    tamperedDerived.some((m) => m.content.includes("TAMPERED")),
+    "coverage mismatch fails open to raw events (no false projection)",
+  );
 }
 
 // User-query invariant (opencode/MiMo-Code parity): a compaction that folds

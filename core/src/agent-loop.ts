@@ -3,7 +3,7 @@ import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT } from ".
 
 /** Max consecutive empty responses (no text + no tool call) we nudge the model to retry before ending the turn. */
 const MAX_EMPTY_RETRIES = 2;
-import { SessionLog } from "./session-log.js";
+import { coverageDigest, SessionLog } from "./session-log.js";
 import type { ToolRegistry } from "./tool-registry.js";
 import type { ChatMessage, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
 
@@ -724,10 +724,20 @@ export class AgentLoop {
         { role: "user", content: last ? last.text : COMPACT_CONTINUE_PROMPT },
       ];
     }
+    // MK#42: coverage stamp — the summary claims the ordered prefix through
+    // the log's current head. deriveMessages verifies this digest before
+    // honoring the projection.
+    const allEvents = this.#log.all();
+    const upToSeq = allEvents[allEvents.length - 1]?.seq ?? 0;
+    const coverage = {
+      upToSeq,
+      digest: coverageDigest(allEvents.filter((e) => e.seq <= upToSeq)),
+    };
     this.#log.append({
       type: "compaction",
       turnId,
       summary: text.slice(0, 12000),
+      coverage,
       ...(recent.length > 0 ? { recent } : {}),
       ...(opts?.trigger ? { trigger: opts.trigger } : {}),
       // Stamp the post-compaction context size (estimate of the projected

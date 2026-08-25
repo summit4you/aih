@@ -137,6 +137,13 @@ export type SessionEvent =
       recent?: ChatMessage[];
       trigger?: "auto" | "manual";
       /**
+       * MK#42 — coverage declaration: the summary claims to replace exactly
+       * the ordered event prefix [0..upToSeq]. deriveMessages verifies the
+       * digest against that prefix before honoring the projection; a mismatch
+       * (file edited externally, cross-session fork) fails open to raw tail.
+       */
+      coverage?: { upToSeq: number; digest: string };
+      /**
        * Estimated prompt-token size of the projected (post-compaction)
        * message list, stamped when the event is written. UI/resume seeds the
        * context counter from this when the compaction is the newest

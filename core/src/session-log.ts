@@ -1,4 +1,18 @@
 import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
+import { createHash } from "node:crypto";
+
+/**
+ * MK#42 — stable digest over an ordered event prefix. Compaction summaries
+ * carry this so consumers can verify that the projection still corresponds
+ * to the log it claims to cover (Maka HistoryCompactCheckpoint parity).
+ */
+export function coverageDigest(events: readonly SessionEvent[]): string {
+  const h = createHash("sha256");
+  for (const e of events) {
+    h.update(`${e.seq}\0${JSON.stringify(e)}\0`);
+  }
+  return h.digest("hex").slice(0, 32);
+}
 import type { ChatMessage, SessionEvent, WorktreeSummary } from "./types.js";
 
 export type SessionListener = (event: SessionEvent) => void;
@@ -121,7 +135,19 @@ export class SessionLog {
   deriveMessages(systemPrompt?: string): ChatMessage[] {
     let compact: Extract<SessionEvent, { type: "compaction" }> | undefined;
     for (const event of this.#events) {
-      if (event.type === "compaction") compact = event;
+      if (event.type === "compaction") {
+        // MK#42: verify the coverage digest before honoring the projection.
+        // A stale/foreign summary must never replace raw history silently —
+        // on mismatch we drop the projection and fail open to the full log.
+        if (
+          event.coverage &&
+          coverageDigest(this.#events.filter((e) => e.seq <= event.coverage!.upToSeq)) !==
+            event.coverage.digest
+        ) {
+          continue; // treat as if this compaction never happened
+        }
+        compact = event;
+      }
     }
     // The compaction summary folds into the LEADING system message: some
     // providers (llama.cpp's Qwen3 template) raise "System message must be at
