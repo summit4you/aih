@@ -207,6 +207,12 @@ assert(
   s1b.status === 0 && s1b.stderr.includes("[session: resumed"),
   "-c resumes the most recent session",
 );
+const s1c = aih(["run", "x", "-c", "no-such-session"]);
+assert(
+  s1c.status === 1 && s1c.stderr.includes('no saved session named "no-such-session"'),
+  "-c with an unknown session name errors instead of silently starting empty",
+);
+assert(!existsSync(".aih/sessions/no-such-session.jsonl"), "failed resume does not create a session file");
 const sessionFile = ".aih/sessions/s1.jsonl";
 assert(existsSync(sessionFile), "session file persisted");
 const sessionContent = readFileSync(sessionFile, "utf8");

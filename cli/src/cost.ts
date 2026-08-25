@@ -106,6 +106,25 @@ export function aggregateUsage(events: readonly SessionEvent[]): TokenUsage {
   return out;
 }
 
+/**
+ * Context size (prompt tokens) at the LAST completed turn in the log. Used to
+ * seed the context-usage counter when resuming a saved session (`-c`), so the
+ * panel reflects history immediately instead of starting at 0 — matching
+ * opencode/mimo, which derive the shown number from the restored message list
+ * on resume rather than an independent zero-initialized counter. 0 when no
+ * completed turn recorded prompt tokens (e.g. a mock-only session).
+ */
+export function lastContextTokens(events: readonly SessionEvent[]): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === "turn/end") {
+      const p = e.usage?.promptTokens;
+      if (typeof p === "number" && p > 0) return p;
+    }
+  }
+  return 0;
+}
+
 /** Cumulative cost (USD) across the whole event log at a given price. */
 export function totalCost(
   events: readonly SessionEvent[],

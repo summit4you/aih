@@ -599,6 +599,7 @@ constructor(opts: TuiOptions) {
 
   push(item: TuiItem): void {
     this.#items.push(item);
+    this.#panelSeq += 1;
     if (!this.#batching) {
       this.#follow();
       this.requestPaint();
@@ -611,6 +612,7 @@ constructor(opts: TuiOptions) {
       text: name,
       tool: { name, args: fmtArgs(name, args), callId, ok: undefined },
     });
+    this.#panelSeq += 1;
     if (!this.#batching) {
       this.#follow();
       this.requestPaint();
@@ -691,6 +693,7 @@ constructor(opts: TuiOptions) {
   }
 
   pushDelta(text: string): void {
+    this.#panelSeq += 1;
     const last = this.#items[this.#items.length - 1];
     if (last && last.role === "assistant") {
       last.text += text;
@@ -715,6 +718,7 @@ constructor(opts: TuiOptions) {
   #invalidateItem(item: TuiItem): void {
     this.#itemCache.delete(item);
     this.#groupCache.clear();
+    this.#panelSeq += 1;
   }
 
   pushSystem(text: string): void {
@@ -774,6 +778,7 @@ constructor(opts: TuiOptions) {
     this.#queue = [];
     this.#groupOpen.clear();
     this.#scrollTop = 0;
+    this.#panelSeq += 1;
     this.requestPaint();
   }
 
@@ -1637,9 +1642,21 @@ constructor(opts: TuiOptions) {
       .join("");
   }
 
+  // #bodyCols feeds #panelActive() -> ctxUsage()/panelTodos(), both O(session)
+  // in the host. It is called per item from #block/#groupLines/#renderBlock,
+  // so on a large resumed session it ran ~12k times per paint (~1.2s). Memoize
+  // on (cols, plain, panelSeq); panelSeq bumps whenever #items mutate.
+  #bodyColsMemo: { key: string; value: number } | null = null;
+  #panelSeq = 0;
+
   #bodyCols(): number {
+    const key = `${this.#cols}|${this.#plain}|${this.#panelSeq}`;
+    const m = this.#bodyColsMemo;
+    if (m && m.key === key) return m.value;
     const pw = this.#panelWidth();
-    return pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : this.#cols;
+    const value = pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : this.#cols;
+    this.#bodyColsMemo = { key, value };
+    return value;
   }
 
   #panelSeg(content: string | undefined, pw: number): string {

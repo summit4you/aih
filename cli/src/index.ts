@@ -60,6 +60,7 @@ import {
   aggregateUsage,
   fmtCost,
   fmtTps,
+  lastContextTokens,
   resolvePrice,
   streamingTps,
   tokensPerSecond,
@@ -718,6 +719,17 @@ function resolveSessionPath(flags: Record<string, string | boolean>): string | u
       console.error("error: --continue found no saved session (use --session <name> first)");
       process.exit(1);
     }
+    const p = join(SESSIONS_DIR, `${name}.jsonl`);
+    if (!existsSync(p)) {
+      const have = existsSync(SESSIONS_DIR)
+        ? readdirSync(SESSIONS_DIR)
+            .filter((f) => f.endsWith(".jsonl"))
+            .map((f) => f.replace(/\.jsonl$/, ""))
+            .join(", ")
+        : "(none)";
+      console.error(`error: --continue: no saved session named "${name}" (available: ${have})`);
+      process.exit(1);
+    }
   }
   return name ? join(SESSIONS_DIR, `${name}.jsonl`) : undefined;
 }
@@ -1129,7 +1141,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       : "") || "todo-app";
 
   const log = loadSession(sessionPath);
-  process.on("exit", () => saveSession(sessionPath, log));
+  process.on("exit", () => {
+    saveSession(sessionPath, log);
+  });
   const PLAN_PROMPT =
     "\n\nYou are in plan mode (read-only): write-capable tools are hidden in this " +
     "mode. Investigate with the available tools, then present a concrete step-by-step " +
@@ -1176,8 +1190,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   let goalCondition = "";
   let goalRoundsLeft = 0;
   let echoEvents = false;
-  let usedTokens = 0;
-  let peakTokens = 0;
+  // Seed the context-usage counter from the restored session's last completed
+  // turn so `-c`/`--session` resume shows the real context immediately instead
+  // of 0 (opencode/mimo derive this from the restored history on resume).
+  let usedTokens = lastContextTokens(log.all());
+  let peakTokens = usedTokens;
 
   const sessionName = sessionPath
     ? `${existsSync(sessionPath) ? "" : "new "}${basename(sessionPath)}`
