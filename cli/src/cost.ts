@@ -10,6 +10,7 @@
  * without a live LLM (the mock LLM does not report usage).
  */
 import type { SessionEvent, TokenUsage } from "@aih/core";
+import { MODEL_METADATA } from "./model-metadata.js";
 
 export interface ModelPrice {
   /** $ per 1M input (prompt) tokens */
@@ -82,7 +83,35 @@ export function resolvePrice(
     }
     return undefined;
   };
-  return look(prices ?? {}) ?? look(DEFAULT_PRICES);
+  // P#48: models.dev snapshot as the LAST fallback — user overrides and the
+  // built-in table win; the snapshot only fills gaps for models missing from
+  // both (snapshot keys are provider-scoped like "openai/gpt-4o", so match
+  // on the bare model segment).
+  const snapLook = (table: Record<string, ModelPrice>): ModelPrice | undefined => {
+    const keys = Object.keys(table).sort(
+      (a, b) => b.length - a.length || a.localeCompare(b),
+    );
+    for (const k of keys) {
+      const nk = norm(k);
+      if (m === nk || m.includes(nk)) return table[k];
+    }
+    return undefined;
+  };
+  return look(prices ?? {}) ?? look(DEFAULT_PRICES) ?? snapLook(snapshotPrices());
+}
+
+/**
+ * P#48 — flatten the generated models.dev snapshot to bare model-name keys
+ * (provider prefix stripped; first occurrence wins on collision).
+ */
+function snapshotPrices(): Record<string, ModelPrice> {
+  const out: Record<string, ModelPrice> = {};
+  for (const [k, v] of Object.entries(MODEL_METADATA)) {
+    if (!v.price) continue;
+    const bare = k.split("/").pop() ?? k;
+    if (!out[bare]) out[bare] = v.price;
+  }
+  return out;
 }
 
 /** Cost (USD) of a single usage record at a given price. */
