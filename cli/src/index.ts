@@ -1478,6 +1478,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     busy: () => busy,
     cancelTurn: () => loop.cancel(),
     onLine: handleLine,
+    onLineBusy: (line) => {
+      const t = line.trim();
+      // Slash commands need a quiet session — keep the queued fallback for them.
+      if (!t || t.startsWith("/")) return false;
+      loop.steer(t);
+      tui.pushSystem("↳ steering — lands before the next step of the running turn");
+      return true;
+    },
     onTab: () => setMode(agentMode === "build" ? "plan" : "build"),
     onPalette: () => {
       void openPalette();

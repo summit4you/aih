@@ -1210,4 +1210,58 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   assert(dLog.all().filter((e) => e.type === "tool/dispatch").length === 1, "exactly one dispatch fact per executed call");
 }
 
+// --- P#35: steering lands mid-turn (before the next LLM step) ----------------
+{
+  const slog = new SessionLog();
+  const stools = new ToolRegistry(gate);
+  stools.register(echo);
+  // Scripted: first call returns a tool_use with a SLOW tool, second happens
+  // only after the steer message was injected.
+  const seenByStep: string[] = [];
+  const slowEcho: ToolDefinition = {
+    name: "slow_echo",
+    description: "echo but takes a moment",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string", description: "text to echo" } },
+      required: ["text"],
+    },
+    execute: async () => {
+      // Steer WHILE this tool runs — the whole point of the feature.
+      loopRef.steer("CHANGE OF PLAN: stop echoing");
+      await new Promise((r) => setTimeout(r, 30));
+      return { echoed: true };
+    },
+  };
+  const sTools = new ToolRegistry(gate);
+  sTools.register(echo);
+  sTools.register(slowEcho);
+  const sLlm: MockLLM = new MockLLM([
+    { text: "", toolCalls: [toolCall("s1", "slow_echo", JSON.stringify({ text: "x" }))], stopReason: "tool_use" },
+    { text: "done", stopReason: "end_turn" },
+  ]);
+  const seenByStep2 = seenByStep;
+  const loopRef = new AgentLoop({
+    llm: sLlm,
+    tools: sTools,
+    log: slog,
+    onPromptInput: (msgs) => seenByStep2.push(msgs.map((m) => m.content).join("|")),
+  });
+  await loopRef.send("start slow echo");
+  const userTexts = slog
+    .all()
+    .filter((e): e is Extract<SessionEvent, { type: "user/message" }> => e.type === "user/message")
+    .map((e) => e.text);
+  assert(
+    userTexts.some((t) => t.includes("CHANGE OF PLAN")),
+    "steer() called during tool execution is recorded as a user message",
+  );
+  assert(
+    slog.all().some((e) => e.type === "turn/end"),
+    "steered turn still completes normally",
+  );
+}
+
 console.log("\nAIH core smoke test passed.");

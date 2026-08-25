@@ -41,6 +41,13 @@ export interface TuiOptions {
   busy(): boolean;
   cancelTurn?(): void;
   onLine(line: string): void;
+  /**
+   * P#35 — called instead of onLine when a turn is active: lets the host
+   * STEER the running turn immediately (opencode parity — user input during
+   * execution is injected before the next step, not held until it ends).
+   * Return false to fall back to the internal queue (shown as "queued").
+   */
+  onLineBusy?(line: string): boolean;
   ctxUsage?(): {
     used: number;
     limit: number;
@@ -1181,8 +1188,14 @@ constructor(opts: TuiOptions) {
         if (this.#history.length > 200) this.#history.shift();
         this.#histCursor = -1;
         if (this.#opts.busy()) {
-          this.#queue.push(line);
-          this.pushSystem(`queued: ${line}`);
+          // P#35: prefer live steering — the host injects into the running
+          // turn so the message lands before the next step, not after the
+          // whole turn. Only queue when the host declines.
+          const steered = this.#opts.onLineBusy?.(line) ?? false;
+          if (!steered) {
+            this.#queue.push(line);
+            this.pushSystem(`queued: ${line}`);
+          }
         } else {
           this.#opts.onLine(line);
         }
