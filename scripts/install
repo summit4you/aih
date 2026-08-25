@@ -133,6 +133,9 @@ download_tarball() {
       || err "download failed — check https://github.com/${GITHUB_REPO}/releases/tag/v${VERSION}"
   fi
   ok "downloaded $(du -h "$TARBALL" | cut -f1)"
+
+  mkdir -p "$STAGE_DIR"
+  tar -xzf "$TARBALL" -C "$STAGE_DIR"
 }
 
 # ── install from local binary ─────────────────────────────────────────
