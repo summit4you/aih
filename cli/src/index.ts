@@ -30,6 +30,9 @@ import {
   TASK_CONTRACT_RULES,
   buildGoalJudgePrompt,
   toolCall,
+  scanRecovery,
+  describeFact,
+  PARK_REASON,
 } from "@aih/core";
 import type {
   ApprovalGate,
@@ -1592,6 +1595,25 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     const events = log.all();
     tui.pushSystem(`resumed session ${sessionPath} (${events.length} events)`);
     replayHistory(tui, events);
+    // MK#45 — resume is not retry: scan the log for an interrupted turn and
+    // classify its tool facts honestly instead of silently continuing.
+    const rep = scanRecovery(events);
+    if (rep.openTurn) {
+      const lines = [
+        `⚠ interrupted turn detected: "${rep.openTurn}" never completed`,
+        ...rep.facts.map((f) => `  ${describeFact(f)}`),
+      ];
+      if (rep.parked) {
+        lines.push(
+          `parked (${PARK_REASON}): at least one tool was dispatched whose outcome is unknown — ` +
+            `its side effect may have happened. Review the facts above; the next message starts a FRESH turn ` +
+            `(nothing is re-run automatically).`,
+        );
+      } else {
+        lines.push("all tool calls in the open turn have recorded outcomes or provably never ran — safe to continue");
+      }
+      tui.pushSystem(lines.join("\n"));
+    }
   }
 
   function evalTurn(

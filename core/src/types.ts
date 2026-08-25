@@ -121,13 +121,6 @@ export type SessionEvent =
   | {
       seq: number;
       ts: number;
-      type: "tool/dispatch";
-      turnId: string;
-      callId: string;
-    }
-  | {
-      seq: number;
-      ts: number;
       type: "tool/result";
       turnId: string;
       callId: string;

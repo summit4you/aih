@@ -43,8 +43,12 @@ export function classifyToolFacts(events: readonly SessionEvent[]): ToolFact[] {
   const results = new Set<string>();
   for (const e of events) {
     if (e.type === "tool/call") calls.set(e.callId, { name: e.name, turnId: e.turnId });
-    else if (e.type === "tool/dispatch") dispatched.add(e.callId);
-    else if (e.type === "tool/result") results.add(e.callId);
+    else if (e.type === "tool/dispatch") {
+      dispatched.add(e.callId);
+      // A dispatch carries the name too — register it as a call anchor so a
+      // crash between dispatch and the tool/call append still classifies.
+      if (!calls.has(e.callId)) calls.set(e.callId, { name: e.name, turnId: e.turnId });
+    } else if (e.type === "tool/result") results.add(e.callId);
   }
   const out: ToolFact[] = [];
   for (const [callId, meta] of calls) {
