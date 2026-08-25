@@ -149,13 +149,18 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       body.stream_options = { include_usage: true };
     }
     const payload = JSON.stringify(body);
-    const maxAttempts = (this.#options.retries ?? 3) + 1;
+    const maxAttempts = (this.#options.retries ?? DEFAULT_RETRIES) + 1;
 
     let lastError: unknown;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (attempt > 0) {
+        // Exponential backoff with ±25% jitter, capped at 8s per gap. Zen's
+        // free tier (and Cloudflare-fronted endpoints generally) fail in
+        // bursts lasting tens of seconds ("Upstream request failed" /
+        // connection resets); opencode survives the same bursts by retrying
+        // far longer than a flat ~2s budget, so its users never see them.
         req.onRetry?.(attempt, lastError);
-        await sleep(Math.min(2000, 400 * attempt));
+        await sleep(retryBackoffMs(attempt - 1));
       }
       let res: Response;
       try {
@@ -210,7 +215,19 @@ export class OpenAICompatibleLLM implements LLMAdapter {
   }
 }
 
-const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+
+/** Default transient-failure retry budget: 7 attempts ≈ 20s of backoff. */
+export const DEFAULT_RETRIES = 6;
+
+/**
+ * Backoff before retry `attempt` (0-based): 400ms doubling to an 8s cap,
+ * with ±25% jitter so concurrent clients don't re-synchronize.
+ */
+export function retryBackoffMs(attempt: number): number {
+  const base = Math.min(8000, 400 * 2 ** Math.max(0, attempt));
+  return Math.round(base * (0.75 + Math.random() * 0.5));
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -21,7 +21,7 @@ export {
   EMPTY_RETRY_PROMPT,
   buildGoalJudgePrompt,
 } from "./prompts.js";
-export { OpenAICompatibleLLM } from "./seams/llm-openai.js";
+export { OpenAICompatibleLLM, DEFAULT_RETRIES, retryBackoffMs } from "./seams/llm-openai.js";
 export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
 export {
   AutoApprove,

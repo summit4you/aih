@@ -435,14 +435,26 @@ export function buildLlm(flags: Record<string, string | boolean>) {
   if (!resolved.model.value) {
     throw new Error("no model id. Set AIH_MODEL, --model, or model in aih.json.");
   }
-  const retries = Number(process.env.AIH_RETRIES ?? "");
+  // AIH_RETRIES unset/empty must fall through to the adapter default —
+  // Number("") is 0 and Number.isFinite(0) is true, which silently disabled
+  // ALL retries (the "fetch failed" on every provider blip).
+  const retries = parseRetryEnv(process.env.AIH_RETRIES);
   return new OpenAICompatibleLLM({
     baseUrl: resolved.baseUrl.value ?? "https://api.openai.com/v1",
     apiKey,
     model: resolved.model.value,
-    ...(Number.isFinite(retries) ? { retries } : {}),
+    ...(retries !== undefined ? { retries } : {}),
     ...(Object.keys(resolved.headers).length > 0 ? { headers: resolved.headers } : {}),
   });
+}
+
+/** Parse AIH_RETRIES; undefined (use adapter default) when unset/empty/invalid. */
+export function parseRetryEnv(v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  const t = v.trim();
+  if (!t) return undefined;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 /** Read a memory file, trimmed; "" when missing/empty. */

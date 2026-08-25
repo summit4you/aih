@@ -7,6 +7,8 @@ import {
   DenyAll,
   MockLLM,
   OpenAICompatibleLLM,
+  DEFAULT_RETRIES,
+  retryBackoffMs,
   PolicyGate,
   RulesetGate,
   SessionLog,
@@ -260,6 +262,18 @@ assert(
   "usage mapped from OpenAI-compatible response",
 );
 assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F#30)");
+
+// Transient-failure resilience (opencode-parity): exponential backoff bounds
+// and generous default budget.
+assert(DEFAULT_RETRIES >= 5, "default retry budget spans multi-second provider bursts");
+for (let a = 0; a < 8; a += 1) {
+  const cap = Math.min(8000, 400 * 2 ** a);
+  const ms = retryBackoffMs(a);
+  assert(
+    ms >= Math.floor(cap * 0.75) && ms <= Math.ceil(cap * 1.25),
+    `retryBackoffMs(${a}) within ±25% of ${cap}ms cap (got ${ms})`,
+  );
+}
 
 {
   // provider config headers (client identity) are sent with every completion call

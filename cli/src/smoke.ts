@@ -1384,6 +1384,16 @@ await srv.connect(new StdioServerTransport());
   assert(!pairBody.includes("┃"), "wide diff cells keep the borderless style");
 }
 
+// --- AIH_RETRIES parse semantics (regression: Number("") === 0 disabled all retries)
+{
+  const { parseRetryEnv } = await import("./index.js");
+  assert(parseRetryEnv(undefined) === undefined, "AIH_RETRIES unset → adapter default");
+  assert(parseRetryEnv("") === undefined, "AIH_RETRIES empty → adapter default (was: 0, killing all retries)");
+  assert(parseRetryEnv("  ") === undefined, "AIH_RETRIES blank → adapter default");
+  assert(parseRetryEnv("0") === 0 && parseRetryEnv("3") === 3, "AIH_RETRIES numeric values pass through");
+  assert(parseRetryEnv("abc") === undefined, "AIH_RETRIES non-numeric → adapter default");
+}
+
 // --- question tool renders once (question + answer), not duplicated --------
 {
   const { Tui } = await import("./tui.js");
