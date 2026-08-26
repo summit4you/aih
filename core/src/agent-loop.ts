@@ -858,11 +858,12 @@ export class AgentLoop {
     turnId: string,
   ): Promise<{ usage: TokenUsage | undefined; applied: boolean }> {
     return this.#compact(turnId).catch((err) => {
-      if (process.env.AIH_DEBUG_COMPACT) {
-        process.stderr.write(
-          `[aih] auto-compaction failed: ${err instanceof Error ? err.stack : String(err)}\n`,
-        );
-      }
+      // Auto-compaction must never be a silent no-op: a skipped compact on a
+      // bloated session snowballs into minute-long model responses. One
+      // stderr line keeps the failure diagnosable without a debug flag.
+      process.stderr.write(
+        `[aih] auto-compaction failed (continuing without it): ${err instanceof Error ? err.message : String(err)}\n`,
+      );
       return { usage: undefined, applied: false };
     });
   }
