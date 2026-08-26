@@ -386,6 +386,36 @@ const retryRes = await flaky.complete({
   tools: [],
 });
 assert(fetchCalls === 2, "retryable 500 is retried once");
+{
+  // Capacity bursts (zen: "Upstream request failed: Endpoint is unavailable")
+  // triple the retry budget — a plain 500 with the same config fails at the
+  // base budget, the capacity flavour survives well past it.
+  let capacityCalls = 0;
+  let plainCalls = 0;
+  const mk = (counter: () => number, body: string) =>
+    new OpenAICompatibleLLM({
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "k",
+      model: "m",
+      retries: 1, // base attempts = 2
+      fetchImpl: (async () => {
+        counter();
+        return new Response(body, { status: 503 });
+      }) as typeof fetch,
+    });
+  const capErr = await mk(() => capacityCalls++, "Upstream request failed: Endpoint is unavailable.").complete({
+    messages: [{ role: "user", content: "hi" }],
+    tools: [],
+  }).catch((e: Error) => e);
+  assert(capacityCalls === 6, `capacity 503 triples the attempt budget (got ${capacityCalls}, want 6)`);
+  assert(capErr instanceof Error && /HTTP 503/.test(capErr.message), "capacity exhaustion still surfaces the HTTP error");
+  const plainErr = await mk(() => plainCalls++, "Internal server error").complete({
+    messages: [{ role: "user", content: "hi" }],
+    tools: [],
+  }).catch((e: Error) => e);
+  assert(plainCalls === 2, `non-capacity 503 keeps the base budget (got ${plainCalls})`);
+  assert(plainErr instanceof Error, "plain 503 exhausts to an error");
+}
 assert(
   retryRes.text === "ok" && retryRes.usage?.totalTokens === 15,
   "usage mapped from OpenAI-compatible response",

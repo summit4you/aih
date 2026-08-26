@@ -154,7 +154,8 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     const maxAttempts = (this.#options.retries ?? DEFAULT_RETRIES) + 1;
 
     let lastError: unknown;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let attempts = maxAttempts; // grows when a capacity-classified error shows up
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (attempt > 0) {
         // Exponential backoff with ±25% jitter, capped at 8s per gap. Zen's
         // free tier (and Cloudflare-fronted endpoints generally) fail in
@@ -179,13 +180,20 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       } catch (err) {
         if (req.signal?.aborted) throw err;
         lastError = err;
-        if (attempt < maxAttempts - 1) continue;
+        if (CAPACITY_ERROR.test(err instanceof Error ? err.message : String(err))) {
+          attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
+        }
+        if (attempt < attempts - 1) continue;
         throw err;
       }
       if (!res.ok) {
         const text = await res.text();
-        const httpError = new Error(`llm request failed: HTTP ${res.status} ${text}`);
-        if (RETRYABLE.has(res.status) && attempt < maxAttempts - 1) {
+        const message = `llm request failed: HTTP ${res.status} ${text}`;
+        if (CAPACITY_ERROR.test(message)) {
+          attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
+        }
+        const httpError = new Error(message);
+        if (RETRYABLE.has(res.status) && attempt < attempts - 1) {
           lastError = httpError;
           continue;
         }
@@ -218,6 +226,16 @@ export class OpenAICompatibleLLM implements LLMAdapter {
 }
 
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+
+/**
+ * Gateway capacity failures (zen free tier's "Upstream request failed:
+ * Endpoint is unavailable" bursts last minutes). When the failure text
+ * matches this, the retry budget triples — with the 8s backoff cap that is
+ * roughly two minutes of patience instead of ~20s.
+ */
+const CAPACITY_ERROR =
+  /upstream request failed|endpoint is unavailable|no healthy upstream|service unavailable|overloaded|at capacity/i;
+const CAPACITY_ATTEMPT_FACTOR = 3;
 
 /** Default transient-failure retry budget: 7 attempts ≈ 20s of backoff. */
 export const DEFAULT_RETRIES = 6;
