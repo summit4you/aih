@@ -332,6 +332,39 @@ assert(noKey.status === 1 && noKey.stderr.includes("no API key"), "missing API k
   );
 }
 
+// Identity-header providers are keyless ONLY on their own endpoint: a URL
+// override (env/flag) that moves the request elsewhere must re-enable the
+// no-key gate — opencode fingerprint headers authenticate nothing on
+// api.openai.com.
+{
+  const dir = mkdtempSync(join(tmpdir(), "aih-keyless-"));
+  writeFileSync(
+    join(dir, "aih.json"),
+    JSON.stringify({
+      defaultProvider: "zen",
+      providers: {
+        zen: {
+          baseUrl: "https://zen.example/v1",
+          model: "big-pickle",
+          apiKeyEnv: "AIH_API_KEY",
+          headers: { "x-fingerprint": "smoke" },
+        },
+      },
+    }),
+  );
+  const env = { AIH_API_KEY: "" };
+  const atHome = aih(["run", "hi", "--trust"], env, dir);
+  assert(
+    !atHome.stderr.includes("no API key"),
+    "identity-header provider stays keyless on its own endpoint",
+  );
+  const moved = aih(["run", "hi", "--trust"], { ...env, AIH_BASE_URL: "https://api.openai.com/v1" }, dir);
+  assert(
+    moved.stderr.includes("no API key"),
+    "URL override off the provider home re-enables the no-key gate",
+  );
+}
+
 rmSync(".aih/sessions", { recursive: true, force: true });
 const s1a = aih(["run", "first prompt alpha", "--mock", "--yes", "--session", "s1"]);
 assert(

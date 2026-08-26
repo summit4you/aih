@@ -466,10 +466,26 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
     process.env[resolved.apiKeyEnv] ??
     process.env.AIH_API_KEY;
   // Keyless is legitimate for: (a) providers carrying identity headers (opencode
-  // Zen free tier authenticates by client fingerprint), and (b) self-hosted
-  // endpoints (llama.cpp/Ollama/vLLM) that run without auth. Only a public
-  // endpoint with zero credentials is rejected up front.
-  if (!apiKey && Object.keys(resolved.headers).length === 0 && !isLocalEndpoint(resolved.baseUrl.value)) {
+  // Zen free tier authenticates by client fingerprint) — but ONLY when the
+  // request actually goes to that provider's own endpoint, and (b) self-hosted
+  // endpoints (llama.cpp/Ollama/vLLM) that run without auth. An env/flag URL
+  // override that moves the request OFF the provider's home invalidates (a):
+  // opencode's fingerprint headers sent to api.openai.com authenticate nothing.
+  const providerHome = resolved.provider
+    ? (() => {
+        try {
+          return providerEntry(resolved.provider).baseUrl;
+        } catch {
+          return undefined;
+        }
+      })()
+    : undefined;
+  const sameHome =
+    providerHome !== undefined &&
+    resolved.baseUrl.value !== undefined &&
+    resolved.baseUrl.value.replace(/\/+$/, "") === providerHome.replace(/\/+$/, "");
+  const headerExempt = Object.keys(resolved.headers).length > 0 && sameHome;
+  if (!apiKey && !headerExempt && !isLocalEndpoint(resolved.baseUrl.value)) {
     throw new Error(
       `no API key for provider "${resolved.provider ?? "custom"}". Set ${resolved.apiKeyEnv} (or AIH_API_KEY), pass --api-key, or use --mock for an offline demo.`,
     );
