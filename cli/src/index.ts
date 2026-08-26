@@ -66,7 +66,7 @@ import {
   ensureProjectTrust,
   hasProjectAssets,
 } from "./project-trust.js";
-import { loadExtensions } from "./extensions.js";
+import { loadExtensions, createExtensionEventBridge } from "./extensions.js";
 import {
   findPruneCandidates,
   placeholderFor,
@@ -135,6 +135,7 @@ import {
   T_DECISIONS,
   T_DOCTOR,
   T_EVAL,
+  T_EXTENSION_EXAMPLE,
   T_GITIGNORE,
   T_SKILL_MD,
   T_HARNESS_YML,
@@ -1250,6 +1251,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   const tuiRef: { current: Tui | null } = { current: null };
   // P#39 — TUI slash commands contributed by extensions.
   const extensionCommands = new Map<string, { run(args: string): void | Promise<void> }>();
+  // P#39① — result-bearing extension events (cancel / rewrite / turn:end).
+  const extensionEvents = createExtensionEventBridge();
   function rebuildRegistry(): void {
     registry = new ToolRegistry(gate);
     for (const def of backendDefs) {
@@ -1261,11 +1264,16 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     void loadExtensions(registry, {
       enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
       commands: extensionCommands,
+      onEvent: (event, handler) => extensionEvents.on(event as "tool:before" | "tool:after" | "turn:end", handler),
     });
     if (!bool(flags, "no-dev")) {
       registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan");
     }
     attachAudit(registry, flags);
+    // Extension hooks ride LAST in the waterfall (after redaction+audit) so
+    // they see the sanitized result and their rewrite lands in the log.
+    const extHooks = extensionEvents.hookSet();
+    if (extHooks.before || extHooks.after) registry.addHooks(extHooks);
   }
   rebuildRegistry();
   const appInfo = await backend.describe().catch(() => undefined);
@@ -1274,7 +1282,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       ? String((appInfo as { name: unknown }).name)
       : "") || "todo-app";
 
-  const log = loadSession(sessionPath);
+  // One store instance for the whole chat session: its flushedSeq baseline
+  // (from load) drives per-event incremental appends between turns.
+  const store = sessionPath ? new SessionStore(sessionPath) : undefined;
+  const log = store?.load() ?? loadSession(sessionPath);
   process.on("exit", () => {
     saveSession(sessionPath, log);
   });
@@ -1672,6 +1683,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     return "";
   };
   log.subscribe((event: SessionEvent) => {
+    // Per-event durability: a long-running turn no longer lives only in
+    // memory — every event is appended to the session file as it happens.
+    if (store) {
+      try {
+        store.flushIncremental(log);
+      } catch {
+        /* disk hiccup: per-turn save + exit save still cover us */
+      }
+    }
     if (event.type === "tool/call") {
       if (event.name === "question") {
         // The "❓ <question>" line is pushed when the question is asked
@@ -1698,6 +1718,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
             " (earlier messages summarized, continuing)" +
             summaryPreview(),
         );
+      } else if (event.type === "turn/end") {
+        // P#39① — extension turn:end subscribers fire on every finished turn.
+        extensionEvents.emit("turn:end", { stopReason: event.stopReason, usage: event.usage });
       }
     });
 
@@ -1795,7 +1818,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       unmet: verdict.unmet,
       roundsLeft,
     });
-    saveSession(sessionPath, log);
+    store?.save(log);
   }
 
   async function runGoalCheck(): Promise<void> {
@@ -1840,7 +1863,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         await evalTurn(
           `${unmetNote}[goal] The goal "${goalCondition}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
         );
-        saveSession(sessionPath, log);
+        store?.save(log);
         const dur = Date.now() - started;
         tui.push({
           role: "footer",
@@ -2019,7 +2042,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         usedTokens || undefined,
         gitStatusSummary({ cwd: process.cwd() }),
       );
-      if (sessionPath) saveSession(sessionPath, log);
+      store?.save(log);
       const wtLines = cp.worktree ? formatWorktreeSummary(cp.worktree) : [];
       tui.pushSystem(
         `checkpoint #${cp.seq} recorded${note ? ` — ${note}` : ""}` +
@@ -2095,7 +2118,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       log.adopt(restored);
       tui.clearItems();
       replayHistory(tui, restored.all());
-      if (sessionPath) saveSession(sessionPath, log);
+      store?.save(log);
       usedTokens = target.contextTokens ?? 0;
       tui.pushSystem(
         `restored to checkpoint #${target.seq}${target.note ? ` — ${target.note}` : ""}\n` +
@@ -2400,7 +2423,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           return;
         }
         usedTokens = r.after;
-        if (sessionPath) saveSession(sessionPath, log);
+        store?.save(log);
         const limit = resolveContextWindow(flags);
         const pct = limit ? Math.round(Math.min(1, r.after / limit) * 100) : null;
         const drop = r.before > 0 ? Math.round(((r.before - r.after) / r.before) * 100) : 0;
@@ -2496,10 +2519,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         for (const q of queued) {
           tui.pushSystem(`→ follow-up: ${q}`);
           await evalTurn(q);
-          saveSession(sessionPath, log);
+          store?.save(log);
         }
       }
-      saveSession(sessionPath, log);
+      store?.save(log);
       const usage = result.usage;
       // Belt-and-braces vs garbage provider usage (agent-loop already gates
       // its own contextNow): only adopt wire numbers bounded by the window.
@@ -3486,6 +3509,9 @@ function cmdInit(positionals: string[], flags: Record<string, string | boolean>)
   write("tasks/TEMPLATE.md", T_TASK_TEMPLATE);
   // P1#4: app-specific skill skeleton (auto-discovered as a project skill).
   write(join(".aih", "skills", `${slug}-app`, "SKILL.md"), T_SKILL_MD);
+  // P#39③: self-extension entry point — a runnable example the agent (or the
+  // user) can adapt; the trust gate still gates loading.
+  write(join(".aih", "extensions", "example.mjs"), T_EXTENSION_EXAMPLE);
   write("scripts/bootstrap", T_BOOTSTRAP);
   write("scripts/doctor", T_DOCTOR);
   write("scripts/check", T_CHECK);

@@ -1015,6 +1015,11 @@ assert(
 );
 assert(existsSync(`${initDir}/mcp-server/src/app-adapter.ts`), "init writes mcp-server adapter");
 assert(existsSync(`${initDir}/scripts/eval`), "init writes scripts/eval");
+assert(
+  existsSync(`${initDir}/.aih/extensions/example.mjs`) &&
+    readFileSync(`${initDir}/.aih/extensions/example.mjs`, "utf8").includes("aih.registerTool"),
+  "init scaffolds the self-extension example (.aih/extensions/example.mjs)",
+);
 {
   const exe = spawnSync("test", ["-x", `${initDir}/scripts/eval`], { encoding: "utf8" });
   assert(exe.status === 0, "init scripts are executable");
@@ -1276,6 +1281,43 @@ await srv.connect(new StdioServerTransport());
     lines.length === 1 && lines[0] === "one two three",
     "pasted newlines become spaces; real Enter submits once",
   );
+}
+
+{
+  // P#35 — Alt+Up recalls the last queued message back into the editor.
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    // busy + host declines steering (slash command) → falls back to the queue
+    busy: () => true,
+    onLineBusy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  tui.feed("/compact extra args\r"); // queued while busy
+  assert(tui.queueSize() === 1, "busy input lands in the fallback queue");
+  tui.feed("\x1b[1;3A"); // Alt+Up
+  assert(tui.queueSize() === 0, "Alt+Up pulls the entry out of the queue");
+  const recalled = tui.editText();
+  assert(recalled === "/compact extra args", `recalled text is editable (${JSON.stringify(recalled)})`);
+  // Edit and resubmit after the turn ends: simulate quiet session via a second Tui.
+  tui.recallQueued(); // empty now
+  const lines2: string[] = [];
+  const tui2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines2.push(l),
+  });
+  tui2.feed("hello\r");
+  assert(lines2.length === 1 && lines2[0] === "hello", "sanity: quiet submit works");
 }
 
 {
@@ -2710,6 +2752,55 @@ await srv.connect(new StdioServerTransport());
     externalSubjectAdapter("/bin/false", [], { timeoutMs: 10_000 }),
     { outDir: join(outDir, "bad"), budget: {} });
   assert(bad.results[0]?.status === "error" || bad.totals.errors === 0, "external failure surfaces as error or empty-output fail");
+}
+
+// --- P#39①: result-bearing extension events (cancel / rewrite / turn:end) ---
+{
+  const { createExtensionEventBridge } = await import("./extensions.js");
+  const { ToolRegistry: Reg, AutoApprove } = await import("@aih/core");
+  const bridge = createExtensionEventBridge();
+  // before-handler vetoes a call; after-handler rewrites the result.
+  bridge.on("tool:before", (p) => {
+    const info = p as { name: string };
+    if (info.name === "forbidden") return { cancel: "blocked by policy extension" };
+    return undefined;
+  });
+  bridge.on("tool:after", (p) => {
+    const info = p as { name: string; result: unknown };
+    if (info.name === "echo") return { result: { ...(info.result as object), rewritten: true } };
+    return undefined;
+  });
+  let turnEnded = 0;
+  bridge.on("turn:end", () => {
+    turnEnded += 1;
+  });
+
+  const reg = new Reg(new AutoApprove());
+  const schema = { type: "object" as const, properties: {}, required: [] as string[] };
+  reg.register({
+    name: "echo",
+    description: "echo",
+    kind: "read",
+    permission: "allow",
+    parameters: schema,
+    execute: async () => ({ echoed: true }),
+  });
+  reg.register({
+    name: "forbidden",
+    description: "should never run",
+    kind: "read",
+    permission: "allow",
+    parameters: schema,
+    execute: async () => ({ ran: true }),
+  });
+  reg.addHooks(bridge.hookSet());
+
+  const vetoed = await reg.invoke("forbidden", {}, { turnId: "t", inject: () => {} });
+  assert(vetoed.ok === false && /blocked by policy extension/.test(vetoed.error ?? ""), `tool:before cancel vetoes the call (${vetoed.error})`);
+  const ok = await reg.invoke("echo", {}, { turnId: "t", inject: () => {} });
+  assert(ok.ok === true && (ok.result as { rewritten?: boolean })?.rewritten === true, `tool:after rewrites the result in place (${JSON.stringify(ok.result)})`);
+  bridge.emit("turn:end", { stopReason: "end_turn" });
+  assert(turnEnded === 1, "turn:end subscribers fire via emit");
 }
 
 console.log("\nAIH cli smoke test passed.");

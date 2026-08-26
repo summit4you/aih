@@ -295,3 +295,66 @@ jobs:
       - name: Smoke tests
         run: npm test
 `;
+
+/**
+ * P#39③ — self-extension entry point: a commented, runnable extension
+ * example scaffolded into every new project. The system prompt's skill roster
+ * plus this file give the agent (and the user) a working starting point for
+ * "let AIH write you an extension".
+ */
+export const T_EXTENSION_EXAMPLE = `// {{NAME}} extension example — loaded from .aih/extensions/*.mjs at startup.
+// Extensions run in-process with full Node capability; the project trust gate
+// gates loading. Delete or adapt freely — this file is a starting point.
+//
+// API surface:
+//   aih.registerTool({ name, description, kind?, permission?, parameters?, execute })
+//   aih.registerCommand({ name, description?, run(args) })   // TUI /name
+//   aih.on("tool:before" | "tool:after" | "turn:end", handler)
+//   aih.log("...")                                           // stderr note
+//
+// Result-bearing events (P#39①):
+//   "tool:before" handler returning { cancel: "reason" } vetoes the call.
+//   "tool:after"  handler returning { result } rewrites it in place.
+//   Handler exceptions are contained — they never break the turn.
+
+export default function (aih) {
+  aih.log("{{SLUG}} example extension loaded");
+
+  // A read-only tool the model can call (permission defaults to "ask").
+  aih.registerTool({
+    name: "project_info",
+    description: "Return basic facts about the {{NAME}} project",
+    kind: "read",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    execute: async () => ({
+      name: "{{NAME}}",
+      cwd: aih.cwd,
+      generatedAt: new Date().toISOString(),
+    }),
+  });
+
+  // A TUI slash command: type /extinfo in the chat.
+  aih.registerCommand({
+    name: "extinfo",
+    description: "show example-extension status",
+    run: () => aih.log("example extension is alive"),
+  });
+
+  // Policy example: veto any tool call named exactly "dangerous_op".
+  aih.on("tool:before", (p) => {
+    if (p && p.name === "dangerous_op") return { cancel: "denied by example policy" };
+    return undefined;
+  });
+
+  // Observation example: count finished turns.
+  let turns = 0;
+  aih.on("turn:end", () => {
+    turns += 1;
+    if (turns % 10 === 0) aih.log(\`\${turns} turns completed\`);
+  });
+}
+`;

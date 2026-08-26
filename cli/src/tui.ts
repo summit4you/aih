@@ -115,7 +115,7 @@ const SPINNER_DELAY_MS = 200;
 const HELP_LINES: string[] = [
   bold("keys"),
   "    enter send · esc clear · esc escape twice cancels the turn",
-  "    up/down recall history · tab complete · ctrl-p command palette",
+  "    up/down recall history · Alt+Up recall queued · tab complete · ctrl-p palette",
   "    ? help (empty input) · mouse scroll/click",
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
@@ -1306,9 +1306,38 @@ constructor(opts: TuiOptions) {
         this.#follow();
         this.requestPaint();
         break;
+      case "1;3A": // Alt+Up — P#35: recall the last queued/busy-line message
+      case "1;3a": // (some terminals report it lowercase)
+        this.recallQueued();
+        break;
       default:
         break;
     }
+  }
+
+  /**
+   * P#35 — Alt+Up: pull the most recent queued (or steering-declined) input
+   * back into the editor for editing and resubmission. Nothing is lost: the
+   * entry is removed from the queue and becomes editable text.
+   */
+  recallQueued(): void {
+    if (!this.#queue.length) {
+      this.pushSystem("no queued messages to recall");
+      return;
+    }
+    const line = this.#queue.pop()!;
+    this.#setEdit(line);
+    this.requestPaint();
+  }
+
+  /** Queued-message accessors (test hook + status display). */
+  queueSize(): number {
+    return this.#queue.length;
+  }
+
+  /** Current editor content (test hook). */
+  editText(): string {
+    return this.#edit;
   }
 
   #chooseHistory(): void {

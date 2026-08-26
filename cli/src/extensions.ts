@@ -18,7 +18,14 @@
  */
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { ToolDefinition, ToolKind, PermissionAction } from "@aih/core";
+import type {
+  ToolDefinition,
+  ToolKind,
+  PermissionAction,
+  ToolHookInfo,
+  ToolInvocationResult,
+  ToolHooks,
+} from "@aih/core";
 import type { ToolRegistry } from "@aih/core";
 
 export interface ExtensionContext {
@@ -123,6 +130,82 @@ export async function loadExtensions(
       for (const h of handlers) opts.onEvent(event, h);
     }
   }
-  void eventHandlers;
   return loaded;
+}
+
+export interface ExtensionEventBridge {
+  /** Register one extension handler (called by loadExtensions via opts.onEvent). */
+  on(event: "tool:before" | "tool:after" | "turn:end", handler: (payload: unknown) => unknown): void;
+  /** Fire a session-log event (turn:end etc.) to subscribed handlers. */
+  emit(event: "turn:end", payload: unknown): void;
+}
+
+/**
+ * P#39① — result-bearing extension events. The bridge collects extension
+ * handlers and exposes them through TWO seams:
+ *   - `hookSet()` rides `registry.addHooks` (the same waterfall as audit /
+ *     redaction): a "tool:before" handler may return `{ cancel: reason }` to
+ *     BLOCK the call; a "tool:after" handler may return `{ result }` to
+ *     REWRITE it in place.
+ *   - `emit("turn:end", …)` fires from the host when the session log appends
+ *     turn/end.
+ * Handler exceptions are contained — an extension must never break a turn.
+ */
+export function createExtensionEventBridge(): ExtensionEventBridge & { hookSet(): ToolHooks } {
+  const beforeHandlers: ((p: unknown) => unknown)[] = [];
+  const afterHandlers: ((p: unknown) => unknown)[] = [];
+  const turnEndHandlers: ((p: unknown) => unknown)[] = [];
+  const safeRun = (h: (p: unknown) => unknown, p: unknown, what: string): unknown => {
+    try {
+      return h(p);
+    } catch (err) {
+      process.stderr.write(
+        `[extension] ${what} handler failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      return undefined;
+    }
+  };
+  return {
+    on(event, handler) {
+      if (event === "tool:before") beforeHandlers.push(handler);
+      else if (event === "tool:after") afterHandlers.push(handler);
+      else turnEndHandlers.push(handler);
+    },
+    emit(event, payload) {
+      if (event !== "turn:end") return;
+      for (const h of turnEndHandlers) safeRun(h, payload, "turn:end");
+    },
+    hookSet(): ToolHooks {
+      return {
+        ...(beforeHandlers.length || afterHandlers.length
+          ? {
+              before: async (info: ToolHookInfo): Promise<void> => {
+                for (const h of beforeHandlers) {
+                  const r = safeRun(h, info, "tool:before");
+                  if (r && typeof r === "object" && r !== null && "cancel" in (r as Record<string, unknown>)) {
+                    // Cancel semantics ride the existing hook waterfall:
+                    // throwing vetoes the call (ToolRegistry before-hook contract).
+                    throw new Error(String((r as { cancel: unknown }).cancel ?? "cancelled by extension"));
+                  }
+                }
+              },
+            }
+          : {}),
+        ...(afterHandlers.length
+          ? {
+              after: async (info: ToolHookInfo, outcome: ToolInvocationResult) => {
+                let out = outcome;
+                for (const h of afterHandlers) {
+                  const r = safeRun(h, { ...info, result: out.result, ok: out.ok }, "tool:after");
+                  if (r && typeof r === "object" && r !== null && "result" in (r as Record<string, unknown>)) {
+                    out = { ...out, result: (r as { result: unknown }).result };
+                  }
+                }
+                return out;
+              },
+            }
+          : {}),
+      };
+    },
+  };
 }
