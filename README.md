@@ -773,11 +773,12 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 工具结果修剪 + archive_read 惰性取回 | — | ✅ prune | ◐ | — | ✅ `.aih/archives` + 占位符投影（MK#43） |
 | 崩溃恢复（T1 dispatch 事实 + park 不猜） | — | ✅ Runtime Resume | ◐ | — | ✅ tool/dispatch + scanRecovery + PARK 码（MK#44/45） |
 | 工作区身份 UUID / 覆盖校验压缩摘要 | — | ✅ | — | — | ✅ `.aih/workspace.json` + coverage digest（MK#47/#42） |
-| Steering 中途改向 / Follow-up 排队 | — | ✅ | ◐ | — | ✅ busy 输入自动 steer；follow-up 自动续跑（P#35） |
+| Extension API（代码级插件） | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on（P#39，信任门约束）+ 结果承载事件（before 否决 / after 改写 / turn:end）+ `init` 自扩展示例 |
+| Steering 中途改向 / Follow-up 排队 + Alt+Up 取回 | — | ✅ | ◐→✅ | ✅ Pi | ✅ busy 输入自动 steer；follow-up 自动续跑；Alt+Up 取回排队消息可改后重发（P#35） |
 | 缓存命中观测（CH%） | — | ◐ | ◐ | — | ✅ `/usage` 行 + 面板 CH%（P#41，需 provider 上报） |
 | 模型元数据快照同步（models.dev） | — | ✅ refresh | — | — | ✅ fail-closed 刷新脚本 + 27 模型快照（P#48） |
-| Extension API（代码级插件） | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on（P#39，信任门约束） |
-| Session 树 / 分支导航 | — | ◐ | ✅ Pi | — | ✅ parentId 链 + `/tree` 视图（P#37，旧文件零迁移） |
+| Session 树 / 分支导航 + 分支蒸馏 | — | ◐→✅ | ✅ Pi | — | ✅ parentId 链 + `/tree` 视图 + `distill-branch` branch_summary（P#37） |
+| Eval 实验框架（cells/预算/subject seam） | — | ◐ | — | ✅ Maka | ✅ runExperiment 有界并发 + 墙钟/成本预算 + CLI/外部命令/HTTP 三 subject（P#46） |
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
