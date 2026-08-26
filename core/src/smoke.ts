@@ -322,6 +322,45 @@ assert(
     "saving an empty log never truncates an existing session file",
   );
 }
+
+// Incremental durability (per-event appends between full saves): a long
+// running turn must not live only in memory.
+{
+  const p = join(mkdtempSync(join(tmpdir(), "aih-core-")), "incr.jsonl");
+  const store = new SessionStore(p);
+  const log = new SessionLog();
+  log.append({ type: "user/message", turnId: "t", text: "one" });
+  log.append({ type: "assistant/message", turnId: "t", text: "two", toolCalls: [] });
+  store.save(log); // baseline: flushed = seq 1
+  log.append({ type: "user/message", turnId: "t", text: "three" });
+  log.append({ type: "tool/call", turnId: "t", callId: "c1", name: "echo", args: { x: 1 } });
+  store.flushIncremental(log);
+  const reloaded = new SessionStore(p).load();
+  assert(reloaded !== undefined && reloaded.all().length === 4, "flushIncremental persists events past the last full save");
+  assert(reloaded!.all()[3].type === "tool/call" && reloaded!.all()[3].seq === 3, "appended events keep seq continuity");
+
+  // Baseline from load(): a fresh store on the same file appends exactly the
+  // one new event, not a duplicate history.
+  const fresh = new SessionStore(p);
+  fresh.load();
+  log.append({ type: "tool/result", turnId: "t", callId: "c1", ok: true, result: { ok: 1 } });
+  fresh.flushIncremental(log);
+  const raw2 = readFileSync(p, "utf8").split("\n").filter(Boolean);
+  assert(raw2.length === 5, `load-baselined append writes only the delta (got ${raw2.length} lines)`);
+
+  // Same-log history rewrite (/restore → adopt shortens the log): a lagging
+  // watermark converges the file to the adopted prefix on the next incremental
+  // flush — never duplicated, never left mixed.
+  log.adopt(log.fork(2)); // keep seq ≥ 2 → three events remain
+  store.flushIncremental(log);
+  const rawNow = readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).seq as number);
+  assert(
+    JSON.stringify(rawNow) === JSON.stringify([2, 3, 4]),
+    `adopted rewrite converges the file exactly (got ${JSON.stringify(rawNow)})`,
+  );
+  const afterRewrite = new SessionStore(p).load()!;
+  assert(afterRewrite.all().length === 3 && afterRewrite.all()[0].seq === 2, "republished file matches the adopted log");
+}
 rmSync(storePath, { force: true });
 
 let fetchCalls = 0;
