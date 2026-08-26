@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
 import {
@@ -218,6 +219,19 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
 
 // Version assertions read the constant from the module (never hardcode —
 // release bumps used to break the smoke suite).
+// Atomic tool-write publish: exact content, zero temp residue — the paint
+// timer reads config files on a 120ms cadence and must never see a torn file.
+{
+  const { publishFile } = await import("./atomic.js");
+  const dir = mkdtempSync(join(tmpdir(), "aih-atomic-"));
+  const target = join(dir, "cfg.json");
+  publishFile(target, '{"a":1}\n');
+  publishFile(target, "完整中文内容\n第二行");
+  assert(readFileSync(target, "utf8") === "完整中文内容\n第二行", "publishFile overwrites exactly");
+  const residue = readdirSync(dir).filter((f) => f.includes(".tmp-"));
+  assert(residue.length === 0, `no temp files left behind (${residue.join(",")})`);
+}
+
 const { VERSION } = await import("./index.js");
 const version = aih(["--version"]);
 assert(version.stdout.trim() === VERSION, "--version prints version");

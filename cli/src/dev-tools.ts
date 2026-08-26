@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { ToolRegistry } from "@aih/core";
 import { lineDiff } from "./diff.js";
+import { publishFile } from "./atomic.js";
 import { buildChildEnv } from "./env-policy.js";
 import { formatAfterWrite } from "./formatter.js";
 import { resolveSandboxBackend } from "./sandbox.js";
@@ -102,7 +103,7 @@ export function registerDevTools(
         }
       }
       mkdirSync(resolve(file, ".."), { recursive: true });
-      writeFileSync(file, content);
+      publishFile(file, content);
       // F#27: post-write auto-format (prettier/biome/eslint), never blocks.
       const fmt = await formatAfterWrite(file, cwd);
       return { path: file, bytes: Buffer.byteLength(content), new_file: previous === "", _diff: lineDiff(previous, content), ...fmt };

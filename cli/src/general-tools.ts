@@ -7,6 +7,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { publishFile } from "./atomic.js";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
@@ -188,7 +189,7 @@ export function registerGeneralTools(
       }
       const newString = String(a.new_string ?? "");
       const updated = a.replace_all ? text.split(oldString).join(newString) : text.replace(oldString, newString);
-      writeFileSync(file, updated);
+      publishFile(file, updated);
       // F#27: post-write auto-format (prettier/biome/eslint), never blocks.
       const fmt = await formatAfterWrite(file, cwd);
       return { path: file, replacements: a.replace_all ? count : 1, _diff: lineDiff(oldString, newString), ...fmt };

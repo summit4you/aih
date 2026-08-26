@@ -1556,32 +1556,42 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       ...skills.map((s) => `/${s.name}`),
     ],
     ctxUsage: () => {
-      const trend = log
-        .all()
-        .filter((e) => e.type === "turn/end")
-        .map((e) => (e.type === "turn/end" ? (e.usage?.promptTokens ?? 0) : 0))
-        .filter((n) => n > 0)
-        .slice(-8);
-      // F#30: cost + throughput (only when the model has a price table entry)
-      const price = currentPrice();
-      const usage = aggregateUsage(log.all());
-      // P#41: cache hit rate (undefined when the provider never reports it)
-      const chr = cacheHitRate(log.all());
-      return {
-        used: usedTokens,
-        limit: resolveContextWindow(flags),
-        trend,
-        ...(chr !== undefined ? { cacheRate: chr } : {}),
-        ...(price && usage.totalTokens > 0
-          ? { cost: totalCost(log.all(), price) }
-          : {}),
-        ...(usage.totalTokens > 0
-          ? { tps: tokensPerSecond(log.all()) }
-          : {}),
-        ...(usage.totalTokens > 0
-          ? { stps: streamingTps(log.all()) }
-          : {}),
-      };
+      try {
+        const trend = log
+          .all()
+          .filter((e) => e.type === "turn/end")
+          .map((e) => (e.type === "turn/end" ? (e.usage?.promptTokens ?? 0) : 0))
+          .filter((n) => n > 0)
+          .slice(-8);
+        // F#30: cost + throughput (only when the model has a price table entry)
+        const price = currentPrice();
+        const usage = aggregateUsage(log.all());
+        // P#41: cache hit rate (undefined when the provider never reports it)
+        const chr = cacheHitRate(log.all());
+        return {
+          used: usedTokens,
+          limit: resolveContextWindow(flags),
+          trend,
+          ...(chr !== undefined ? { cacheRate: chr } : {}),
+          ...(price && usage.totalTokens > 0
+            ? { cost: totalCost(log.all(), price) }
+            : {}),
+          ...(usage.totalTokens > 0
+            ? { tps: tokensPerSecond(log.all()) }
+            : {}),
+          ...(usage.totalTokens > 0
+            ? { stps: streamingTps(log.all()) }
+            : {}),
+        };
+      } catch (err) {
+        // Paint path must never throw: a transient config read failure (e.g.
+        // racing this process's own atomic-rename window) used to escape the
+        // paint timer as an uncaught exception and kill the whole TUI.
+        if (process.env.AIH_DEBUG_PANEL) {
+          process.stderr.write(`[aih] ctxUsage error: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
+        return { used: usedTokens, limit: 0, trend: [] };
+      }
     },
   });
   void echoEvents;
