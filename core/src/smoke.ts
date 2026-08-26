@@ -389,16 +389,22 @@ for (let a = 0; a < 8; a += 1) {
     },
   } as unknown as LLMAdapter;
   const oLog = new SessionLog();
-  const filler = "工具输出测试".repeat(300); // ≈1800 CJK chars → ~2000 tokens
+  oLog.append({ type: "user/message", turnId: "old", text: "older question" });
+  oLog.append({ type: "assistant/message", turnId: "old", text: "older answer", toolCalls: [] });
+  const filler = "工具输出测试".repeat(450); // ≈2700 CJK chars → ~2970 tokens (> the 600 recent budget)
   oLog.append({ type: "user/message", turnId: "t0", text: filler });
   oLog.append({ type: "assistant/message", turnId: "t0", text: "", toolCalls: [] });
   assert(estimateTokensText(filler) >= 1500, "filler is large enough to sit near the test window");
   const oLoop = new Loop({ llm: flaky500, tools: new ToolRegistry(gate), log: oLog, contextWindow: 3000 });
   const oRes = await oLoop.send("continue");
   assert(oRes.stopReason === "end_turn", "turn completes via compact-retry after opaque 500");
+  const oCompacts = oLog.all().filter((e) => e.type === "compaction") as Extract<SessionEvent, { type: "compaction" }>[];
+  assert(oCompacts.length === 1, "a compaction event was appended before the retry");
+  // Tail guarantee: the giant turn can't fit the recent budget whole, but the
+  // verbatim tail is still non-empty (trailing whole-message suffix).
   assert(
-    oLog.all().some((e) => e.type === "assistant/message" && e.text === "recovered after compaction"),
-    "the retried turn's answer is logged",
+    (oCompacts[0].recent?.length ?? 0) >= 1,
+    "recent tail survives even when no user-boundary suffix fits",
   );
   assert(
     oLog.all().some((e) => e.type === "compaction"),
@@ -685,13 +691,21 @@ const replayResult = await new AgentLoop({
 assert(replayResult.stopReason === "end_turn", "mega-turn compaction completes the turn");
 const replayCompacts = replayLog.all().filter((e) => e.type === "compaction") as Extract<SessionEvent, { type: "compaction" }>[];
 assert(replayCompacts.length === 1, "mega turn (tail over budget) still compacts");
-assert(
-  replayCompacts[0].recent?.some((m) => m.role === "user" && m.content === replayUser) === true,
-  "#compact replays the turn's user message when the tail selection is empty",
-);
+  assert(
+    replayCompacts[0].recent?.some(
+      (m) =>
+        m.role === "user" &&
+        (m.content === replayUser || replayUser.startsWith(m.content.slice(0, 100))),
+    ) === true,
+    "#compact keeps the turn's user request in the tail (verbatim or budget-truncated)",
+  );
 const replayDerived = replayLog.deriveMessages("sys");
 assert(
-  replayDerived.some((m) => m.role === "user" && m.content === replayUser),
+  replayDerived.some(
+    (m) =>
+      m.role === "user" &&
+      (m.content === replayUser || replayUser.startsWith(m.content.slice(0, 100))),
+  ),
   "post-compaction request contains the user's request again (replay tail)",
 );
 

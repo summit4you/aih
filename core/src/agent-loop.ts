@@ -630,6 +630,35 @@ export class AgentLoop {
         break;
       }
     }
+    if (split < n) return { head: messages.slice(0, split), recent: messages.slice(split) };
+    // Tail guarantee (pi-style): no turn-boundary suffix fits — the newest
+    // turn is a giant. Keep that turn anyway with its user message TRUNCATED
+    // to the budget (plus any following messages that still fit), so the
+    // post-compaction conversation always retains the live request verbatim-
+    // prefixed and never loses "what were we just doing". A user-led tail is
+    // also chat-template-safe (Qwen3 400s on conversations without a user
+    // query), and truncation keeps call↔result pairing inside whole messages.
+    const lastUser = boundaries[boundaries.length - 1];
+    if (lastUser !== undefined) {
+      const charCap = Math.max(64, Math.floor(budget / 1.2));
+      const u = messages[lastUser];
+      const truncatedUser: ChatMessage = {
+        ...u,
+        content:
+          u.content.length > charCap
+            ? `${u.content.slice(0, charCap)}\n[…truncated to fit the post-compaction budget; full text stays in the session log]`
+            : u.content,
+      };
+      const recent: ChatMessage[] = [truncatedUser];
+      let acc = this.#estimateTokens([truncatedUser]);
+      for (let j = lastUser + 1; j < n; j++) {
+        const cost = this.#estimateTokens([messages[j]]);
+        if (acc + cost > budget) break;
+        recent.push(messages[j]);
+        acc += cost;
+      }
+      return { head: messages.slice(0, lastUser), recent };
+    }
     return { head: messages.slice(0, split), recent: messages.slice(split) };
   }
 
@@ -776,7 +805,14 @@ export class AgentLoop {
   #compactOrSkip(
     turnId: string,
   ): Promise<{ usage: TokenUsage | undefined; applied: boolean }> {
-    return this.#compact(turnId).catch(() => ({ usage: undefined, applied: false }));
+    return this.#compact(turnId).catch((err) => {
+      if (process.env.AIH_DEBUG_COMPACT) {
+        process.stderr.write(
+          `[aih] auto-compaction failed: ${err instanceof Error ? err.stack : String(err)}\n`,
+        );
+      }
+      return { usage: undefined, applied: false };
+    });
   }
 
   async #compact(
