@@ -28,6 +28,40 @@ export interface GeneralToolsOptions {
 const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn", "dist", "build"]);
 const MAX_GLOB = 500;
 const MAX_GREP = 200;
+
+/**
+ * P#37② — recover the stateful-tool snapshot (todos) from a session log.
+ * State-carrying tools stamp their FULL state into `details` on every write
+ * (`{ kind: "state.todos", todos: [...] }`); the newest such result at or
+ * before `beforeSeq` IS the timeline's state at that point — so /restore and
+ * branch switches roll tool state back with the history, no sidecar files to
+ * reconcile. Returns undefined when the log carries no todo state.
+ */
+export function todoStateFromLog(
+  events: readonly { seq: number; type: string; ok?: boolean; result?: unknown }[],
+  beforeSeq = Infinity,
+): Array<{ content: string; status: string }> | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i] as { seq: number; type: string; ok?: boolean; result?: { details?: { kind?: string; todos?: unknown } } };
+    if (e.seq > beforeSeq) continue;
+    if (e.type !== "tool/result" || e.ok === false) continue;
+    const d = e.result?.details;
+    if (d && d.kind === "state.todos" && Array.isArray(d.todos)) {
+      return (d.todos as Array<{ content?: string; status?: string }>).map((t) => ({
+        content: String(t.content ?? ""),
+        status: String(t.status ?? "pending"),
+      }));
+    }
+  }
+  return undefined;
+}
+
+/** Write the recovered todo state back to .aih/todos.json (best-effort). */
+export function applyTodoState(cwd: string, todos: Array<{ content: string; status: string }>): void {
+  const p = join(cwd, ".aih", "todos.json");
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, `${JSON.stringify({ updatedAt: new Date().toISOString(), todos }, null, 2)}\n`);
+}
 const MAX_FETCH_BYTES = 1_500_000;
 const MAX_CONTENT = 64_000;
 
@@ -253,7 +287,9 @@ export function registerGeneralTools(
     name: "todo",
     description:
       "Replace the session todo list (task tracking). Pass the full list with statuses " +
-      "pending | in_progress | completed | cancelled; at most one in_progress.",
+      "pending | in_progress | completed | cancelled; at most one in_progress. " +
+      "The full list is also stamped into every tool/result (P#37② state-carrying), " +
+      "so /restore and branch switches roll the todo state back with the timeline.",
     kind: "write",
     permission: "allow",
     parameters: {
@@ -293,7 +329,16 @@ export function registerGeneralTools(
             })
             .join("\n")
         : "(empty)";
-      return { file: todosPath, count: items.length, list: rendered, todos: items };
+      return {
+        file: todosPath,
+        count: items.length,
+        list: rendered,
+        todos: items,
+        // P#37② — state-carrying result: the FULL todo snapshot rides inside
+        // the tool/result event, so a restore/fork to any earlier seq makes
+        // `todoStateFromLog(log)` return exactly this state again.
+        details: { kind: "state.todos", todos: items },
+      };
     },
   });
 

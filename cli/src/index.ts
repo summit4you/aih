@@ -78,6 +78,7 @@ import {
   fmtCost,
   fmtTps,
   cacheHitRate,
+  cacheTtlWaste,
   lastContextTokens,
   resolvePrice,
   sanePromptTokens,
@@ -124,7 +125,7 @@ import {
   type Skill,
 } from "./skills.js";
 import { registerDevTools } from "./dev-tools.js";
-import { registerGeneralTools } from "./general-tools.js";
+import { registerGeneralTools, todoStateFromLog, applyTodoState } from "./general-tools.js";
 import {
   T_AGENTS_MD,
   T_APP_MD,
@@ -2120,9 +2121,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       replayHistory(tui, restored.all());
       store?.save(log);
       usedTokens = target.contextTokens ?? 0;
+      // P#37② — stateful tools roll back WITH the timeline: recover the todo
+      // snapshot from the restored prefix and re-apply it to .aih/todos.json.
+      const rolledTodos = todoStateFromLog(log.all(), target.seq);
+      if (rolledTodos) applyTodoState(process.cwd(), rolledTodos);
       tui.pushSystem(
         `restored to checkpoint #${target.seq}${target.note ? ` — ${target.note}` : ""}\n` +
-          `context now rolls back to that point; the discarded suffix was snapshotted to ${snapshot || "(ephemeral — no session file)"} for audit`,
+          `context now rolls back to that point; the discarded suffix was snapshotted to ${snapshot || "(ephemeral — no session file)"} for audit` +
+          (rolledTodos ? `\ntodo state rolled back with the timeline (${rolledTodos.length} entr${rolledTodos.length === 1 ? "y" : "ies"})` : ""),
       );
       return;
     }
@@ -2268,6 +2274,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       // P#41: prompt-cache hit rate (only when the provider reports cache data)
       const chr = cacheHitRate(log.all());
       if (chr !== undefined) lines.push(`cache hit rate: ${Math.round(chr * 100)}% of prompt tokens`);
+      // P#41: idle-gap TTL waste attribution (heuristic over observable facts)
+      const ttlWaste = cacheTtlWaste(log.all());
+      if (ttlWaste && ttlWaste.gaps > 0) {
+        const wasteCost = price && ttlWaste.wastedTokens > 0 ? fmtCost((ttlWaste.wastedTokens / 1_000_000) * price.input) : undefined;
+        lines.push(
+          `TTL waste: ${ttlWaste.gaps} gap(s) > 5min likely evicted the prompt cache` +
+            ` (~${ttlWaste.wastedTokens.toLocaleString()} uncached tokens${wasteCost ? ` ≈ ${wasteCost}` : ""})`,
+        );
+      }
       const tps = tokensPerSecond(log.all());
       if (tps > 0) lines.push(`throughput: ${fmtTps(tps)} (session average)`);
       const stps = streamingTps(log.all());

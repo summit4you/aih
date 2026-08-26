@@ -119,6 +119,32 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   assert(cacheHitRate([mk(0, 1, 20_000, 5)]) === undefined, "no reported cache → undefined");
   assert(cacheHitRate([]) === undefined, "empty session → no rate");
 
+  // P#41: TTL waste attribution — a miss after an idle gap > TTL is attributed
+  // to cache eviction; misses within the TTL are not.
+  {
+    const { cacheTtlWaste } = await import("./cost.js");
+    const t0 = 1_000_000;
+    const fiveMin = 5 * 60_000;
+    // t0: cached turn (cache established). t0+6min: gap > TTL, uncached read.
+    const evs = [
+      mkCached(0, t0, 10_000, 9_000),
+      mkCached(1, t0 + sixMin(), 12_000, 2_000),
+      mkCached(2, t0 + sixMin() + 1000, 13_000, 11_000), // within TTL, normal
+    ];
+    const w = cacheTtlWaste(evs);
+    assert(w !== undefined && w.gaps === 1, `one idle gap > TTL attributed (${w?.gaps})`);
+    assert(
+      w !== undefined && w.wastedTokens === Math.min(10_000, 10_000),
+      `wasted tokens = uncached reads capped by the previous prefix (${w?.wastedTokens})`,
+    );
+    // No gap over TTL → zero attribution.
+    const tight = [mkCached(0, t0, 10_000, 9_000), mkCached(1, t0 + 60_000, 12_000, 3_000)];
+    assert(cacheTtlWaste(tight)?.gaps === 0, "misses within the TTL are not attributed");
+    function sixMin(): number {
+      return fiveMin + 60_000;
+    }
+  }
+
 
   // lastContextTokens: compaction-aware seeding. When the newest turn-boundary
   // is a compaction event (no LLM turn ran since), the stamped post-compaction
@@ -2756,8 +2782,35 @@ await srv.connect(new StdioServerTransport());
 
 // --- P#39①: result-bearing extension events (cancel / rewrite / turn:end) ---
 {
-  const { createExtensionEventBridge } = await import("./extensions.js");
+  const { createExtensionEventBridge, loadExtensions } = await import("./extensions.js");
   const { ToolRegistry: Reg, AutoApprove } = await import("@aih/core");
+  const { TOOL_ICONS, TOOL_TITLE_ARG } = await import("./tui.js");
+
+  // ② Same-name shadowing inherits the built-in's rendering tables.
+  {
+    const dir = mkdtempSync("/tmp/aih-ext-");
+    mkdirSync(join(dir, ".aih", "extensions"), { recursive: true });
+    // run_cmd is a built-in with icon "$" and title-arg "command".
+    writeFileSync(
+      join(dir, ".aih", "extensions", "shadow.mjs"),
+      `export default function (aih) {
+        aih.registerTool({
+          name: "run_cmd",
+          description: "shadowed run_cmd",
+          kind: "read",
+          parameters: { type: "object", properties: {}, required: [] },
+          execute: async () => ({ shadowed: true }),
+        });
+      }`,
+    );
+    const reg2 = new Reg(new AutoApprove());
+    await loadExtensions(reg2, { cwd: dir, enabled: true });
+    assert(reg2.get("run_cmd") !== undefined && reg2.get("run_cmd")?.description === "shadowed run_cmd", "same-name extension tool replaces the built-in");
+    assert(TOOL_ICONS["run_cmd"] === "$", "shadowing inherits the built-in icon");
+    assert(TOOL_TITLE_ARG["run_cmd"] === "command", "shadowing inherits the built-in title-arg");
+    rmSync(dir, { recursive: true, force: true });
+  }
+
   const bridge = createExtensionEventBridge();
   // before-handler vetoes a call; after-handler rewrites the result.
   bridge.on("tool:before", (p) => {
@@ -2801,6 +2854,30 @@ await srv.connect(new StdioServerTransport());
   assert(ok.ok === true && (ok.result as { rewritten?: boolean })?.rewritten === true, `tool:after rewrites the result in place (${JSON.stringify(ok.result)})`);
   bridge.emit("turn:end", { stopReason: "end_turn" });
   assert(turnEnded === 1, "turn:end subscribers fire via emit");
+}
+
+// --- P#37②: stateful tools roll back with the timeline ----------------------
+{
+  const { todoStateFromLog, registerGeneralTools } = await import("./general-tools.js");
+  const { ToolRegistry: Reg2, AutoApprove: AA } = await import("@aih/core");
+  const reg3 = new Reg2(new AA());
+  const tmpCwd = mkdtempSync("/tmp/aih-state-");
+  registerGeneralTools(reg3, { cwd: tmpCwd });
+  const t = await reg3.invoke("todo", { todos: [{ content: "first", status: "completed" }] }, { turnId: "t", inject: () => {} });
+  assert(t.ok && (t.result as { details?: { kind?: string } })?.details?.kind === "state.todos", "todo stamps a state.todos snapshot into the result");
+  // Simulate the log growing, then rolling back to before the second write.
+  const evs = [
+    { seq: 0, type: "user/message", text: "start" },
+    { seq: 1, type: "tool/result", callId: "a", ok: true },
+    { seq: 2, type: "tool/result", callId: "b", ok: true, result: { details: { kind: "state.todos", todos: [{ content: "old", status: "pending" }] } } },
+    { seq: 3, type: "tool/result", callId: "c", ok: true, result: { details: { kind: "state.todos", todos: [{ content: "new", status: "in_progress" }] } } },
+    { seq: 4, type: "checkpoint" },
+    { seq: 5, type: "tool/result", callId: "d", ok: true, result: { details: { kind: "state.todos", todos: [{ content: "future", status: "completed" }] } } },
+  ];
+  assert(todoStateFromLog(evs)?.[0]?.content === "future", "newest state snapshot wins");
+  assert(todoStateFromLog(evs, 4)?.[0]?.content === "new", "beforeSeq rolls state back to the timeline point");
+  assert(todoStateFromLog(evs, 1) === undefined, "no snapshot before first write → undefined");
+  rmSync(tmpCwd, { recursive: true, force: true });
 }
 
 console.log("\nAIH cli smoke test passed.");

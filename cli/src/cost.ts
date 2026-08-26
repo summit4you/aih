@@ -318,6 +318,55 @@ export function fmtCacheRate(rate: number, observedTurns: number): string {
   return `CH ${Math.round(rate * 100)}%`;
 }
 
+/**
+ * P#41 — TTL waste attribution. For every turn that reports cache data, ask:
+ * "was this turn's cache MISS plausibly caused by the idle gap before it
+ * exceeding the provider's prompt-cache TTL?" (Anthropic ~5 min; OpenAI
+ * similar order.) The newest reported miss after a gap > ttlMs is attributed
+ * to that gap; its uncached prompt tokens are "wasted" full-price reads.
+ *
+ * Pure and honest about limits: providers report only cached_tokens per turn,
+ * not which prefix was served from cache — so this is an attribution
+ * heuristic over observable facts (gap length + reported hit), never proof.
+ * Returns undefined when no turn reports cache data.
+ */
+export function cacheTtlWaste(
+  events: readonly SessionEvent[],
+  opts?: { ttlMs?: number },
+): { gaps: number; wastedTokens: number } | undefined {
+  const ttl = opts?.ttlMs ?? 5 * 60_000;
+  let lastTs: number | undefined;
+  let prevPrompt = 0;
+  let gaps = 0;
+  let wastedTokens = 0;
+  let seen = false;
+  for (const e of events) {
+    if (e.type !== "turn/end") continue;
+    const c = e.usage?.cachedTokens;
+    if (typeof c === "number" && c > 0) {
+      seen = true;
+      const prompt = e.usage?.promptTokens ?? 0;
+      const uncached = Math.max(0, prompt - c);
+      if (
+        lastTs !== undefined &&
+        typeof e.ts === "number" &&
+        e.ts - lastTs > ttl &&
+        uncached > 0
+      ) {
+        // A real cacheable prefix existed (previous turn had tokens), the gap
+        // exceeds the TTL, and this turn paid for uncached prompt tokens.
+        gaps += 1;
+        wastedTokens += Math.min(uncached, prevPrompt || uncached);
+      }
+    }
+    if (typeof e.ts === "number") {
+      lastTs = e.ts;
+      prevPrompt = e.usage?.promptTokens ?? prevPrompt;
+    }
+  }
+  return seen ? { gaps, wastedTokens } : undefined;
+}
+
 /** Human TPS string, e.g. "128 tok/s". */
 export function fmtTps(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "";

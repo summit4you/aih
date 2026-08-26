@@ -18,6 +18,10 @@
  */
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import {
+  TOOL_ICONS,
+  TOOL_TITLE_ARG,
+} from "./tui.js";
 import type {
   ToolDefinition,
   ToolKind,
@@ -78,6 +82,13 @@ export async function loadExtensions(
       process.stderr.write(`[extension] ${line}\n`);
     },
     registerTool(def) {
+      // P#39② — same-name shadowing inherits the built-in's RENDERING: icon,
+      // title-arg and arg formatter fall back to the shadowed built-in so a
+      // replacement tool keeps its familiar transcript appearance.
+      const inheritedIcon = TOOL_ICONS[def.name];
+      const inheritedTitle = TOOL_TITLE_ARG[def.name];
+      if (inheritedIcon !== undefined) TOOL_ICONS[def.name] = inheritedIcon;
+      if (inheritedTitle !== undefined) TOOL_TITLE_ARG[def.name] = inheritedTitle;
       const tool: ToolDefinition = {
         name: def.name,
         description: def.description,
@@ -86,13 +97,13 @@ export async function loadExtensions(
         permission: def.permission ?? "ask",
         parameters:
           (def.parameters as ToolDefinition["parameters"]) ??
-          ({ type: "object", properties: {} } as ToolDefinition["parameters"]),
+          ({ type: "object", properties: {}, required: [] } as ToolDefinition["parameters"]),
         async execute(args, ctx) {
           return def.execute(args, ctx);
         },
       };
-      // Same-name registration replaces the built-in but inherits nothing else
-      // (registry.register already overwrites by name).
+      // Same-name registration replaces the built-in (registry.register
+      // overwrites by name); rendering inheritance handled above.
       registry.register(tool);
     },
     registerCommand(cmd) {
