@@ -123,7 +123,7 @@ const HELP_LINES: string[] = [
   "    /skills · /usage · /compact · /checkpoint · /restore · /fork · /find · /vivid · /exit",
 ];
 
-const TOOL_ICONS: Record<string, string> = {
+export const TOOL_ICONS: Record<string, string> = {
   bash: "$",
   execute: "$",
   run: "$",
@@ -388,7 +388,7 @@ function highlightCode(line: string): string {
 // opencode-style per-tool "title" argument: the row shows its full value
 // (no truncation) instead of a capped k=v dump — e.g. run_cmd shows the whole
 // command, write_file shows the path.
-const TOOL_TITLE_ARG: Record<string, string> = {
+export const TOOL_TITLE_ARG: Record<string, string> = {
   run_cmd: "command",
   read_file: "path",
   write_file: "path",
@@ -1194,7 +1194,11 @@ constructor(opts: TuiOptions) {
           const steered = this.#opts.onLineBusy?.(line) ?? false;
           if (!steered) {
             this.#queue.push(line);
-            this.pushSystem(`queued: ${line}`);
+            this.pushSystem(
+              line.trim().startsWith("/")
+                ? `queued (runs right after the current turn finishes): ${line}`
+                : `queued: ${line}`,
+            );
           }
         } else {
           this.#opts.onLine(line);
