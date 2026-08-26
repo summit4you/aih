@@ -219,6 +219,39 @@ diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截�
   拒绝覆盖、坏 seq / 无标记报错；worktree 快照（非仓库 undefined、分支/sha/脏文件、
   封顶计数、事件携带结构化摘要）
 
+### 分支蒸馏（distill-branch，P#37）
+
+放弃一个分支时，"被扔掉的路上学到了什么"不必跟着丢：
+
+- `aih session distill-branch <废弃会话> <目标会话> [--from seq]` 用**一次无工具
+  LLM 调用**把废弃分支的转写（工具正文截断、输入封顶 24k 字符）蒸馏为 3–6 条可迁移
+  经验，作为 `branch_summary` 事件**追加**到目标会话——原文件不动，append-only 可审计
+- `deriveMessages` 把 branch_summary 折叠进首条 system 消息（与 compaction 投影共存），
+  存活分支保留死路的知识而无需承担其 token 成本；蒸馏提示词只取"为什么失败/发现的约束/
+  关键路径与命令"，不含密钥
+- 冒烟测试覆盖：投影折叠（含与 compaction 并存）、CLI 蒸馏落盘与缺失目标拒绝
+
+### Eval 实验框架（P#46）
+
+"A/B 两个模型跑同一批任务各 N 次，产出可比的结果内核"——现代智能体项目的可信度门槛：
+
+```sh
+# 编程接口（cli/src/eval.ts）：tasks × models × repetitions → cell 矩阵
+runExperiment(tasks, models, reps, subject, { outDir, budget })
+```
+
+- **SubjectAdapter seam**：eval 只拥有实验语义，执行复用各 subject 自身运行时——
+  内置 CLI（`cliSubjectAdapter`）、任意外部命令（`externalSubjectAdapter`，
+  `{prompt}`/`{workdir}` 模板展开，可对比其他 agent CLI）、HTTP 端点
+  （`httpSubjectAdapter`，打 `aih serve POST /message`）
+- **预算控制**：墙钟（`budgetMs`）与成本上限（`maxCostUsd`，按 F#30 价目表从各
+  attempt 会话日志的 turn/end usage 定价）；预算耗尽后未启动的 cell 进
+  `skippedCells`——诚实记账，绝不伪造结果；并发上限默认 `AIH_TOOL_CONCURRENCY`
+- **结果内核**：`{ status, durationMs, outputTail, failureReason, usage, costUsd }`；
+  attempt 不可变，多 attempt 取最早有效者（反 Goodhart）
+- 冒烟测试覆盖：cell 展开、mock 全流程 4 cell、紧预算跳过记账、usage 聚合、成本上限
+  停机、外部 echo subject 判定
+
 ### 成本与吞吐（cost / TPS）
 
 会话级成本与吞吐统计（roadmap F#30，对齐 MiMo context sidebar）：
@@ -334,6 +367,7 @@ npm run cli -- session export work  > work.json   # 导出为 JSON
 npm run cli -- session fork default branch-a --from 7   # 从事件序 7 分叉出新会话
 npm run cli -- session checkpoint work "before risky refactor"   # 记录检查点（F#28）
 npm run cli -- session restore work   # 回滚：前缀分叉为 work-restore-<seq>（原文件不动）
+npm run cli -- session distill-branch branch-a default --from 7  # 废弃分支蒸馏为 branch_summary 注入目标会话
 # TUI 内：/checkpoint [note] 与 /restore [seq]（回滚前自动快照完整历史）
 npm run cli -- session rm work                    # 删除
 npm run cli -- stats                              # 所有会话 token 用量汇总
@@ -593,6 +627,7 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd 默认超时 |
 | `AIH_TOOL_CONCURRENCY` (4) | 单步内连续只读工具调用的并发上限（写类恒串行） |
 | `AIH_FORMAT_TIMEOUT_MS` (15000) | 写后自动格式化超时（失败不阻断写入） |
+| `AIH_MOCK_AUX_TEXT` | mock 模式下无工具辅助调用（goal 裁判 / 分支蒸馏）的回复文本（测试钩子） |
 
 ### 会话标题（隐藏系统 agent）
 
