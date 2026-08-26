@@ -365,6 +365,47 @@ for (let a = 0; a < 8; a += 1) {
   );
 }
 
+// CJK-aware token estimation: flat chars÷4 undercounts the Chinese + JSON mix
+// ~2-3×, which let real prompts hit ~1.5× the window unnoticed.
+{
+  const { estimateTokensText } = await import("./agent-loop.js");
+  const cjk = estimateTokensText("你好世界".repeat(10)); // 40 CJK chars
+  assert(cjk >= 36 && cjk <= 48, `40 CJK chars ≈ 40+ tokens (got ${cjk}, chars/4 would say 10)`);
+  const json = estimateTokensText(JSON.stringify({ path: "/tmp/x", content: "a".repeat(60) }));
+  assert(json >= 20, `dense JSON estimates denser than chars/4 (got ${json})`);
+}
+{
+  // Opaque HTTP 500 near the window → suspected overflow → compact → retry
+  // succeeds (free-tier gateways hide real overflow behind generic 500s).
+  const { AgentLoop: Loop, estimateTokensText } = await import("./agent-loop.js");
+  let calls = 0;
+  const flaky500 = {
+    complete: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("llm request failed: HTTP 500 Internal server error");
+      if (calls === 2)
+        return { text: "summary of the earlier work", toolCalls: [], stopReason: "end_turn" };
+      return { text: "recovered after compaction", toolCalls: [], stopReason: "end_turn" };
+    },
+  } as unknown as LLMAdapter;
+  const oLog = new SessionLog();
+  const filler = "工具输出测试".repeat(300); // ≈1800 CJK chars → ~2000 tokens
+  oLog.append({ type: "user/message", turnId: "t0", text: filler });
+  oLog.append({ type: "assistant/message", turnId: "t0", text: "", toolCalls: [] });
+  assert(estimateTokensText(filler) >= 1500, "filler is large enough to sit near the test window");
+  const oLoop = new Loop({ llm: flaky500, tools: new ToolRegistry(gate), log: oLog, contextWindow: 3000 });
+  const oRes = await oLoop.send("continue");
+  assert(oRes.stopReason === "end_turn", "turn completes via compact-retry after opaque 500");
+  assert(
+    oLog.all().some((e) => e.type === "assistant/message" && e.text === "recovered after compaction"),
+    "the retried turn's answer is logged",
+  );
+  assert(
+    oLog.all().some((e) => e.type === "compaction"),
+    "a compaction event was appended before the retry",
+  );
+}
+
 {
   // provider config headers (client identity) are sent with every completion call
   let seen: Record<string, string> = {};

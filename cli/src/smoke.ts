@@ -8,6 +8,7 @@ import {
   fmtCost,
   fmtTps,
   lastContextTokens,
+  estimateContextTokens,
   cacheHitRate,
   DEFAULT_PRICES,
 } from "./cost.js";
@@ -150,6 +151,29 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   assert(lastContextTokens([garbage], 0).tokens === 28_200_904, "without a window the raw value passes through (cannot judge)");
   const saneNewer = lastContextTokens([mk(0, 1, 120_000, 5), garbage, mk(9, 10, 130_000, 5)], 200_000);
   assert(saneNewer.tokens === 130_000 && saneNewer.source === "usage", "sane newer usage beats older garbage");
+
+  // A sane sample can be STALE: when the log clearly outgrew it (tool-heavy
+  // sessions accrue fast), the local estimate is the current truth.
+  {
+    const stale = [
+      mk(1, 2, 100_000, 5),
+      ...Array.from({ length: 4 }, (_, i) =>
+        ({ seq: 2 + i, ts: 3 + i, type: "user/message", turnId: `t${i}`, text: "工具输出测试".repeat(6000) }) as SessionEvent,
+      ),
+    ];
+    const r = lastContextTokens(stale, 200_000);
+    assert(r.source === "estimate" && r.tokens > 130_000, `stale sample outgrown by log → estimate wins (got ${r.source} ${r.tokens})`);
+  }
+
+  // estimateContextTokens is CJK-aware: Chinese-heavy events count ≈1 token
+  // per char (flat chars÷4 would undercount ~3× and hide real overflow).
+  {
+    const cjkEvents = [
+      { seq: 1, ts: 1, type: "user/message", turnId: "t", text: "你好世界".repeat(25) }, // 100 CJK chars
+    ] as SessionEvent[];
+    const est = estimateContextTokens(cjkEvents);
+    assert(est >= 90 && est <= 130, `100 CJK chars ≈ ~110 tokens (got ${est}; chars/4 would say 25)`);
+  }
 
   assert(tokensPerSecond([]) === 0, "TPS is 0 with no events");
   assert(fmtCost(12.5) === "$12.50", "fmtCost formats >=0.01 to 2 decimals");

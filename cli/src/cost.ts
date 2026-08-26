@@ -10,6 +10,7 @@
  * without a live LLM (the mock LLM does not report usage).
  */
 import type { SessionEvent, TokenUsage } from "@aih/core";
+import { estimateTokensText } from "@aih/core";
 import { MODEL_METADATA } from "./model-metadata.js";
 
 export interface ModelPrice {
@@ -167,7 +168,15 @@ export function lastContextTokens(
       // Free-tier gateways report cumulative/garbage prompt_tokens (observed
       // 28M on a ~500k-token conversation). Skip implausible values and keep
       // walking back; when nothing sane remains, derive locally.
-      if (sanePromptTokens(p, window)) return { tokens: p as number, source: "usage" };
+      if (sanePromptTokens(p, window)) {
+        // A sane sample can still be STALE: lots of content may have accrued
+        // after that turn (tool-heavy sessions grow fast). When the local
+        // estimate clearly outgrew the sample, the estimate is the truth.
+        const est = estimateContextTokens(events);
+        return est > (p as number) * 1.25
+          ? { tokens: est, source: "estimate" }
+          : { tokens: p as number, source: "usage" };
+      }
     }
   }
   if (events.length === 0) return { tokens: 0, source: "none" };
@@ -183,33 +192,35 @@ export function lastContextTokens(
  */
 export function estimateContextTokens(events: readonly SessionEvent[]): number {
   let cutoff = -1;
-  let chars = 0;
+  let tokens = 0;
   for (const e of events) {
     if (e.type === "compaction") {
       cutoff = e.seq;
-      chars = e.summary?.length ?? 0; // earlier summaries are superseded
+      tokens = estimateTokensText(e.summary ?? ""); // earlier summaries are superseded
     }
   }
   for (const e of events) {
     if (e.seq <= cutoff) continue;
     switch (e.type) {
       case "user/message":
-        chars += e.text.length;
+        tokens += estimateTokensText(e.text);
         break;
       case "assistant/message":
-        chars += e.text.length + JSON.stringify(e.toolCalls ?? []).length;
+        tokens +=
+          estimateTokensText(e.text) +
+          (e.toolCalls ?? []).reduce((n, tc) => n + estimateTokensText(`${tc.name} ${JSON.stringify(tc.args ?? {})}`), 0);
         break;
       case "tool/call":
-        chars += e.name.length + JSON.stringify(e.args ?? {}).length;
+        tokens += estimateTokensText(`${e.name} ${JSON.stringify(e.args ?? {})}`);
         break;
       case "tool/result":
-        chars += JSON.stringify(e.result ?? e.error ?? "").length;
+        tokens += estimateTokensText(JSON.stringify(e.result ?? e.error ?? ""));
         break;
       default:
         break;
     }
   }
-  return Math.max(0, Math.round(chars / 4));
+  return Math.max(0, tokens);
 }
 
 /**

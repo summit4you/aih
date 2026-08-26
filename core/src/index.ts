@@ -8,7 +8,7 @@ export {
 } from "./recovery.js";
 export type { ToolFact, ToolRecoveryState, RecoveryReport } from "./recovery.js";
 export { SessionStore } from "./session-store.js";
-export { AgentLoop } from "./agent-loop.js";
+export { AgentLoop, estimateTokensText } from "./agent-loop.js";
 export type { AgentLoopOptions } from "./agent-loop.js";
 export { ToolRegistry } from "./tool-registry.js";
 export type {

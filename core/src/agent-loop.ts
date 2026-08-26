@@ -63,6 +63,31 @@ export interface AgentLoopOptions {
 const CONTEXT_ERROR =
   /(maximum context|context length|context_length|prompt is too long|too many tokens|maximum number of tokens|exceeds? (the )?(longest )?maximum|requested \d+ tokens)/i;
 
+/**
+ * CJK-aware token estimate. A flat chars÷4 undercounts the tool-JSON +
+ * Chinese-conversation mix by ~2-3× (CJK ≈ 1 char/token, dense JSON ≈ 3),
+ * which let real prompts reach ~1.5× the window before anyone noticed.
+ */
+export function estimateTokensText(s: string): number {
+  let cjk = 0;
+  for (let i = 0; i < s.length; i++) {
+    const cp = s.charCodeAt(i);
+    if (
+      (cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+      (cp >= 0x3000 && cp <= 0x30ff) || // CJK punct + kana
+      (cp >= 0xff00 && cp <= 0xffef) || // fullwidth forms
+      (cp >= 0xac00 && cp <= 0xd7af)    // Hangul
+    ) {
+      cjk++;
+    }
+  }
+  const rest = s.length - cjk;
+  return Math.max(1, Math.round(cjk * 1.1 + rest / 3.5));
+}
+
+/** Below this fraction of the window, opaque server errors are NOT treated as overflow. */
+const OVERFLOW_SUSPECT_RATIO = 0.6;
+
 // Compaction design aligned with opencode / MiMo-Code (session/compaction.ts,
 // core/session/compaction.ts, overflow.ts):
 //  - keep a recent tail VERBATIM (not summarized) so the agent retains the most
@@ -266,7 +291,17 @@ export class AgentLoop {
       } catch (err) {
         if (ac.signal.aborted) break;
         const message = err instanceof Error ? err.message : String(err);
-        if (!CONTEXT_ERROR.test(message)) throw err;
+        // Provider text is unreliable about WHY it failed: free-tier gateways
+        // return generic "HTTP 500 Internal server error" when the real cause
+        // is an oversized prompt. When the local estimate says we're near the
+        // window, treat opaque server errors as suspected overflow and try
+        // one compact+retry — mirroring pi's silent-overflow heuristic.
+        const nearWindow =
+          this.#contextWindow > 0 &&
+          this.#estimateContext() >= OVERFLOW_SUSPECT_RATIO * this.#contextWindow;
+        const opaqueFailure =
+          /HTTP [45]\d\d|fetch failed|terminated|socket hang|other side closed/i.test(message);
+        if (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure)) throw err;
         const c = await this.#compact(turnId);
         if (c.usage) usage = addUsage(usage, c.usage);
         if (c.applied) contextNow = this.#estimateContext();
@@ -510,11 +545,14 @@ export class AgentLoop {
   }
 
   #estimateTokens(messages: ChatMessage[]): number {
-    let chars = 0;
+    let tokens = 0;
     for (const m of messages) {
-      chars += m.content.length + (m.toolCalls?.length ?? 0) * 32;
+      tokens += estimateTokensText(m.content);
+      for (const tc of m.toolCalls ?? []) {
+        tokens += estimateTokensText(`${tc.name} ${JSON.stringify(tc.args ?? {})}`);
+      }
     }
-    return Math.max(1, Math.round(chars / 4));
+    return Math.max(1, tokens);
   }
 
   #estimateContext(): number {
