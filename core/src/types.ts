@@ -238,6 +238,15 @@ export interface LLMRequest {
   onDelta?: (delta: string) => void;
   onRetry?: (attempt: number, error: unknown) => void;
   signal?: AbortSignal;
+  /**
+   * P#36 — side-channel session identity for auxiliary calls (compaction
+   * summaries). When set, "{sid}" header placeholders resolve to this id
+   * instead of the client's stable session id, so gateway-side per-session
+   * state (routing, caches keyed on the session header) treats the summary
+   * traffic as a separate lane and the main conversation's cache lineage
+   * stays clean.
+   */
+  sessionId?: string;
 }
 
 export interface LLMResponse {

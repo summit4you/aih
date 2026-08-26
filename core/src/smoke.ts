@@ -22,7 +22,7 @@ import {
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
 } from "./index.js";
-import type { ChatMessage, SessionEvent, ToolDefinition } from "./types.js";
+import type { ChatMessage, LLMRequest, SessionEvent, ToolDefinition } from "./types.js";
 import type { LLMAdapter } from "./seams/llm.js";
 
 function assert(cond: boolean, msg: string): void {
@@ -658,6 +658,72 @@ assert(
   noUserDerived.filter((m) => m.role === "user").length === 1,
   "user-query guard appends exactly one user message",
 );
+
+// --- P#36③④⑤: split-turn double summary, overflow re-prime, summary isolation ---
+{
+  // ⑤ Summary-call isolation: every auxiliary (summary) call carries a
+  // sessionId distinct from the main conversation's requests.
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const isoLog = new SessionLog();
+  const seenSessionIds: Array<string | undefined> = [];
+  let phase = 0; // 0 = main call → tool_use, 1 = summary, 2+ = main
+  const isoLlm = {
+    complete: (r: LLMRequest) => {
+      if (phase === 1) seenSessionIds.push(r.sessionId);
+      else seenSessionIds.push(r.sessionId);
+      phase += 1;
+      if (phase === 1)
+        return Promise.resolve({
+          text: "",
+          toolCalls: [toolCall("iso-1", "echo", { text: "x" })],
+          stopReason: "tool_use" as const,
+          usage: { promptTokens: 4500, completionTokens: 5, totalTokens: 4505 },
+        });
+      if (phase === 2) return Promise.resolve({ text: "ISO-SUMMARY", toolCalls: [], stopReason: "end_turn" as const });
+      return Promise.resolve({ text: "done", toolCalls: [], stopReason: "end_turn" as const });
+    },
+  } as unknown as LLMAdapter;
+  const isoLoop = new Loop({ llm: isoLlm, tools: new ToolRegistry(gate), log: isoLog, contextWindow: 5000 });
+  isoLog.append({ type: "user/message", turnId: "old", text: `history ${"x ".repeat(600)}` });
+  await isoLoop.compactNow();
+  assert(
+    seenSessionIds.length >= 1 &&
+      seenSessionIds.every((s) => typeof s === "string" && s.startsWith("aih-compact-")),
+    `every summary call carries its own side-channel sessionId (${seenSessionIds.map((s) => s ?? "-").join(",")})`,
+  );
+
+  // ④ Overflow recovery re-primes the interrupted turn: after a suspected-
+  // overflow failure + compaction, an explicit continuation message quoting
+  // the original request is logged before the retry.
+  const rpLog = new SessionLog();
+  let calls4 = 0;
+  const flaky = {
+    complete: async () => {
+      calls4 += 1;
+      if (calls4 === 1) throw new Error("llm request failed: HTTP 500 Internal server error");
+      return { text: "RP-SUMMARY", toolCalls: [], stopReason: "end_turn" };
+    },
+  } as unknown as LLMAdapter;
+  // Fill near the window so the opaque 500 is classified as overflow
+  // (≥60% of the 3000-token window → ~1800 tokens of filler).
+  rpLog.append({ type: "user/message", turnId: "old", text: `filler ${"y".repeat(4800)} end` });
+  rpLog.append({ type: "assistant/message", turnId: "old", text: `ack ${"z".repeat(2400)}`, toolCalls: [] });
+  const rpLoop = new Loop({ llm: flaky, tools: new ToolRegistry(gate), log: rpLog, contextWindow: 3000 });
+  await rpLoop.send("deploy the staging cluster");
+  const reprime = rpLog.all().find(
+    (e): e is Extract<SessionEvent, { type: "user/message" }> =>
+      e.type === "user/message" && e.text.includes("[context recovery]"),
+  );
+  assert(!!reprime, "overflow recovery appends a [context recovery] continuation message");
+  assert(
+    !!reprime && reprime.text.includes("deploy the staging cluster"),
+    "continuation message quotes the interrupted turn's original request",
+  );
+  assert(
+    rpLog.all().some((e) => e.type === "compaction"),
+    "compaction happened before/with the re-prime",
+  );
+}
 const synthLog = new SessionLog();
 synthLog.append({ type: "assistant/message", turnId: "t2", text: "orphan", toolCalls: [] });
 synthLog.append({ type: "compaction", turnId: "t2", summary: "s" });

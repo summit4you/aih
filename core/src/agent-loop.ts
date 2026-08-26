@@ -151,6 +151,10 @@ export class AgentLoop {
   #contextWindow: number;
   #compactAt: number;
   #readConcurrency: number;
+  /** P#36⑤ — side-channel session identity for summary calls (stable per loop). */
+  #summarySid?: string;
+  /** P#36④ — re-primed the interrupted turn once after an overflow recovery. */
+  #overflowReprimed = false;
   #onPromptInput?: (messages: ChatMessage[]) => void;
   #inbox: string[] = [];
   /** P#35 — user steering messages queued mid-turn; drained before the next LLM call. */
@@ -302,9 +306,26 @@ export class AgentLoop {
         const opaqueFailure =
           /HTTP [45]\d\d|fetch failed|terminated|socket hang|other side closed/i.test(message);
         if (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure)) throw err;
+        // P#36④ — the failed request was part of THIS turn: its user request
+        // and everything logged before it stay in the log, but compaction may
+        // fold them into the summary. Re-prime the turn with an explicit
+        // continuation message AFTER compacting so "retry the step" becomes
+        // "resume the interrupted turn": the model re-reads its goal instead
+        // of silently dropping it (pi: overflow → resume the task).
         const c = await this.#compact(turnId);
         if (c.usage) usage = addUsage(usage, c.usage);
         if (c.applied) contextNow = this.#estimateContext();
+        if (!this.#overflowReprimed) {
+          this.#overflowReprimed = true;
+          this.#log.append({
+            type: "user/message",
+            turnId,
+            text:
+              `[context recovery] The previous model request failed (likely context overflow) ` +
+              `and older history was just summarized. Resume the interrupted task from the summary. ` +
+              `${this.#turnRequestPreview(turnId)}`,
+          });
+        }
         response = await doComplete();
       }
       usage = addUsage(usage, response.usage);
@@ -559,6 +580,19 @@ export class AgentLoop {
     return this.#estimateTokens(this.#log.deriveMessages(this.#systemPrompt));
   }
 
+  // P#36④ — the user request that started this turn (truncated preview), so
+  // the overflow-recovery continuation message re-states the original goal.
+  #turnRequestPreview(turnId: string): string {
+    const users = this.#log
+      .all()
+      .filter(
+        (e): e is Extract<SessionEvent, { type: "user/message" }> =>
+          e.type === "user/message" && e.turnId === turnId,
+      );
+    const first = users[0]?.text ?? "";
+    return first.length > 400 ? `${first.slice(0, 400)}…` : first;
+  }
+
   // Latest compaction event in the log (for post-compaction size estimation).
   #lastCompaction(): Extract<SessionEvent, { type: "compaction" }> | undefined {
     for (let i = this.#log.all().length - 1; i >= 0; i--) {
@@ -633,11 +667,19 @@ export class AgentLoop {
     if (split < n) return { head: messages.slice(0, split), recent: messages.slice(split) };
     // Tail guarantee (pi-style): no turn-boundary suffix fits — the newest
     // turn is a giant. Keep that turn anyway with its user message TRUNCATED
-    // to the budget (plus any following messages that still fit), so the
+    // to the budget (plus any following whole messages that fit), so the
     // post-compaction conversation always retains the live request verbatim-
     // prefixed and never loses "what were we just doing". A user-led tail is
     // also chat-template-safe (Qwen3 400s on conversations without a user
     // query), and truncation keeps call↔result pairing inside whole messages.
+    //
+    // P#36③ — split-turn double summary: messages of the giant turn that do
+    // NOT fit the tail are folded back into the summarized head (chronolo-
+    // gically appended), so the map-reduce summarizer produces partials for
+    // them and merges — every message is either summarized or kept verbatim,
+    // never silently dropped. Summary input is serialized text, so cutting
+    // inside the turn cannot orphan tool_calls the way a chat-history split
+    // would.
     const lastUser = boundaries[boundaries.length - 1];
     if (lastUser !== undefined) {
       const charCap = Math.max(64, Math.floor(budget / 1.2));
@@ -651,13 +693,20 @@ export class AgentLoop {
       };
       const recent: ChatMessage[] = [truncatedUser];
       let acc = this.#estimateTokens([truncatedUser]);
+      let overflowStart = n;
       for (let j = lastUser + 1; j < n; j++) {
         const cost = this.#estimateTokens([messages[j]]);
-        if (acc + cost > budget) break;
+        if (acc + cost > budget) {
+          overflowStart = j;
+          break;
+        }
         recent.push(messages[j]);
         acc += cost;
       }
-      return { head: messages.slice(0, lastUser), recent };
+      return {
+        head: [...messages.slice(0, lastUser), ...messages.slice(overflowStart)],
+        recent,
+      };
     }
     return { head: messages.slice(0, split), recent: messages.slice(split) };
   }
@@ -773,6 +822,7 @@ export class AgentLoop {
       const response = await this.#llm.complete({
         messages: [{ role: "user", content: fullPrompt }],
         tools: [],
+        ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
       });
       return { text: response.text, usage: response.usage };
     }
@@ -789,6 +839,7 @@ export class AgentLoop {
       const response = await this.#llm.complete({
         messages: [{ role: "user", content: prompt }],
         tools: [],
+        ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
       });
       if (response.text.trim()) partials.push(response.text.trim());
       usage = addUsage(usage, response.usage);
@@ -798,6 +849,7 @@ export class AgentLoop {
     const merged = await this.#llm.complete({
       messages: [{ role: "user", content: this.#mergePrompt(partials, previousSummary) }],
       tools: [],
+      ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
     });
     return { text: merged.text, usage: addUsage(usage, merged.usage) };
   }
@@ -834,6 +886,11 @@ export class AgentLoop {
       head = conversation;
       recent = [];
     }
+    // P#36⑤ — summary-call isolation: auxiliary calls run on their own
+    // session identity ("{sid}" header → fresh id), keeping gateway-side
+    // per-session state and the main conversation's prompt-cache lineage
+    // free of summary traffic. The mock adapter ignores the field.
+    this.#summarySid ??= `aih-compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const { text, usage } = await this.#summarizeHead(head, previousSummary, opts?.instructions);
     if (!text.trim()) return { usage, applied: false };
     // User-query invariant (opencode/MiMo-Code "replay"): the compaction must

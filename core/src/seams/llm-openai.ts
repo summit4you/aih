@@ -128,7 +128,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(this.#options.headers ?? {})) {
       let out = v;
-      if (out.includes("{sid}")) out = out.split("{sid}").join(this.#sid);
+      // P#36: auxiliary calls (compaction summaries) carry their own
+      // session id so "{sid}" resolves to the side-channel identity.
+      if (out.includes("{sid}")) out = out.split("{sid}").join(req.sessionId ?? this.#sid);
       if (out.includes("{rand}")) out = out.split("{rand}").join(opencodeIDBody());
       headers[k] = out;
     }
