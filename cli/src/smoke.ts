@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -17,6 +17,17 @@ import {
 import type { SessionEvent } from "@aih/core";
 
 const cli = fileURLToPath(new URL("./index.js", import.meta.url));
+
+// The session tests wipe ./.aih/sessions; a real user session must never be
+// the casualty. Stash it aside (recoverable under /tmp) instead of rm -rf.
+const SESSIONS_STASH_ROOT = `/tmp/aih-sessions-stash-${process.pid}`;
+function wipeLocalSessions(): void {
+  if (!existsSync(".aih/sessions")) return;
+  const dest = `${SESSIONS_STASH_ROOT}/${Date.now()}`;
+  mkdirSync(dest, { recursive: true });
+  renameSync(".aih/sessions", dest);
+  console.error(`[smoke] stashed pre-existing .aih/sessions → ${dest}`);
+}
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -365,7 +376,7 @@ assert(noKey.status === 1 && noKey.stderr.includes("no API key"), "missing API k
   );
 }
 
-rmSync(".aih/sessions", { recursive: true, force: true });
+wipeLocalSessions();
 const s1a = aih(["run", "first prompt alpha", "--mock", "--yes", "--session", "s1"]);
 assert(
   s1a.status === 0 && s1a.stderr.includes("[session: new"),
@@ -451,7 +462,7 @@ assert(forkAgain.status === 1 && forkAgain.stderr.includes("already exists"), "f
   assert(noCp.status === 1 && noCp.stderr.includes("no checkpoints"), "restore errors cleanly when the session has no checkpoints");
 }
 
-rmSync(".aih/sessions", { recursive: true, force: true });
+wipeLocalSessions();
 
 const config = aih(["config"], { AIH_MODEL: "deepseek-v4-flash" });
 assert(config.status === 0, "config command runs");
@@ -1979,7 +1990,7 @@ await srv.connect(new StdioServerTransport());
   rmSync(repo, { recursive: true, force: true });
 
   // CLI checkpoint embeds the snapshot into the event (cwd = this repo).
-  rmSync(".aih/sessions", { recursive: true, force: true });
+  wipeLocalSessions();
   const s1run = aih(["run", "seed for wt", "--mock", "--yes", "--session", "s1wt"]);
   assert(s1run.status === 0, "seed session exists before checkpoint");
   const cpOut = aih(["session", "checkpoint", "s1wt", "wt", "check"]);
