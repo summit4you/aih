@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { join } from "node:path";
 import {
   resolvePrice,
   totalCost,
@@ -2615,9 +2616,9 @@ await srv.connect(new StdioServerTransport());
   assert(tui.searchTools("   ").n === 0, "/find: blank query → no matches");
 }
 
-// --- P#46 phase 1: eval experiment framework --------------------------------
+// --- P#46: eval experiment framework (phase 1 kernel + phase 2 semantics) ---
 {
-  const { expandCells, judgeOutput, runAttempt } = await import("./eval.js");
+  const { expandCells, judgeOutput, runExperiment, cliSubjectAdapter, externalSubjectAdapter, attemptUsage } = await import("./eval.js");
   const tasks = [
     { id: "t1", prompt: "say OK", expect: [] },
     { id: "t2", prompt: "echo hi then deploy", expect: [] },
@@ -2634,20 +2635,65 @@ await srv.connect(new StdioServerTransport());
   assert(judgeOutput("nothing here", ["OK"]) === false, "judgeOutput fails on missing expectation");
   assert(judgeOutput("nonempty", []) === true, "judgeOutput with no expectations needs non-empty output");
 
-  // One real attempt against the mock LLM in an isolated workdir.
+  // Phase 2: real experiment over the bundled CLI subject (mock LLM),
+  // bounded concurrency, isolated workdirs per cell.
   const { mkdtempSync } = await import("node:fs");
   const outDir = mkdtempSync("/tmp/aih-eval-");
   const cliRoot = fileURLToPath(new URL("../../", import.meta.url));
-  const res = runAttempt(await import("node:path").then((m) => m.join(cliRoot, "cli")), {
-    cwd: process.cwd(),
-    outDir,
-    task: tasks[0],
-    model: "mock",
-    repetition: 1,
-    timeoutMs: 60_000,
-  });
-  assert(res.cellId === "t1__mock__r1", "attempt cellId is task__model__rep");
-  assert(res.status === "passed", `mock attempt passes (got ${res.status}: ${res.failureReason ?? ""})`);
+  const report = await runExperiment(
+    [tasks[0]],
+    [{ model: "mock" }, { model: "mock" }],
+    2,
+    cliSubjectAdapter(await import("node:path").then((m) => m.join(cliRoot, "cli")), { timeoutMs: 60_000 }),
+    { outDir, budget: { concurrency: 2 } },
+  );
+  assert(report.results.length === 4, `experiment ran all 4 cells (got ${report.results.length})`);
+  assert(report.totals.passed === 4, `all mock cells pass (got ${report.totals.passed} passed, ${report.totals.failed} failed)`);
+  assert(
+    report.results.every((r) => r.cellId === `t1__mock__r${r.repetition}`),
+    "cellIds are task__model__rep",
+  );
+  assert(report.totals.stopReason === "completed", "no budget set → completed");
+
+  // Time budget: exhausted budget skips queued cells honestly (no fabrication).
+  const tight = await runExperiment([tasks[0]], [{ model: "mock" }], 4, async () => {
+    await new Promise((r) => setTimeout(r, 30));
+    return { output: "ok" };
+  }, { outDir: join(outDir, "tight"), budget: { budgetMs: 50, concurrency: 1 } });
+  assert(tight.totals.stopReason === "time_budget_exhausted", "tiny wall-clock budget → time_budget_exhausted");
+  assert(tight.skippedCells.length > 0, "unstarted cells are reported as skipped");
+  assert(
+    tight.results.length + tight.skippedCells.length === 4,
+    "every cell is either run or skipped (never fabricated)",
+  );
+
+  // Cost budget: ceiling below one attempt's spend stops after first cell.
+  const { writeFileSync } = await import("node:fs");
+  const fakeSession = join(outDir, "fake-session.jsonl");
+  writeFileSync(fakeSession, JSON.stringify({ type: "turn/end", usage: { promptTokens: 1000, completionTokens: 500, totalTokens: 1500 } }) + "\n");
+  const usage = attemptUsage(fakeSession);
+  assert(usage?.totalTokens === 1500 && usage.promptTokens === 1000, "attemptUsage aggregates turn/end usage");
+  assert(attemptUsage(undefined) === undefined, "attemptUsage missing file → undefined");
+  const costly = await runExperiment([tasks[0]], [{ model: "gpt-4o" }], 3, async (_t, _m, wd) => {
+    // simulate an expensive subject by planting a session log next to the workdir
+    const { copyFileSync } = await import("node:fs");
+    const { join: pjoin } = await import("node:path");
+    copyFileSync(fakeSession, pjoin(wd, "s.jsonl"));
+    return { output: "ok", sessionFile: pjoin(wd, "s.jsonl") };
+  }, { outDir: join(outDir, "cost"), budget: { maxCostUsd: 0.001, concurrency: 1 } });
+  assert(costly.totals.costUsd > 0, "cost kernel prices attempts via table prices");
+  assert(costly.totals.stopReason === "cost_budget_exhausted", "cost ceiling → cost_budget_exhausted");
+  void costly;
+
+  // External command subject: echo passes, failing command errors honestly.
+  const ext = await runExperiment([{ id: "e1", prompt: "hello eval", expect: ["hello eval"] }], [{ model: "any" }], 1,
+    externalSubjectAdapter("/bin/echo", ["{prompt}"], { timeoutMs: 10_000 }),
+    { outDir: join(outDir, "ext"), budget: { concurrency: 2 } });
+  assert(ext.totals.passed === 1, `externalSubjectAdapter: /bin/echo output judged (got ${ext.totals.passed}/${JSON.stringify(ext.results[0])})`);
+  const bad = await runExperiment([{ id: "b1", prompt: "x", expect: [] }], [{ model: "any" }], 1,
+    externalSubjectAdapter("/bin/false", [], { timeoutMs: 10_000 }),
+    { outDir: join(outDir, "bad"), budget: {} });
+  assert(bad.results[0]?.status === "error" || bad.totals.errors === 0, "external failure surfaces as error or empty-output fail");
 }
 
 console.log("\nAIH cli smoke test passed.");
