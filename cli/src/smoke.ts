@@ -336,6 +336,19 @@ assert(existsSync(".aih/sessions/s1-branch.jsonl"), "forked session file exists"
 const forkAgain = aih(["session", "fork", "s1", "s1-branch"]);
 assert(forkAgain.status === 1 && forkAgain.stderr.includes("already exists"), "fork refuses to overwrite an existing session");
 
+// --- P#37①: distill an abandoned branch into a branch_summary event ---------
+{
+  // mock mode: AIH_MOCK_AUX_TEXT feeds the distiller's tool-less call
+  const d = aih(["session", "distill-branch", "s1-branch", "s1", "--mock"], {
+    AIH_MOCK_AUX_TEXT: "- Approach A breaks on Windows paths\n- Use pnpm in this repo",
+  });
+  assert(d.status === 0 && d.stdout.includes("branch summary #"), `distill-branch appends a summary (exit ${d.status}: ${d.stderr})`);
+  const targetLog = readFileSync(".aih/sessions/s1.jsonl", "utf8");
+  assert(targetLog.includes('"branch_summary"') && targetLog.includes('"fromSession":"s1-branch"'), "target log carries a branch_summary sourced from the abandoned branch");
+  const missingTarget = aih(["session", "distill-branch", "s1-branch", "no-such-dst", "--mock"]);
+  assert(missingTarget.status === 1 && missingTarget.stderr.includes("no such session"), "distill-branch refuses a missing target session");
+}
+
 // --- F#28: checkpoint / restore (append-only rollback) ----------------------
 {
   const cp = aih(["session", "checkpoint", "s1", "before", "risky", "refactor"]);

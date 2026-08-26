@@ -206,6 +206,23 @@ export type SessionEvent =
   | {
       seq: number;
       ts: number;
+      type: "branch_summary";
+      /**
+       * P#37 — distillation of an abandoned branch: what was learned on the
+       * road not taken, injected at the fork point so the surviving branch
+       * keeps the knowledge without the token cost. Model-visible as part of
+       * the system prompt block (deriveMessages folds it in).
+       */
+      /** The source session this summary was distilled from. */
+      fromSession?: string;
+      /** Fork boundary the branch diverged at (seq in the SOURCE log). */
+      fromSeq?: number;
+      /** The distilled knowledge (≤ a few hundred words). */
+      text: string;
+    }
+  | {
+      seq: number;
+      ts: number;
       type: "app/event";
       source: string;
       payload: unknown;

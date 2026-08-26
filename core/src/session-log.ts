@@ -168,6 +168,12 @@ export class SessionLog {
 
   deriveMessages(systemPrompt?: string): ChatMessage[] {
     let compact: Extract<SessionEvent, { type: "compaction" }> | undefined;
+    // P#37 — branch summaries ride along with the projection: they carry
+    // knowledge from abandoned branches and are folded into the leading
+    // system message (never dropped, never re-summarized).
+    const branchSummaries = this.#events.filter(
+      (e): e is Extract<SessionEvent, { type: "branch_summary" }> => e.type === "branch_summary",
+    );
     for (const event of this.#events) {
       if (event.type === "compaction") {
         // MK#42: verify the coverage digest before honoring the projection.
@@ -186,11 +192,17 @@ export class SessionLog {
     // The compaction summary folds into the LEADING system message: some
     // providers (llama.cpp's Qwen3 template) raise "System message must be at
     // the beginning" for a system message anywhere after index 0.
-    const summary = compact?.summary;
+    const summaryBlock = [
+      compact?.summary ? `# Summary of the earlier conversation\n${compact.summary}` : "",
+      ...branchSummaries.map((b) => `# Lessons from an abandoned branch\n${b.text}`),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const summary = summaryBlock || undefined;
     const systemContent = summary
       ? systemPrompt
-        ? `${systemPrompt}\n\n# Summary of the earlier conversation\n${summary}`
-        : `Summary of the earlier conversation:\n${summary}`
+        ? `${systemPrompt}\n\n${summary}`
+        : summary
       : systemPrompt;
     const messages: ChatMessage[] = [];
     if (systemContent) messages.push({ role: "system", content: systemContent });

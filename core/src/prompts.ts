@@ -93,3 +93,22 @@ export function buildGoalJudgePrompt(goalCondition: string): string {
     `"reason" states what IS verified (when met) or the single most important gap (when not).`
   );
 }
+
+/**
+ * P#37① — branch distillation prompt: one tool-less LLM call turns an
+ * abandoned branch's transcript into a compact "lessons learned" block that
+ * is injected at the fork point of the surviving branch.
+ */
+export function buildBranchDistillPrompt(transcript: string): string {
+  return [
+    "The conversation below is an ABANDONED branch of a coding session (the user forked away from it).",
+    "Distill what was learned on it so a future agent on the SURVIVING branch does not repeat the dead end.",
+    "Write 3-6 short bullet points covering ONLY transferable knowledge: approaches tried and why they failed,",
+    "constraints discovered, file paths/commands that matter, and any partial progress worth keeping.",
+    "Do not narrate the story; do not include secrets or credentials; maximum ~200 words.",
+    "",
+    "<abandoned-branch>",
+    transcript,
+    "</abandoned-branch>",
+  ].join("\n");
+}

@@ -27,6 +27,7 @@ export {
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
   buildGoalJudgePrompt,
+  buildBranchDistillPrompt,
 } from "./prompts.js";
 export { OpenAICompatibleLLM, DEFAULT_RETRIES, retryBackoffMs } from "./seams/llm-openai.js";
 export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";

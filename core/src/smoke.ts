@@ -724,6 +724,44 @@ assert(
     "compaction happened before/with the re-prime",
   );
 }
+
+// --- P#37①: branch summaries ride along in the projection -------------------
+{
+  const bLog = new SessionLog();
+  bLog.append({ type: "user/message", turnId: "t1", text: "try approach A" });
+  bLog.append({ type: "assistant/message", turnId: "t1", text: "A failed", toolCalls: [] });
+  bLog.append({
+    type: "branch_summary",
+    fromSession: "dead-end",
+    fromSeq: 3,
+    text: "- Approach A breaks on Windows paths\n- Use pnpm, not npm, in this repo",
+  });
+  const derived = bLog.deriveMessages("sys");
+  assert(
+    derived[0]?.role === "system" && derived[0].content.includes("Lessons from an abandoned branch"),
+    "branch summary folds into the leading system message",
+  );
+  assert(
+    derived.some((m) => m.role === "user" && m.content === "try approach A"),
+    "branch summary does not hide the raw conversation",
+  );
+  // Coexists with a compaction projection.
+  const { coverageDigest } = await import("./session-log.js");
+  const all = bLog.all();
+  bLog.append({
+    type: "compaction",
+    turnId: "t1",
+    summary: "earlier work summarized",
+    coverage: { upToSeq: all[all.length - 1].seq, digest: coverageDigest(all) },
+  });
+  const derived2 = SessionLog.fromEvents(bLog.all().map((e) => ({ ...e }))).deriveMessages("sys");
+  assert(
+    derived2[0]?.role === "system" &&
+      derived2[0].content.includes("earlier work summarized") &&
+      derived2[0].content.includes("Lessons from an abandoned branch"),
+    "branch summary coexists with the compaction projection",
+  );
+}
 const synthLog = new SessionLog();
 synthLog.append({ type: "assistant/message", turnId: "t2", text: "orphan", toolCalls: [] });
 synthLog.append({ type: "compaction", turnId: "t2", summary: "s" });

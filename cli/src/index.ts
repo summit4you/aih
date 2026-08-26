@@ -29,6 +29,7 @@ import {
   GOAL_CONTRACT_TEMPLATE,
   TASK_CONTRACT_RULES,
   buildGoalJudgePrompt,
+  buildBranchDistillPrompt,
   toolCall,
   scanRecovery,
   describeFact,
@@ -421,6 +422,9 @@ async function readPipedStdin(): Promise<string> {
 
 export function buildLlm(flags: Record<string, string | boolean>) {
   if (bool(flags, "mock")) {
+    // AIH_MOCK_AUX_TEXT: non-empty reply for auxiliary tool-less calls (goal
+    // judge / branch distiller) in mock mode — a testing hook without a key.
+    const aux = process.env.AIH_MOCK_AUX_TEXT;
     return new MockLLM([
       {
         text: "",
@@ -428,8 +432,26 @@ export function buildLlm(flags: Record<string, string | boolean>) {
         stopReason: "tool_use",
       },
       { text: "Added via mock.", stopReason: "end_turn" },
+      ...(aux ? [{ text: aux, stopReason: "end_turn" as const }] : []),
     ]);
   }
+  return buildRealLlm(flags);
+}
+
+/**
+ * LLM for standalone AUXILIARY calls (branch distiller): one tool-less
+ * completion. In mock mode the whole script IS the aux reply (AIH_MOCK_AUX_TEXT),
+ * so a single-call consumer gets it on the first try.
+ */
+export function buildAuxLlm(flags: Record<string, string | boolean>) {
+  const aux = process.env.AIH_MOCK_AUX_TEXT;
+  if (bool(flags, "mock")) {
+    return new MockLLM([{ text: aux ?? "", stopReason: "end_turn" }]);
+  }
+  return buildRealLlm(flags);
+}
+
+function buildRealLlm(flags: Record<string, string | boolean>) {
   const resolved = resolveLlm({
     flagModel: str(flags, "model"),
     flagBaseUrl: str(flags, "base-url"),
@@ -2667,6 +2689,78 @@ function cmdSessionFork(source: string | undefined, target: string, fromSeq?: st
   );
 }
 
+/**
+ * P#37① — distill an abandoned branch into a branch_summary event appended to
+ * the target session: one tool-less LLM call over the source transcript
+ * (events after --from, capped), then the surviving session carries the
+ * lessons without the dead branch's token cost. The source file is untouched.
+ */
+async function cmdSessionDistillBranch(
+  source: string | undefined,
+  target: string,
+  fromSeq?: string,
+  flags: Record<string, string | boolean> = {},
+): Promise<void> {
+  const src = source ?? latestSessionNameOrExit();
+  const srcPath = join(SESSIONS_DIR, `${src}.jsonl`);
+  if (!existsSync(srcPath)) {
+    console.error(`error: no such session: ${src}`);
+    process.exit(1);
+  }
+  const dstPath = join(SESSIONS_DIR, `${target}.jsonl`);
+  if (!existsSync(dstPath)) {
+    console.error(`error: no such session: ${target} (the distilled summary is appended to it)`);
+    process.exit(1);
+  }
+  const from = Math.max(0, Number.parseInt(String(fromSeq), 10) || 0);
+  const events = readSessionEvents(src).filter((e) => e.seq >= from);
+  // Serialize the branch transcript for the distiller (user + assistant text
+  // and tool activity markers; tool bodies truncated — same discipline as
+  // compaction serialization).
+  const lines: string[] = [];
+  for (const e of events) {
+    if (e.type === "user/message") lines.push(`[User]: ${e.text}`);
+    else if (e.type === "assistant/message") {
+      if (e.text) lines.push(`[Assistant]: ${e.text}`);
+      for (const tc of e.toolCalls ?? []) lines.push(`[Assistant tried] ${tc.name}(${JSON.stringify(tc.args).slice(0, 200)})`);
+    } else if (e.type === "tool/result") {
+      lines.push(`[Tool result ok=${e.ok}] ${String(e.ok ? JSON.stringify(e.result) : e.error ?? "").slice(0, 300)}`);
+    }
+  }
+  if (lines.length === 0) {
+    console.error(`error: nothing to distill in ${src} (no conversation events at seq >= ${from})`);
+    process.exit(1);
+  }
+  process.stderr.write(`${dim(`distilling ${src} (${lines.length} entries, from seq ${from})…`)}\n`);
+  const llm = buildAuxLlm(flags);
+  let text: string;
+  try {
+    const resp = await llm.complete({
+      messages: [{ role: "user", content: buildBranchDistillPrompt(lines.join("\n\n").slice(0, 24_000)) }],
+      tools: [],
+    });
+    text = resp.text.trim();
+  } catch (err) {
+    console.error(`error: distiller LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (!text) {
+    console.error("error: distiller returned an empty summary — nothing recorded");
+    process.exit(1);
+  }
+  const log = SessionLog.fromEvents(readSessionEvents(target));
+  const ev = log.append({
+    type: "branch_summary",
+    ...(from > 0 ? { fromSeq: from } : {}),
+    fromSession: src,
+    text: text.slice(0, 4000),
+  });
+  saveSession(dstPath, log);
+  console.log(
+    `branch summary #${ev.seq} appended to ${target} (from ${src})\n${dim(text.slice(0, 400))}${text.length > 400 ? "…" : ""}`,
+  );
+}
+
 /** F#28: record a named checkpoint marker in a session (append-only). */
 function cmdSessionCheckpoint(name: string | undefined, note: string | undefined) {
   const src = name ?? latestSessionNameOrExit();
@@ -3551,7 +3645,14 @@ async function main() {
         }
         return cmdSessionRestore(positionals[0], positionals[1]);
       }
-      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|fork|checkpoint|restore)`);
+      if (sub === "distill-branch") {
+        if (!positionals[1]) {
+          console.error("error: usage: aih session distill-branch <abandoned-session> <target-session> [--from seq]");
+          process.exit(1);
+        }
+        return cmdSessionDistillBranch(positionals[0], positionals[1], str(flags, "from"), flags);
+      }
+      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|fork|checkpoint|restore|distill-branch)`);
       process.exit(1);
     }
     case "stats":
