@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -25,7 +25,15 @@ function wipeLocalSessions(): void {
   if (!existsSync(".aih/sessions")) return;
   const dest = `${SESSIONS_STASH_ROOT}/${Date.now()}`;
   mkdirSync(dest, { recursive: true });
-  renameSync(".aih/sessions", dest);
+  try {
+    renameSync(".aih/sessions", dest);
+  } catch (err) {
+    // EXDEV: /tmp may live on a different filesystem than the repo — fall
+    // back to copy+remove so a cross-device layout never kills the run.
+    if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+    cpSync(".aih/sessions", dest, { recursive: true });
+    rmSync(".aih/sessions", { recursive: true, force: true });
+  }
   console.error(`[smoke] stashed pre-existing .aih/sessions → ${dest}`);
 }
 
@@ -363,13 +371,21 @@ assert(noKey.status === 1 && noKey.stderr.includes("no API key"), "missing API k
       },
     }),
   );
-  const env = { AIH_API_KEY: "" };
-  const atHome = aih(["run", "hi", "--trust"], env, dir);
+  // aihClean, not aih: the dev shell exports real AIH_BASE_URL/AIH_MODEL,
+  // which would leak in and move the request off the provider's config home,
+  // breaking sameHome before the gate under test is even reached.
+  const atHome = aihClean(["run", "hi", "--trust"], { AIH_API_KEY: "" }, dir);
   assert(
     !atHome.stderr.includes("no API key"),
     "identity-header provider stays keyless on its own endpoint",
   );
-  const moved = aih(["run", "hi", "--trust"], { ...env, AIH_BASE_URL: "https://api.openai.com/v1" }, dir);
+  // Flag override (not env) to move off the provider home — a flag beats both
+  // env and layers, so the assertion holds no matter what the shell exports.
+  const moved = aihClean(
+    ["run", "hi", "--trust", "--base-url", "https://api.openai.com/v1"],
+    { AIH_API_KEY: "" },
+    dir,
+  );
   assert(
     moved.stderr.includes("no API key"),
     "URL override off the provider home re-enables the no-key gate",
@@ -483,7 +499,15 @@ assert(
   );
   // P#40: the trust gate would hide this temp dir's aih.json (it is never in
   // the user's trust store) — mark it trusted for the duration of the block.
-  const baseEnv: NodeJS.ProcessEnv = { ...process.env, AIH_TRUST_ALL_PROJECTS: "1" };
+  // AIH_HOME sandbox: the dev machine's global layer (~/.local/share/aih) may
+  // carry its own defaultProvider/providers (e.g. a local qwen endpoint);
+  // without the sandbox those leak in whenever this fixture omits the key.
+  const cwHome = mkdtempSync(join(tmpdir(), "aih-cw-home-"));
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    AIH_TRUST_ALL_PROJECTS: "1",
+    AIH_HOME: cwHome,
+  };
   const runIn = (args: string[], envOverrides: Record<string, string> = {}) => {
     const merged: NodeJS.ProcessEnv = { ...baseEnv, ...envOverrides };
     if (!("AIH_CONTEXT_WINDOW" in envOverrides)) delete merged.AIH_CONTEXT_WINDOW;
@@ -602,6 +626,7 @@ assert(
 // model catalog across providers (used by ctrl-p palette / /model picker)
 {
   const catDir = ".aih-smoke-cat";
+  const catHome = mkdtempSync(join(tmpdir(), "aih-cat-home-"));
   rmSync(catDir, { recursive: true, force: true });
   mkdirSync(catDir, { recursive: true });
   // P#40: trust gate would hide the temp dir's aih.json — trust it for this block.
@@ -624,8 +649,14 @@ assert(
   );
   const runIn = (args: string[]) => {
     // strip ambient AIH_MODEL / AIH_BASE_URL so aih.json providers decide;
-    // P#40: temp dir is never in the trust store → mark trusted for this block
-    const e: NodeJS.ProcessEnv = { ...process.env, AIH_TRUST_ALL_PROJECTS: "1" };
+    // P#40: temp dir is never in the trust store → mark trusted for this block;
+    // AIH_HOME sandbox keeps the machine's global layer (defaultProvider etc.)
+    // out of the merge — fixtures here omit keys on purpose.
+    const e: NodeJS.ProcessEnv = {
+      ...process.env,
+      AIH_TRUST_ALL_PROJECTS: "1",
+      AIH_HOME: catHome,
+    };
     delete e.AIH_MODEL;
     delete e.AIH_BASE_URL;
     return spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", cwd: catDir, env: e });
