@@ -152,34 +152,41 @@ export function lastContextTokens(
   events: readonly SessionEvent[],
   window = 0,
 ): { tokens: number; source: "usage" | "estimate" | "none" } {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i];
+  // The newest compaction is a hard cutoff: every usage sample older than it
+  // describes a conversation that no longer exists. Without this, a bigger
+  // window (e.g. switching 200k → 1M) lets a stale pre-compaction sample
+  // through the plausibility gate and the panel jumps back to the old size.
+  let cutoffSeq = -1;
+  let compaction: Extract<SessionEvent, { type: "compaction" }> | undefined;
+  for (const e of events) {
     if (e.type === "compaction") {
-      // Newest turn-boundary is a compaction: its stamp is a chars/4
-      // ESTIMATE, never provider truth. opencode parity: display values come
-      // from real usage where available; estimates are labeled as such.
-      const est = e.contextAfter ?? 0;
-      return est > 0
-        ? { tokens: est, source: "estimate" }
-        : { tokens: estimateContextTokens(events), source: "estimate" };
-    }
-    if (e.type === "turn/end") {
-      const p = e.usage?.promptTokens;
-      // Free-tier gateways report cumulative/garbage prompt_tokens (observed
-      // 28M on a ~500k-token conversation). Skip implausible values and keep
-      // walking back; when nothing sane remains, derive locally.
-      if (sanePromptTokens(p, window)) {
-        // A sane sample can still be STALE: lots of content may have accrued
-        // after that turn (tool-heavy sessions grow fast). When the local
-        // estimate clearly outgrew the sample, the estimate is the truth.
-        const est = estimateContextTokens(events);
-        return est > (p as number) * 1.25
-          ? { tokens: est, source: "estimate" }
-          : { tokens: p as number, source: "usage" };
-      }
+      cutoffSeq = e.seq;
+      compaction = e;
     }
   }
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.seq <= cutoffSeq) break;
+    if (e.type !== "turn/end") continue;
+    const p = e.usage?.promptTokens;
+    if (!sanePromptTokens(p, window)) continue;
+    // Free-tier gateways report cumulative/garbage prompt_tokens (observed
+    // 28M on a ~500k-token conversation) — handled by the gate above. A sane
+    // sample can still be STALE in the other direction (content accrued after
+    // that turn); when the local estimate clearly outgrew it, estimate wins.
+    const est = estimateContextTokens(events);
+    return est > (p as number) * 1.25
+      ? { tokens: est, source: "estimate" }
+      : { tokens: p as number, source: "usage" };
+  }
   if (events.length === 0) return { tokens: 0, source: "none" };
+  if (compaction) {
+    const stamped = compaction.contextAfter ?? 0;
+    return {
+      tokens: stamped > 0 ? stamped : estimateContextTokens(events),
+      source: "estimate",
+    };
+  }
   return { tokens: estimateContextTokens(events), source: "estimate" };
 }
 

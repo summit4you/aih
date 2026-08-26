@@ -135,6 +135,11 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   // compaction newest → stamp wins (labeled as estimate).
   const est = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000)]);
   assert(est.tokens === 12_000 && est.source === "estimate", "compaction stamp wins and is labeled estimate");
+  // …and it stays won even under a much bigger window where the stale
+  // pre-compaction sample would pass the plausibility gate (the reported
+  // "switch to x-preview → 254k" regression).
+  const bigWin = lastContextTokens([mk(0, 1, 254_098, 5), mkCompact(1, 2, 6_709)], 1_000_000);
+  assert(bigWin.tokens === 6_709 && bigWin.source === "estimate", "pre-compaction usage never survives a compaction, whatever the window");
   // newer real turn → usage wins again.
   const real = lastContextTokens([mk(0, 1, 100_000, 5), mkCompact(1, 2, 12_000), mk(2, 3, 15_000, 5)]);
   assert(real.tokens === 15_000 && real.source === "usage", "newer turn/end returns to provider-truth usage");
