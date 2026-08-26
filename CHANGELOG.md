@@ -8,7 +8,34 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
 ### Added
+- **Extension API (P#39)**: `.aih/extensions/*.mjs` modules — `registerTool`,
+  `registerCommand`, `on("tool:before" | "tool:after" | "turn:end")` handlers
+  that can cancel calls or rewrite results in place. `--no-extensions`
+  disables loading; gated by the project trust decision.
+- **Session tree (P#37)**: events carry optional parent links; `aih session
+  tree` renders the branch structure and TUI `/tree` navigates it, with fork
+  from any historical point (D#10 CLI already existed).
+- **Steering + follow-up queues (P#35)**: input typed while busy now lands
+  mid-turn (between tool batches) instead of waiting; follow-up queue drains
+  at the natural stop point.
+- **Project trust gate (P#40)**: repo-supplied extensions/skills/config stay
+  dormant until the directory is trusted; decisions persist per-path in the
+  user dir; `--trust` / `--no-trust` one-shot overrides.
+- **Eval framework phase 1 (P#46)**: Experiment → Cells → Attempts → Results
+  data model for measuring harness changes against fixed task sets.
+- **Context prune + lazy archive (MK#43)**: oversized old tool results are
+  pruned once per session start and retrievable verbatim via `archive_read`.
+- **Compaction coverage digest (MK#42)**: summaries stamp what they replace;
+  derivation verifies coverage before honoring them.
+- **Offline installer**: `scripts/offline-package` builds a self-extracting
+  POSIX `.sh` + Windows `.ps1` bundling runtime deps and a merged global
+  config (providers/models included); sandboxed install/uninstall sanity
+  tests run at build time. Uninstall never touches `$PWD/aih.json`.
+- **Cache-hit rate (#41)**: `/usage` reports prompt-cache hit rate when the
+  provider returns cached-token counts.
 - **Per-model context window (F#34)**: `providers.<name>.models[]` entries now accept
   the object form `{ "model": "<id>", "contextWindow": <n> }` (mixable with plain
   model-id strings). The model-level value overrides the provider-level
@@ -67,6 +94,37 @@ the versions listed here (`scripts/package` derives the version from
   (the expanded content, including the 32KB in-band cap), expand matched tools
   and scroll the first hit into view; `run_cmd keep_output=true` still persists
   the full uncapped output for external inspection.
+
+### Fixed
+- **Context panel truthfulness**: free-tier gateways reporting cumulative or
+  garbage `prompt_tokens` (observed 28M on a ~500k-token conversation) no
+  longer reach the display — usage samples are window-bounded, a compaction
+  is a hard provenance cutoff, and stale samples outgrown by the log fall
+  back to local estimation. `-c` resume, `/model` switch and post-compact
+  views all show the real current size.
+- **CJK-aware token estimation**: flat chars÷4 undercounted Chinese + JSON
+  sessions ~3×, hiding context overflow until providers failed; estimation
+  now weights CJK ≈1 token/char and prices assistant toolCall args.
+- **Opaque-500 overflow recovery**: near-window HTTP 4xx/5xx / transport
+  failures are treated as suspected overflow — compact then retry once
+  (free-tier gateways hide real context overflows behind generic 500s).
+- **Compaction recent-tail guarantee**: giant turns no longer collapse the
+  entire conversation into the summary; the newest user turn is kept
+  budget-truncated (with marker) plus as many whole follow-up messages as
+  fit, keeping call↔result pairing intact.
+- **LLM retries were silently disabled**: the `AIH_RETRIES` parse produced
+  `retries: 0` when unset. Default is now 6 attempts with exponential
+  backoff (400ms→8s, ±25% jitter) so provider blips ride out invisibly.
+- **question tool renders once** with the user's answer shown (`→ answer`);
+  cancelled questions render a `(no answer)` marker instead of duplicating.
+- **Session store hardening**: atomic publish via temp+rename, torn-tail
+  repair on load, and an empty log never truncates an existing session file.
+- **TUI flush row-diff**: only changed rows are written and shrinking frames
+  erase surplus lines — geometry changes no longer clear the whole screen.
+- **tool-call pairing invariant**: length-truncated responses fail their
+  tool calls synthetically ("arguments may be truncated; re-issue") and
+  aborted batches pair skipped calls with cancelled results.
+- **steering while busy** lands mid-turn instead of waiting for turn end.
 
 ## [0.2.0]
 

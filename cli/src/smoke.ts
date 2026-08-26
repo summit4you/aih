@@ -190,10 +190,13 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   assert(Object.keys(DEFAULT_PRICES).length >= 10, "built-in price table has entries");
 }
 
+// Version assertions read the constant from the module (never hardcode —
+// release bumps used to break the smoke suite).
+const { VERSION } = await import("./index.js");
 const version = aih(["--version"]);
-assert(version.stdout.trim() === "0.2.0", "--version prints version");
+assert(version.stdout.trim() === VERSION, "--version prints version");
 const versionCmd = aih(["version"]);
-assert(versionCmd.stdout.trim() === "0.2.0", "version command prints version");
+assert(versionCmd.stdout.trim() === VERSION, "version command prints version");
 
 const help = aih([]);
 assert(help.status === 1 && help.stdout.includes("Usage:"), "no command prints help and exits 1");

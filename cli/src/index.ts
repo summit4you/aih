@@ -149,7 +149,7 @@ import {
   runWorkflow,
 } from "./workflow.js";
 
-const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
