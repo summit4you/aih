@@ -622,26 +622,46 @@ export class AgentLoop {
 
   // Context size if `compact` were the newest compaction event — same
   // projection deriveMessages applies, without mutating the log.
-  #estimateContextWith(compact: { summary?: string; recent?: ChatMessage[] } | undefined): number {
-    const messages = this.#log.deriveMessages(this.#systemPrompt);
-    // P#36-fix: estimate the FUTURE projection cleanly — system prompt with
-    // the NEW summary, plus only the events AFTER the compaction point.
-    // The previous delta-math double-counted the recent tail (deriveMessages
-    // already includes it AND we added compact.recent again), which inflated
-    // the stamped contextAfter on long sessions (observed 15M+).
-    const prevLen = this.#lastCompaction()
-      ? `# Summary of the earlier conversation\n${this.#lastCompaction()!.summary}`.length
-      : 0;
-    const nextHeaderLen = compact?.summary
-      ? `# Summary of the earlier conversation\n${compact.summary}`.length
-      : 0;
-    const sum = (m: { content: string; toolCalls?: unknown[] }) =>
-      m.content.length + (m.toolCalls?.length ?? 0) * 32;
-    const systemMsg = messages[0]?.role === "system" ? messages[0] : undefined;
-    const rest = systemMsg ? messages.slice(1) : messages;
-    let chars = nextHeaderLen + rest.reduce((n, m) => n + sum(m), 0);
-    if (systemMsg && !nextHeaderLen) chars += systemMsg.content.length; // no summary: keep original system
-    else if (systemMsg) chars += Math.max(0, systemMsg.content.length - prevLen); // swap old summary for new
+  #estimateContextWith(compact: { summary?: string; recent?: ChatMessage[]; upToSeq?: number } | undefined): number {
+    // Simulate the post-append projection directly from the event list:
+    // system (with the NEW summary) + every event after this compaction's
+    // coverage cutoff, replayed verbatim. This mirrors deriveMessages's
+    // projection exactly and avoids the previous delta-math, which derived
+    // from the PRE-append projection (still containing the full tail being
+    // compacted away) and inflated the stamped contextAfter on big sessions.
+    const summary = compact?.summary?.trim();
+    const header = summary ? `# Summary of the earlier conversation\n${summary}` : "";
+    const systemContent = this.#systemPrompt
+      ? header
+        ? `${this.#systemPrompt}\n\n${header}`
+        : this.#systemPrompt
+      : header;
+    let chars = systemContent.length;
+    const cutoff = compact?.upToSeq ?? -1;
+    const sum = (m: string) => m.length;
+    for (const e of this.#log.all()) {
+      if (e.seq <= cutoff) continue;
+      switch (e.type) {
+        case "user/message":
+          chars += sum(e.text);
+          break;
+        case "assistant/message":
+          chars += sum(e.text) + (e.toolCalls ?? []).reduce((n, tc) => n + `${tc.name} ${JSON.stringify(tc.args ?? {})}`.length, 0);
+          break;
+        case "tool/call":
+          chars += `${e.name} ${JSON.stringify(e.args ?? {})}`.length;
+          break;
+        case "tool/result": {
+          const call = this.#log.all().find((c) => c.type === "tool/call" && c.callId === e.callId);
+          if (call && call.seq >= cutoff) {
+            chars += JSON.stringify(e.ok ? e.result : { error: e.error }).length;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
     return Math.max(1, Math.round(chars / 4));
   }
 
@@ -875,7 +895,7 @@ export class AgentLoop {
   #compactOrSkip(
     turnId: string,
   ): Promise<{ usage: TokenUsage | undefined; applied: boolean }> {
-    return this.#compact(turnId).catch((err) => {
+    return this.#compact(turnId, { trigger: "auto" }).catch((err) => {
       // Auto-compaction must never be a silent no-op: a skipped compact on a
       // bloated session snowballs into minute-long model responses. One
       // stderr line keeps the failure diagnosable without a debug flag.
@@ -949,7 +969,11 @@ export class AgentLoop {
       // message list AFTER the append below — computed from the summary text
       // + tail we are about to persist). UI/resume read this instead of the
       // stale pre-compaction turn/end usage.
-      contextAfter: this.#estimateContextWith({ ...this.#lastCompaction(), summary: text.slice(0, 12000), recent: recent.length > 0 ? recent : undefined }),
+      contextAfter: this.#estimateContextWith({
+        summary: text.slice(0, 12000),
+        recent: recent.length > 0 ? recent : undefined,
+        upToSeq: coverage.upToSeq,
+      }),
     });
     return { usage, applied: true };
   }

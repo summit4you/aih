@@ -1709,6 +1709,16 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     return "";
   };
+  // Refresh the live context gauge on every event that changes context size
+  // (tool result, compaction, turn end) so the panel reflects each append, not
+  // just turn-completion. Cheap: lastContextTokens scans in reverse and short-
+  // circuits on the newest sane sample.
+  const refreshContextGauge = (): void => {
+    usedTokens = lastContextTokens(log.all(), resolveContextWindow(flags)).tokens;
+    if (usedTokens > peakTokens) peakTokens = usedTokens;
+    tui.requestPaint();
+  };
+
   log.subscribe((event: SessionEvent) => {
     // Per-event durability: a long-running turn no longer lives only in
     // memory — every event is appended to the session file as it happens.
@@ -1718,6 +1728,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       } catch {
         /* disk hiccup: per-turn save + exit save still cover us */
       }
+    }
+    if (
+      event.type === "tool/result" ||
+      event.type === "compaction" ||
+      event.type === "turn/end"
+    ) {
+      refreshContextGauge();
     }
     if (event.type === "tool/call") {
       if (event.name === "question") {
