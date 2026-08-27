@@ -79,6 +79,7 @@ import {
   fmtTps,
   cacheHitRate,
   cacheTtlWaste,
+  estimateContextTokens,
   lastContextTokens,
   resolvePrice,
   sanePromptTokens,
@@ -1356,9 +1357,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // turn so `-c`/`--session` resume shows the real context immediately instead
   // of 0 (opencode/mimo derive this from the restored history on resume).
   // Window-bounded so garbage provider usage (28M-token prompts) is skipped
-  // in favor of the local estimate.
-  const seedCtx = lastContextTokens(log.all(), resolveContextWindow(flags));
-  let usedTokens = seedCtx.tokens;
+  // in favor of the local estimate. Seed from the live estimate so the panel
+  // matches what would actually be sent (tool outputs truncated) — a stale
+  // provider sample from an old turn would pin the panel instead.
+  let usedTokens = estimateContextTokens(log.all());
   let peakTokens = usedTokens;
 
   const sessionName = sessionPath
@@ -1573,11 +1575,12 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     ],
     ctxUsage: () => {
       try {
+        const win = resolveContextWindow(flags);
         const trend = log
           .all()
           .filter((e) => e.type === "turn/end")
           .map((e) => (e.type === "turn/end" ? (e.usage?.promptTokens ?? 0) : 0))
-          .filter((n) => n > 0)
+          .filter((n) => sanePromptTokens(n, win))
           .slice(-8);
         // F#30: cost + throughput (only when the model has a price table entry)
         const price = currentPrice();
@@ -1585,8 +1588,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         // P#41: cache hit rate (undefined when the provider never reports it)
         const chr = cacheHitRate(log.all());
         return {
-          used: lastContextTokens(log.all(), resolveContextWindow(flags)).tokens,
-          limit: resolveContextWindow(flags),
+          used: usedTokens,
+          limit: win,
           trend,
           ...(chr !== undefined ? { cacheRate: chr } : {}),
           ...(price && usage.totalTokens > 0
@@ -1711,10 +1714,12 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   };
   // Refresh the live context gauge on every event that changes context size
   // (tool result, compaction, turn end) so the panel reflects each append, not
-  // just turn-completion. Cheap: lastContextTokens scans in reverse and short-
-  // circuits on the newest sane sample.
+  // just turn-completion. Uses the live estimate (what deriveMessages would
+  // actually send) rather than lastContextTokens, which pins the panel to a
+  // stale provider sample from the newest sane turn/end — it never moves while
+  // a turn is in flight.
   const refreshContextGauge = (): void => {
-    usedTokens = lastContextTokens(log.all(), resolveContextWindow(flags)).tokens;
+    usedTokens = estimateContextTokens(log.all());
     if (usedTokens > peakTokens) peakTokens = usedTokens;
     tui.requestPaint();
   };
