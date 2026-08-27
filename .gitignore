@@ -6,6 +6,7 @@ dist-release/
 
 # 本地运行/会话数据（provider 端点、密钥、窗口配置不入库）
 .aih/
+archives/
 start.sh
 aih.json
 
