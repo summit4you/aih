@@ -2745,11 +2745,28 @@ function cmdSessionRm(names: string[]) {
     console.error("error: session rm needs a name (or --all)");
     process.exit(1);
   }
-  for (const name of names) {
+  let missing = 0;
+  for (const raw of names) {
+    const name = raw.replace(/\.jsonl$/i, "");
+    // Guard: a session name must be a bare id — never a path. A shell glob
+    // (`aih session rm *`) expands to every file in the CWD; feeding those
+    // into join() could reach outside the sessions dir or silently "remove"
+    // names that were never sessions.
+    if (!name || /[/\\]/.test(name) || name === "." || name === "..") {
+      console.error(`error: "${raw}" is not a valid session name`);
+      missing += 1;
+      continue;
+    }
     const path = join(SESSIONS_DIR, `${name}.jsonl`);
+    if (!existsSync(path)) {
+      console.error(`error: no such session "${raw}"`);
+      missing += 1;
+      continue;
+    }
     rmSync(path, { force: true });
     console.log(`${dim("removed")} ${name}`);
   }
+  if (missing > 0) process.exitCode = 1;
 }
 
 function cmdSessionFork(source: string | undefined, target: string, fromSeq?: string): void {

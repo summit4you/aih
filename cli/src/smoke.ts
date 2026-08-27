@@ -454,6 +454,22 @@ assert(exportJson.status === 0 && JSON.parse(exportJson.stdout).length > 0, "ses
   assert(noFile.status === 1 && noFile.stderr.includes("no such file"), "session import errors on a missing file");
 }
 
+// --- session rm hardening: never claim removal of non-sessions / traverse ---
+{
+  // A shell glob (`session rm *`) expands to every file in the CWD; none of
+  // these are sessions. rm must error (exit 1) instead of printing "removed".
+  const fake = aih(["session", "rm", "AGENTS.md", "aih.json", "not-a-session"]);
+  assert(fake.status === 1 && fake.stderr.includes('no such session "AGENTS.md"'), "session rm errors on a non-session name instead of fake 'removed'");
+  assert(!fake.stdout.includes("removed AGENTS.md"), "session rm never claims to remove a non-session");
+  const trav = aih(["session", "rm", "../evil", "a/../b"]);
+  assert(trav.status === 1 && trav.stderr.includes("not a valid session name"), "session rm rejects path-traversal names");
+  const realRm = aih(["session", "fork", "s1", "s1-rm-me"]);
+  assert(realRm.status === 0, "fork a session to remove");
+  const rmIt = aih(["session", "rm", "s1-rm-me"]);
+  assert(rmIt.status === 0 && rmIt.stdout.includes("removed s1-rm-me"), "session rm still removes a real session");
+  assert(!existsSync(".aih/sessions/s1-rm-me.jsonl"), "session rm deletes the file for a real session");
+}
+
 const stats = aih(["stats"]);
 assert(stats.status === 0, "stats command runs");
 assert(stats.stdout.includes("(no usage recorded yet)"), "stats reports when no usage recorded");
