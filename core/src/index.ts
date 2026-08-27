@@ -1,4 +1,4 @@
-export { SessionLog } from "./session-log.js";
+export { SessionLog, TOOL_OUTPUT_MAX_CHARS, truncateToolOutput } from "./session-log.js";
 export type { SessionListener, SessionEventInput } from "./session-log.js";
 export {
   classifyToolFacts,

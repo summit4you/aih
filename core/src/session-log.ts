@@ -1,6 +1,16 @@
 import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
 import { createHash } from "node:crypto";
 
+// Tool outputs exceeding this are truncated before being sent to the LLM.
+// Matches opencode's TOOL_OUTPUT_MAX_CHARS; must stay in sync with cost.ts.
+export const TOOL_OUTPUT_MAX_CHARS = 2_000;
+
+export function truncateToolOutput(value: string): string {
+  return value.length <= TOOL_OUTPUT_MAX_CHARS
+    ? value
+    : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`;
+}
+
 /**
  * MK#42 — stable digest over an ordered event prefix. Compaction summaries
  * carry this so consumers can verify that the projection still corresponds
@@ -230,13 +240,14 @@ export class SessionLog {
             // MK#43: pruned results project the placeholder instead of the
             // full body (the original stays in the log).
             const prunedBody = this.#pruned.get(event.callId);
+            const raw =
+              prunedBody ??
+              JSON.stringify(event.ok ? event.result : { error: event.error });
             messages.push({
               role: "tool",
               toolCallId: event.callId,
               name: call.name,
-              content:
-                prunedBody ??
-                JSON.stringify(event.ok ? event.result : { error: event.error }),
+              content: truncateToolOutput(raw),
             });
           }
           break;

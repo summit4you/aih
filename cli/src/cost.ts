@@ -10,7 +10,7 @@
  * without a live LLM (the mock LLM does not report usage).
  */
 import type { SessionEvent, TokenUsage } from "@aih/core";
-import { estimateTokensText } from "@aih/core";
+import { estimateTokensText, truncateToolOutput } from "@aih/core";
 import { MODEL_METADATA } from "./model-metadata.js";
 
 export interface ModelPrice {
@@ -221,7 +221,7 @@ export function estimateContextTokens(events: readonly SessionEvent[]): number {
         tokens += estimateTokensText(`${e.name} ${JSON.stringify(e.args ?? {})}`);
         break;
       case "tool/result":
-        tokens += estimateTokensText(JSON.stringify(e.result ?? e.error ?? ""));
+        tokens += estimateTokensText(truncateToolOutput(JSON.stringify(e.result ?? e.error ?? "")));
         break;
       default:
         break;
