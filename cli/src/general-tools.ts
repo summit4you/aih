@@ -452,7 +452,7 @@ export function registerGeneralTools(
 
   reg({
     name: "websearch",
-    description: "Web search (DuckDuckGo); returns titles, URLs and snippets.",
+    description: "Web search (Parallel MCP); returns titles, URLs and snippets.",
     kind: "read",
     permission: "allow",
     parameters: {
@@ -468,25 +468,60 @@ export function registerGeneralTools(
       const query = String(a.query ?? "");
       if (!query) throw new Error("query is required");
       const max = Math.min(20, Math.max(1, Number(a.max_results ?? 8) || 8));
-      const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+
+      const body = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "web_search",
+          arguments: {
+            objective: query,
+            search_queries: [query],
+          },
+        },
+      });
+
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20_000);
+      const timer = setTimeout(() => controller.abort(), 25_000);
       let res: Response;
       try {
-        res = await fetch(endpoint, { signal: controller.signal, headers: { "user-agent": "Mozilla/5.0 (aih websearch)" } });
+        res = await fetch("https://search.parallel.ai/mcp", {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "User-Agent": "aih/0.2",
+          },
+          body,
+        });
       } finally {
         clearTimeout(timer);
       }
       if (!res.ok) throw new Error(`websearch failed: HTTP ${res.status}`);
-      const html = await res.text();
-      const links = [...html.matchAll(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
-      const snippets = [...html.matchAll(/<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => stripTags(m[1]).trim());
-      const results = links.slice(0, max).map((m, i) => {
-        let href = decodeEntities(m[1]);
-        const uddg = /uddg=([^&]+)/.exec(href);
-        if (uddg) href = decodeURIComponent(uddg[1]);
-        return { title: stripTags(m[2]).trim(), url: href, snippet: snippets[i] ?? "" };
-      });
+
+      const raw = await res.text();
+      // MCP responses may be SSE (data: ...) or plain JSON
+      let json: any;
+      for (const line of raw.split("\n")) {
+        const trimmed = line.startsWith("data: ") ? line.slice(6).trim() : line.trim();
+        if (!trimmed.startsWith("{")) continue;
+        try { json = JSON.parse(trimmed); break; } catch { /* continue */ }
+      }
+      if (!json?.result?.content) throw new Error("websearch: invalid MCP response");
+
+      const text = json.result.content.find((c: any) => c.type === "text")?.text;
+      if (!text) throw new Error("websearch: no text in MCP response");
+
+      let parsed: any;
+      try { parsed = JSON.parse(text); } catch { throw new Error("websearch: failed to parse search results"); }
+
+      const results = (parsed.results ?? []).slice(0, max).map((r: any) => ({
+        title: r.title ?? "",
+        url: r.url ?? "",
+        snippet: (r.excerpts ?? [])[0] ?? "",
+      }));
       if (!results.length) throw new Error("no results (the search endpoint may be unavailable; try webfetch on a known URL)");
       return { query, count: results.length, results };
     },
