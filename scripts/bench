@@ -3,13 +3,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-KEY="${AIH_API_KEY:?set AIH_API_KEY}"
+KEY="${AIH_API_KEY:-}" # may be empty: zen free tier authenticates via client identity headers, keyless works (empty must NOT be exported, or the CLI sends an invalid Bearer)
 MODEL="${AIH_MODEL:-deepseek-v4-flash}"
 BASE_URL="${AIH_BASE_URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 RUNS="${BENCH_RUNS:-3}"
 WITH_OPENCODE="${BENCH_WITH_OPENCODE:-1}"
 
-export AIH_API_KEY="$KEY" AIH_MODEL="$MODEL" AIH_BASE_URL="$BASE_URL"
+# Export the key only when non-empty — an empty exported AIH_API_KEY makes the
+# CLI send `Authorization: Bearer ` and zen answers 401 AuthError; keyless
+# (unset) is the working free-tier path.
+if [ -n "$KEY" ]; then
+  export AIH_API_KEY="$KEY"
+fi
+export AIH_MODEL="$MODEL" AIH_BASE_URL="$BASE_URL"
 AIH_CLI=(node cli/dist/index.js)
 RES=".aih/bench.tsv"
 OUT=".aih/bench.last.out"

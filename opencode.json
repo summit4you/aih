@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "opencode": {
+      "npmjs": "@ai-sdk/openai-compatible",
+      "name": "opencode zen (keyless free tier)",
+      "options": { "baseURL": "https://opencode.ai/zen/v1" },
+      "models": { "big-pickle": {} }
+    }
+  },
+  "model": "opencode/big-pickle"
+}

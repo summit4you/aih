@@ -31,6 +31,8 @@ export {
 } from "./prompts.js";
 export { OpenAICompatibleLLM, DEFAULT_RETRIES, retryBackoffMs } from "./seams/llm-openai.js";
 export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
+export { consumeSSEStream, classifyProviderError, parseFrame } from "./seams/llm-sse.js";
+export type { StreamAccumulator, ParseOptions, ProviderErrorClass } from "./seams/llm-sse.js";
 export {
   AutoApprove,
   DenyAll,

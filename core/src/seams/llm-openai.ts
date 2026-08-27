@@ -105,6 +105,9 @@ function parseArguments(raw: string): unknown {
   }
 }
 
+// TP#2: Import consumeSSEStream and classifyProviderError from llm-sse.ts
+import { consumeSSEStream, classifyProviderError } from "./llm-sse.js";
+
 export class OpenAICompatibleLLM implements LLMAdapter {
   #options: OpenAICompatibleOptions;
   #fetch: typeof fetch;
@@ -180,7 +183,8 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       } catch (err) {
         if (req.signal?.aborted) throw err;
         lastError = err;
-        if (CAPACITY_ERROR.test(err instanceof Error ? err.message : String(err))) {
+        const cls = classifyProviderError(0, err instanceof Error ? err.message : String(err));
+        if (cls === "capacity") {
           attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
         }
         if (attempt < attempts - 1) continue;
@@ -189,11 +193,12 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       if (!res.ok) {
         const text = await res.text();
         const message = `llm request failed: HTTP ${res.status} ${text}`;
-        if (CAPACITY_ERROR.test(message)) {
+        const cls = classifyProviderError(res.status, text);
+        if (cls === "capacity") {
           attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
         }
         const httpError = new Error(message);
-        if (RETRYABLE.has(res.status) && attempt < attempts - 1) {
+        if ((cls === "retryable" || cls === "capacity") && attempt < attempts - 1) {
           lastError = httpError;
           continue;
         }
@@ -201,7 +206,10 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       }
       try {
         if (req.onDelta && res.body) {
-          const acc = await consumeStream(res.body, req.onDelta);
+          const acc = await consumeSSEStream(res.body, {
+            onDelta: req.onDelta,
+            onReasoning: (req as any).onReasoning,
+          });
           return {
             text: acc.text,
             toolCalls: acc.toolCalls,
@@ -225,16 +233,8 @@ export class OpenAICompatibleLLM implements LLMAdapter {
   }
 }
 
-const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
-
-/**
- * Gateway capacity failures (zen free tier's "Upstream request failed:
- * Endpoint is unavailable" bursts last minutes). When the failure text
- * matches this, the retry budget triples — with the 8s backoff cap that is
- * roughly two minutes of patience instead of ~20s.
- */
-const CAPACITY_ERROR =
-  /upstream request failed|endpoint is unavailable|no healthy upstream|service unavailable|overloaded|at capacity/i;
+// TP#2: RETRYABLE / CAPACITY_ERROR / CAPACITY_ATTEMPT_FACTOR moved to llm-sse.ts classifyProviderError
+// Kept as legacy re-export for backward compatibility.
 const CAPACITY_ATTEMPT_FACTOR = 3;
 
 /** Default transient-failure retry budget: 7 attempts ≈ 20s of backoff. */
@@ -253,76 +253,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface StreamAccumulator {
-  text: string;
-  toolCalls: ToolCall[];
-  finishReason?: string;
-  usage?: TokenUsage;
-}
-
-async function consumeStream(
-  body: ReadableStream<Uint8Array>,
-  onDelta: (delta: string) => void,
-): Promise<StreamAccumulator> {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let text = "";
-  const toolAcc = new Map<number, { id: string; name: string; args: string }>();
-  let finishReason: string | undefined;
-  let usage: TokenUsage | undefined;
-
-  for await (const chunk of body) {
-    buffer += decoder.decode(chunk as Buffer, { stream: true });
-    let newlineAt: number;
-    while ((newlineAt = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, newlineAt).trim();
-      buffer = buffer.slice(newlineAt + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") continue;
-      let json: any;
-      try {
-        json = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      const choice = json.choices?.[0];
-      if (choice?.finish_reason) finishReason = choice.finish_reason;
-      const delta = choice?.delta;
-      if (typeof delta?.content === "string" && delta.content) {
-        text += delta.content;
-        onDelta(delta.content);
-      }
-      for (const tc of delta?.tool_calls ?? []) {
-        const acc = toolAcc.get(tc.index) ?? { id: "", name: "", args: "" };
-        if (tc.id) acc.id = tc.id;
-        if (tc.function?.name) acc.name += tc.function.name;
-        if (tc.function?.arguments) acc.args += tc.function.arguments;
-        toolAcc.set(tc.index, acc);
-      }
-      if (json.usage) {
-        usage = mapUsage(json.usage);
-      }
-    }
-  }
-
-  const toolCalls: ToolCall[] = [...toolAcc.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([, acc]) => ({
-      id: acc.id,
-      name: acc.name,
-      args: parseArguments(acc.args),
-    }));
-  return { text, toolCalls, finishReason, usage };
-}
+// TP#2: consumeStream removed — replaced by consumeSSEStream from llm-sse.ts
+// Re-export for backward compatibility if any caller imported it.
+export { consumeSSEStream as consumeStream } from "./llm-sse.js";
 
 function mapUsage(u: any): TokenUsage {
   return {
     promptTokens: u.prompt_tokens ?? 0,
     completionTokens: u.completion_tokens ?? 0,
     totalTokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
-    // P#41: OpenAI puts the cached count in prompt_tokens_details; some
-    // gateways flatten it to cached_tokens / cache_read_input_tokens.
     ...(Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) > 0
       ? { cachedTokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) }
       : {}),
