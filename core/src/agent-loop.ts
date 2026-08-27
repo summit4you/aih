@@ -268,6 +268,24 @@ export class AgentLoop {
 
     while (steps < this.#maxSteps && !ac.signal.aborted) {
       steps += 1;
+      // Pre-flight compact: if context is already above the threshold before
+      // the first LLM call, compact now. This prevents sending oversized
+      // prompts that cause provider 503/timeout (observed when context is
+      // ~160K and the compact check only runs after the LLM response).
+      if (steps === 1) {
+        const preCtx = this.#estimateContext();
+        if (
+          this.#contextWindow > 0 &&
+          preCtx >= Math.min(
+            this.#compactAt * this.#contextWindow,
+            this.#contextWindow - this.#compactReserve(),
+          )
+        ) {
+          const c = await this.#compactOrSkip(turnId);
+          if (c.usage) usage = addUsage(usage, c.usage);
+          if (c.applied) contextNow = this.#estimateContext();
+        }
+      }
       const isLastStep = Number.isFinite(this.#maxSteps) && steps >= this.#maxSteps;
       const buildInput = (): ChatMessage[] => {
         const base = this.#log.deriveMessages(this.#systemPrompt);
