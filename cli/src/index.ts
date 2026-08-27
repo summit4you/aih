@@ -1585,7 +1585,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         // P#41: cache hit rate (undefined when the provider never reports it)
         const chr = cacheHitRate(log.all());
         return {
-          used: usedTokens,
+          used: lastContextTokens(log.all(), resolveContextWindow(flags)).tokens,
           limit: resolveContextWindow(flags),
           trend,
           ...(chr !== undefined ? { cacheRate: chr } : {}),
