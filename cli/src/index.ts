@@ -167,8 +167,9 @@ Usage:
   aih chat                        interactive terminal session
   aih tools                       list tools exposed by the app server
   aih describe                    print the app descriptor
-  aih session <list|show|rm|export|fork> [args]
-                               fork: aih session fork [source] <target> [--from seq]
+aih session <list|show|rm|export|import|fork> [args]
+                                fork: aih session fork [source] <target> [--from seq]
+                                import: aih session import <file.jsonl|file.json> [target]
   aih stats                       token usage across saved sessions
   aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
                                Agent Teams: roster + task board + mailbox (D#15)
@@ -2931,6 +2932,96 @@ function cmdSessionExport(name: string, outFile: string | undefined) {
   }
 }
 
+/**
+ * Import events from a JSONL (one JSON object per line) or a pretty-printed
+ * JSON array into a NEW saved session. Counterpart of `export`. Accepts both
+ * the raw session-file format (NDJSON) and the pretty `JSON.stringify(…, 2)`
+ * array that `session export` writes to a file. Events are re-sequenced to
+ * start at 0 and stamped with the newest ts so the imported history replays
+ * cleanly and is comparable with a freshly forked session.
+ */
+function cmdSessionImport(file: string, targetArg: string | undefined): void {
+  if (!existsSync(file)) {
+    console.error(`error: no such file: ${file}`);
+    process.exit(1);
+  }
+  const raw = readFileSync(file, "utf8");
+  let events: SessionEvent[];
+  try {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[")) {
+      // Pretty JSON array (what `session export` writes to a file).
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) throw new Error("not an array");
+      events = parsed as SessionEvent[];
+    } else {
+      // NDJSON: one JSON object per line (raw session-file format).
+      events = trimmed
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as SessionEvent);
+    }
+  } catch (err) {
+    console.error(
+      `error: could not parse ${file} as JSONL or JSON array: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    process.exit(1);
+  }
+  if (events.length === 0) {
+    console.error(`error: no events found in ${file}`);
+    process.exit(1);
+  }
+  for (const e of events) {
+    if (!e || typeof e.type !== "string" || typeof e.seq !== "number" || typeof e.ts !== "number") {
+      console.error(
+        `error: ${file} contains a malformed event (expected {seq, ts, type, …}): ${JSON.stringify(e)?.slice(0, 120)}`,
+      );
+      process.exit(1);
+    }
+    // Minimal per-type field check: conversation events must carry turnId so
+    // deriveMessages can replay them; a bare {seq,ts,type} would silently
+    // corrupt the session on resume.
+    const needsTurnId =
+      e.type === "turn/start" ||
+      e.type === "user/message" ||
+      e.type === "assistant/message" ||
+      e.type === "tool/call" ||
+      e.type === "tool/result";
+    if (needsTurnId && typeof (e as { turnId?: unknown }).turnId !== "string") {
+      console.error(
+        `error: ${file} event #${e.seq} (type ${e.type}) is missing its turnId`,
+      );
+      process.exit(1);
+    }
+    if (e.type === "user/message" && typeof (e as { text?: unknown }).text !== "string") {
+      console.error(`error: ${file} user/message event #${e.seq} is missing its text`);
+      process.exit(1);
+    }
+  }
+  const target = (targetArg ?? basename(file))
+    .replace(/\.(jsonl|json)$/i, "")
+    .trim();
+  if (!target) {
+    console.error("error: could not derive a session name from the file; pass <target> explicitly");
+    process.exit(1);
+  }
+  const dstPath = join(SESSIONS_DIR, `${target}.jsonl`);
+  if (existsSync(dstPath)) {
+    console.error(`error: session already exists: ${target} (rm it first)`);
+    process.exit(1);
+  }
+  // Re-sequence so seq runs 0..n-1 (imported files may carry arbitrary seqs),
+  // and stamp the newest ts so the session sorts as "recent".
+  const newestTs = Math.max(...events.map((e) => e.ts));
+  const renumbered = events.map((e, i) => ({ ...e, seq: i, ts: e.ts || newestTs }));
+  const log = SessionLog.fromEvents(renumbered);
+  saveSession(dstPath, log);
+  console.log(
+    `imported ${events.length} events from ${file} → ${target} (${dim(`.aih/sessions/${target}.jsonl`)})\n` +
+      `resume with: aih chat --session ${target}`,
+  );
+}
+
 function cmdStats() {
   let turns = 0;
   let prompt = 0;
@@ -3714,6 +3805,13 @@ async function main() {
           positionals[1],
         );
       }
+      if (sub === "import") {
+        if (!positionals[0]) {
+          console.error("error: usage: aih session import <file.jsonl|file.json> [target]");
+          process.exit(1);
+        }
+        return cmdSessionImport(positionals[0], positionals[1]);
+      }
       if (sub === "fork") {
         if (!positionals[1]) {
           console.error("error: usage: aih session fork [source] <target> [--from seq]");
@@ -3741,7 +3839,7 @@ async function main() {
         }
         return cmdSessionDistillBranch(positionals[0], positionals[1], str(flags, "from"), flags);
       }
-      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|fork|checkpoint|restore|distill-branch)`);
+      console.error(`error: unknown session subcommand "${sub}" (list|show|rm|export|import|fork|checkpoint|restore|distill-branch)`);
       process.exit(1);
     }
     case "stats":

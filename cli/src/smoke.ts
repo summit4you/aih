@@ -426,6 +426,34 @@ assert(show.status === 0 && show.stdout.includes("first prompt alpha"), "session
 const exportJson = aih(["session", "export", "s1"]);
 assert(exportJson.status === 0 && JSON.parse(exportJson.stdout).length > 0, "session export emits JSON events");
 
+// --- session import: JSON array (export format) and NDJSON (raw file) -------
+{
+  const tmpD = mkdtempSync(join(tmpdir(), "aih-import-"));
+  const expFile = join(tmpD, "s1-export.json");
+  const exp = aih(["session", "export", "s1", expFile]);
+  assert(exp.status === 0 && existsSync(expFile), "session export writes a JSON file");
+  const imp = aih(["session", "import", expFile, "s1-imported"]);
+  assert(imp.status === 0 && imp.stdout.includes("imported") && imp.stdout.includes("s1-imported"), `session import accepts the exported JSON array (exit ${imp.status}: ${imp.stderr})`);
+  const impList = aih(["sessions"]);
+  assert(impList.stdout.includes("s1-imported"), "imported session appears in the list");
+  const impShow = aih(["session", "show", "s1-imported"]);
+  assert(impShow.status === 0 && impShow.stdout.includes("first prompt alpha"), "imported session replays its transcript");
+  const impDup = aih(["session", "import", expFile, "s1-imported"]);
+  assert(impDup.status === 1 && impDup.stderr.includes("already exists"), "session import refuses to overwrite an existing session");
+
+  const raw = join(tmpD, "s1-raw.jsonl");
+  writeFileSync(raw, readFileSync(sessionFile, "utf8"), "utf8");
+  const impRaw = aih(["session", "import", raw, "s1-imported-raw"]);
+  assert(impRaw.status === 0 && impRaw.stdout.includes("s1-imported-raw"), "session import accepts the raw NDJSON session file");
+
+  const bad = join(tmpD, "bad.jsonl");
+  writeFileSync(bad, '{"seq":0,"ts":123,"type":"user/message"}\n', "utf8");
+  const impBad = aih(["session", "import", bad, "s1-imported-bad"]);
+  assert(impBad.status === 1 && impBad.stderr.includes("missing its turnId"), "session import rejects malformed events");
+  const noFile = aih(["session", "import", join(tmpD, "nope.jsonl"), "s1-imported-nope"]);
+  assert(noFile.status === 1 && noFile.stderr.includes("no such file"), "session import errors on a missing file");
+}
+
 const stats = aih(["stats"]);
 assert(stats.status === 0, "stats command runs");
 assert(stats.stdout.includes("(no usage recorded yet)"), "stats reports when no usage recorded");
