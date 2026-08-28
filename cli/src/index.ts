@@ -487,7 +487,7 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
     resolved.baseUrl.value !== undefined &&
     resolved.baseUrl.value.replace(/\/+$/, "") === providerHome.replace(/\/+$/, "");
   const headerExempt = Object.keys(resolved.headers).length > 0 && sameHome;
-  if (!apiKey && !headerExempt && !isLocalEndpoint(resolved.baseUrl.value)) {
+  if (!apiKey && !resolved.keyless && !headerExempt && !isLocalEndpoint(resolved.baseUrl.value)) {
     throw new Error(
       `no API key for provider "${resolved.provider ?? "custom"}". Set ${resolved.apiKeyEnv} (or AIH_API_KEY), pass --api-key, or use --mock for an offline demo.`,
     );
@@ -503,6 +503,7 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
     baseUrl: resolved.baseUrl.value ?? "https://api.openai.com/v1",
     apiKey,
     model: resolved.model.value,
+    ...(resolved.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     ...(retries !== undefined ? { retries } : {}),
     ...(Object.keys(resolved.headers).length > 0 ? { headers: resolved.headers } : {}),
   });

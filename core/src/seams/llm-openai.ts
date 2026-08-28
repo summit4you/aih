@@ -45,6 +45,13 @@ export interface OpenAICompatibleOptions {
   retries?: number;
   /** extra request headers sent with every completion call (e.g. client identity) */
   headers?: Record<string, string>;
+  /**
+   * Cap for the model's max_tokens (max output tokens) per request. Some free
+   * tiers reject requests that ask for more output than the account can afford
+   * (e.g. OpenRouter upstreams 503 when max_tokens > remaining quota) — send an
+   * explicit cap to stay under it. Undefined → omit the field (provider default).
+   */
+  maxTokens?: number;
 }
 
 interface OpenAIToolCall {
@@ -148,6 +155,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     if (req.tools.length > 0) {
       body.tools = req.tools.map(toOpenAITool);
       body.tool_choice = "auto";
+    }
+    if (this.#options.maxTokens !== undefined) {
+      body.max_tokens = this.#options.maxTokens;
     }
     if (req.onDelta) {
       body.stream = true;

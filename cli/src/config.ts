@@ -42,8 +42,20 @@ export interface ProviderConfig {
    */
   models?: Array<string | ModelEntry>;
   apiKeyEnv?: string;
+  /**
+   * Mark this provider as keyless (no API key required). Use for public free
+   * endpoints (HTTPS) that need no auth — otherwise buildRealLlm refuses to
+   * start without a key, since only local/http endpoints and identity-header
+   * providers are exempt automatically.
+   */
+  keyless?: boolean;
   /** context window (max input tokens) for this provider's model */
   contextWindow?: number;
+  /**
+   * Cap for max_tokens (max output tokens) sent per request. Free tiers that
+   * reject large max_tokens (OpenRouter 503 "can only afford N") need this.
+   */
+  maxTokens?: number;
   /** extra request headers for this provider (e.g. client identity for rate-limit pools) */
   headers?: Record<string, string>;
 }
@@ -117,6 +129,8 @@ export interface ResolvedLlm {
   baseUrl: ResolvedValue;
   apiKeyEnv: string;
   provider: string | undefined;
+  keyless: boolean;
+  maxTokens?: number;
   contextWindow: ResolvedValue;
   headers: Record<string, string>;
   layers: ConfigLayer[];
@@ -494,6 +508,12 @@ export function resolveLlm(opts: {  flagModel?: string;
 
   const headers = { ...(provider?.headers ?? {}) };
 
+  const keyless = provider?.keyless === true;
+  const maxTokens =
+    typeof provider?.maxTokens === "number" && provider.maxTokens > 0
+      ? provider.maxTokens
+      : undefined;
+
   // F#34 — the active model's own models[] entry overrides the provider tier.
   const mWindow = modelLevelWindow(layers, providerName, model.value);
   const contextWindow =
@@ -512,5 +532,5 @@ export function resolveLlm(opts: {  flagModel?: string;
                 c.contextWindow !== undefined ? String(c.contextWindow) : undefined,
             );
 
-  return { model, baseUrl, apiKeyEnv, provider: providerName, headers, contextWindow, layers };
+  return { model, baseUrl, apiKeyEnv, provider: providerName, keyless, maxTokens, headers, contextWindow, layers };
 }

@@ -351,6 +351,46 @@ assert(noKey.status === 1 && noKey.stderr.includes("no API key"), "missing API k
   );
 }
 
+// The explicit "keyless": true provider flag exempts a public HTTPS endpoint
+// from the no-key gate (e.g. free.empero.org), and "maxTokens" caps the
+// max_tokens field for tiers that reject large output budgets.
+{
+  const projDir = mkdtempSync(join(tmpdir(), "aih-keyless-flag-"));
+  writeFileSync(
+    join(projDir, "aih.json"),
+    JSON.stringify({
+      defaultProvider: "free",
+      providers: {
+        free: {
+          baseUrl: "https://free.example.test/v1",
+          model: "m1",
+          keyless: true,
+          maxTokens: 16000,
+        },
+      },
+    }),
+  );
+  const run = (args: string[], env: Record<string, string> = {}) =>
+    aih(args, { AIH_TRUST_ALL_PROJECTS: "1", ...env }, projDir);
+  const list = run(["models"]);
+  assert(list.status === 0 && list.stdout.includes("free.example.test"), "keyless:true provider appears in the model catalog");
+  // No API key anywhere + a public HTTPS endpoint → must NOT hit the no-key
+  // gate (loopback refuses instantly, proving the gate is open).
+  const attempt = run(["run", "hi"], { AIH_API_KEY: "" });
+  assert(!attempt.stderr.includes("no API key"), "keyless:true skips the no-key gate on a public endpoint");
+  // A project WITHOUT the keyless flag on the same endpoint still errors.
+  const projDir2 = mkdtempSync(join(tmpdir(), "aih-keyless-flag2-"));
+  writeFileSync(
+    join(projDir2, "aih.json"),
+    JSON.stringify({
+      defaultProvider: "free",
+      providers: { free: { baseUrl: "https://free.example.test/v1", model: "m1" } },
+    }),
+  );
+  const denied = aih(["run", "hi"], { AIH_API_KEY: "", AIH_TRUST_ALL_PROJECTS: "1" }, projDir2);
+  assert(denied.status === 1 && denied.stderr.includes("no API key"), "without keyless:true the same public endpoint still demands a key");
+}
+
 // Identity-header providers are keyless ONLY on their own endpoint: a URL
 // override (env/flag) that moves the request elsewhere must re-enable the
 // no-key gate — opencode fingerprint headers authenticate nothing on
