@@ -6,10 +6,30 @@ export interface ApprovalRequest {
   kind: "read" | "write";
   args: unknown;
   reason?: string;
+  /**
+   * CC#60 — provenance of the activity that triggered this request. "tty":
+   * a turn started by local keyboard input. "injected": a turn started by
+   * serve/attach POST /message or steering queue text. Only "tty" may answer
+   * an ask prompt; "injected" requests are auto-denied at the gate.
+   */
+  source?: "tty" | "injected";
 }
 
 export interface ApprovalGate {
   request(req: ApprovalRequest): Promise<boolean>;
+}
+
+/**
+ * CC#53 — thrown by before-hooks / extension bridges to force a human
+ * confirmation for a tool call, regardless of the tool's own permission or the
+ * current auto/plan mode. A plain thrown Error vetoes (denies); AskError instead
+ * routes to the approval gate's prompt — the "ask" floor.
+ */
+export class AskError extends Error {
+  constructor(message = "requires human confirmation") {
+    super(message);
+    this.name = "AskError";
+  }
 }
 
 export class AutoApprove implements ApprovalGate {
@@ -54,7 +74,7 @@ export class PolicyGate implements ApprovalGate {
 export interface PermissionRule {
   tool: string;
   pattern?: string;
-  action: "allow" | "deny";
+  action: "allow" | "ask" | "deny";
 }
 
 const PATH_KEYS = ["path", "file", "dir", "directory", "target"] as const;
@@ -115,20 +135,32 @@ export class RulesetGate implements ApprovalGate {
     this.rules.push(rule);
   }
 
-  evaluate(req: ApprovalRequest): "allow" | "deny" | undefined {
+  /**
+   * CC#53 — evaluate the ruleset with a deny > ask > allow priority floor.
+   * If ANY matching rule is "deny", the request is denied. Else if ANY is
+   * "ask", it must be confirmed by a human (a later "allow" cannot lift this
+   * floor). Only when no ask/deny matches does "allow" (or the base) apply.
+   */
+  evaluate(req: ApprovalRequest): "allow" | "ask" | "deny" | undefined {
     const raw = targetOf(req);
     const abs = raw ? resolve(raw) : undefined;
-    let action: "allow" | "deny" | undefined;
+    let action: "allow" | "ask" | "deny" | undefined;
     for (const rule of this.rules) {
       if (!matchPattern(rule.pattern, raw) && !matchPattern(rule.pattern, abs)) continue;
       const pathScoped = !!rule.pattern && rule.pattern !== "*" && rule.pattern !== "**";
-      if (pathScoped || rule.tool === req.tool || rule.tool === "*") action = rule.action;
+      if (!(pathScoped || rule.tool === req.tool || rule.tool === "*")) continue;
+      // Priority floor: deny dominates, then ask, then allow.
+      if (rule.action === "deny") action = "deny";
+      else if (rule.action === "ask" && action !== "deny") action = "ask";
+      else if (rule.action === "allow" && action !== "ask" && action !== "deny") action = "allow";
     }
     return action;
   }
 
   async request(req: ApprovalRequest): Promise<boolean> {
     const action = this.evaluate(req);
+    // "ask" floors at a human prompt in the SessionGate (which owns the TUI).
+    // Here both "ask" and no-match delegate to the base (auto/deny fallback).
     if (action === "allow") return true;
     if (action === "deny") return false;
     return this.#base.request(req);

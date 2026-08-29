@@ -1,11 +1,41 @@
 import type { LLMAdapter } from "./seams/llm.js";
-import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT } from "./prompts.js";
+import { QuotaError, StallError } from "./seams/llm-sse.js";
+import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT } from "./prompts.js";
 
 /** Max consecutive empty responses (no text + no tool call) we nudge the model to retry before ending the turn. */
 const MAX_EMPTY_RETRIES = 2;
+
+/**
+ * CC#49 — max stream-stall resumes per turn (partial content + "continue"
+ * nudge). Bounded so a pathologically flaky provider can't loop forever.
+ */
+const MAX_STALL_RESUMES = 1;
+
+/**
+ * CC#51 — quota-exhaustion (usage-limit) auto-resume. When the provider
+ * spends its usage window it returns a quota 429; instead of ending the turn
+ * with an error we WAIT for the reset and re-issue the SAME rejected call
+ * (not re-run the turn). Bounded so a never-resetting provider can't hang the
+ * session forever.
+ */
+const MAX_QUOTA_WAITS = 2;
+/** Default wait (s) when the provider gives no Retry-After. */
+const QUOTA_DEFAULT_WAIT_SEC = 60;
+/** Hard cap on a single wait (s) — a "reset in 3 days" is not something to sit through. */
+const QUOTA_MAX_WAIT_SEC = 1800;
+
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      resolve();
+    }, { once: true });
+  });
+}
 import { coverageDigest, SessionLog } from "./session-log.js";
 import type { ToolRegistry } from "./tool-registry.js";
-import type { ChatMessage, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
+import type { ChatMessage, ContentBlock, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
 
 function addUsage(a: TokenUsage | undefined, b: TokenUsage | undefined): TokenUsage | undefined {
   if (!b) return a;
@@ -58,6 +88,12 @@ export interface AgentLoopOptions {
    * model-visible messages right before every LLM request.
    */
   onPromptInput?: (messages: ChatMessage[]) => void;
+  /**
+   * CC#60 — provenance of input driving this loop's turns. "tty" (default):
+   * local keyboard. "injected": serve/attach POST /message or steering text.
+   * Injected turns can never approve a pending permission ask.
+   */
+  inputSource?: "tty" | "injected";
 }
 
 const CONTEXT_ERROR =
@@ -83,6 +119,28 @@ export function estimateTokensText(s: string): number {
   }
   const rest = s.length - cjk;
   return Math.max(1, Math.round(cjk * 1.1 + rest / 3.5));
+}
+
+/**
+ * Image blocks contribute a fixed budget to the token estimate — treat a
+ * 1024×1024 image as ~1k tokens (conservative floor; multimodal providers
+ * usually align on ~1-2k for a standard image). Keeps context-window math
+ * honest when a message carries images instead of plain text.
+ */
+export const IMAGE_TOKENS_ESTIMATE = 1024;
+
+/**
+ * Estimate tokens for a `string | ContentBlock[]` message content. Text blocks
+ * flow through the CJK-aware estimator; image blocks get IMAGE_TOKENS_ESTIMATE.
+ */
+export function estimateTokensContent(content: string | ContentBlock[]): number {
+  if (typeof content === "string") return estimateTokensText(content);
+  let tokens = 0;
+  for (const block of content) {
+    if (block.type === "image_url") tokens += IMAGE_TOKENS_ESTIMATE;
+    else if (typeof block.text === "string") tokens += estimateTokensText(block.text);
+  }
+  return tokens;
 }
 
 /** Below this fraction of the window, opaque server errors are NOT treated as overflow. */
@@ -156,6 +214,8 @@ export class AgentLoop {
   /** P#36④ — re-primed the interrupted turn once after an overflow recovery. */
   #overflowReprimed = false;
   #onPromptInput?: (messages: ChatMessage[]) => void;
+  /** CC#60 — "tty" | "injected"; injected turns cannot approve asks. */
+  #inputSource: "tty" | "injected" = "tty";
   #inbox: string[] = [];
   /** P#35 — user steering messages queued mid-turn; drained before the next LLM call. */
   #steering: string[] = [];
@@ -179,6 +239,7 @@ export class AgentLoop {
       Math.floor(options.readConcurrency ?? (Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4)),
     );
     this.#onPromptInput = options.onPromptInput;
+    this.#inputSource = options.inputSource ?? "tty";
   }
 
   get log(): SessionLog {
@@ -231,7 +292,22 @@ export class AgentLoop {
 
   async send(
     text: string,
-    hooks?: { onDelta?: (delta: string) => void; onRetry?: (attempt: number, error: unknown) => void },
+    hooks?: {
+      onDelta?: (delta: string) => void;
+      onRetry?: (attempt: number, error: unknown) => void;
+      /**
+       * CC#51 — called around a quota-exhaustion wait: `begin` fires when we
+       * start waiting (UI shows "[quota] exhausted — will auto-resume at …"),
+       * `end` when the wait completes (success or budget exhausted). Absent
+       * (non-interactive run mode) → the wait is skipped and the QuotaError
+       * propagates immediately (scripts stay predictable).
+       */
+      quotaWait?: {
+        begin: (info: { retryAfterSec: number; resumeAtMs: number; wait: number }) => void;
+        /** Called when the wait completes (reason: "done" | "aborted"). */
+        end: (reason: string) => void;
+      };
+    },
   ): Promise<TurnResult> {
     const turnId = `turn_${Date.now().toString(36)}`;
     const ac = new AbortController();
@@ -265,6 +341,10 @@ export class AgentLoop {
     // task mid-turn and return nothing; nudge them to continue a bounded
     // number of times before giving up (see MAX_EMPTY_RETRIES).
     let emptyRetries = 0;
+    // CC#49 — bounded stream-stall resumes for this turn.
+    let stallResumes = 0;
+    // CC#51 — bounded quota-exhaustion waits for this turn.
+    let quotaWaits = 0;
 
     while (steps < this.#maxSteps && !ac.signal.aborted) {
       steps += 1;
@@ -312,39 +392,115 @@ export class AgentLoop {
         response = await doComplete();
       } catch (err) {
         if (ac.signal.aborted) break;
-        const message = err instanceof Error ? err.message : String(err);
-        // Provider text is unreliable about WHY it failed: free-tier gateways
-        // return generic "HTTP 500 Internal server error" when the real cause
-        // is an oversized prompt. When the local estimate says we're near the
-        // window, treat opaque server errors as suspected overflow and try
-        // one compact+retry — mirroring pi's silent-overflow heuristic.
-        const nearWindow =
-          this.#contextWindow > 0 &&
-          this.#estimateContext() >= OVERFLOW_SUSPECT_RATIO * this.#contextWindow;
-        const opaqueFailure =
-          /HTTP [45]\d\d|fetch failed|terminated|socket hang|other side closed/i.test(message);
-        if (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure)) throw err;
-        // P#36④ — the failed request was part of THIS turn: its user request
-        // and everything logged before it stay in the log, but compaction may
-        // fold them into the summary. Re-prime the turn with an explicit
-        // continuation message AFTER compacting so "retry the step" becomes
-        // "resume the interrupted turn": the model re-reads its goal instead
-        // of silently dropping it (pi: overflow → resume the task).
-        const c = await this.#compact(turnId);
-        if (c.usage) usage = addUsage(usage, c.usage);
-        if (c.applied) contextNow = this.#estimateContext();
-        if (!this.#overflowReprimed) {
-          this.#overflowReprimed = true;
+        // CC#49 — a stalled stream that already delivered partial text is
+        // resumed honestly: the partial text is kept in the transcript, and a
+        // bounded continuation message asks the model to finish the thought.
+        // (Stream-level retries without content are handled inside the LLM
+        // adapter; reaching here means content existed or retries ran out.)
+        if (err instanceof StallError && stallResumes < MAX_STALL_RESUMES) {
+          stallResumes += 1;
+          const partial = err.partialText.trim();
+          if (partial) {
+            this.#log.append({ type: "assistant/message", turnId, text: partial, toolCalls: [] });
+          }
           this.#log.append({
             type: "user/message",
             turnId,
-            text:
-              `[context recovery] The previous model request failed (likely context overflow) ` +
-              `and older history was just summarized. Resume the interrupted task from the summary. ` +
-              `${this.#turnRequestPreview(turnId)}`,
+            text: STREAM_RESUME_PROMPT,
           });
+          continue; // next loop step rebuilds input from the log (partial + resume note)
         }
-        response = await doComplete();
+        // CC#51 — quota exhaustion (usage limit): WAIT for the reset, then
+        // re-issue the SAME call. Only when the caller opted in (interactive
+        // session with auto-resume on); otherwise the QuotaError propagates
+        // so non-interactive `run` fails fast and predictably.
+        if (err instanceof QuotaError && hooks?.quotaWait && quotaWaits < MAX_QUOTA_WAITS) {
+          quotaWaits += 1;
+          const waitSec = Math.min(
+            Math.max(1, Math.round(err.retryAfterSec || QUOTA_DEFAULT_WAIT_SEC)),
+            QUOTA_MAX_WAIT_SEC,
+          );
+          const resumeAtMs = Date.now() + waitSec * 1000;
+          this.#log.append({
+            type: "quota_wait",
+            turnId,
+            retryAfterSec: waitSec,
+            resumeAtMs,
+            wait: quotaWaits,
+          });
+          hooks.quotaWait.begin({ retryAfterSec: waitSec, resumeAtMs, wait: quotaWaits });
+          await sleepMs(waitSec * 1000, ac.signal);
+          hooks.quotaWait.end(ac.signal.aborted ? "aborted" : "done");
+          if (ac.signal.aborted) break;
+          // Re-issue the SAME call (not re-run the turn). On success we fall
+          // OUT of the catch and the normal post-catch path logs the response
+          // (usage + assistant/message). On a non-quota failure it propagates
+          // (turn ends). On a quota failure again we wait once more (bounded).
+          for (;;) {
+            try {
+              response = await doComplete();
+              break;
+            } catch (retryErr) {
+              if (!(retryErr instanceof QuotaError) || ac.signal.aborted || quotaWaits >= MAX_QUOTA_WAITS) {
+                throw retryErr;
+              }
+              quotaWaits += 1;
+              const w2 = Math.min(
+                Math.max(1, Math.round(retryErr.retryAfterSec || QUOTA_DEFAULT_WAIT_SEC)),
+                QUOTA_MAX_WAIT_SEC,
+              );
+              const ra2 = Date.now() + w2 * 1000;
+              this.#log.append({
+                type: "quota_wait",
+                turnId,
+                retryAfterSec: w2,
+                resumeAtMs: ra2,
+                wait: quotaWaits,
+              });
+              hooks.quotaWait.begin({ retryAfterSec: w2, resumeAtMs: ra2, wait: quotaWaits });
+              await sleepMs(w2 * 1000, ac.signal);
+              hooks.quotaWait.end(ac.signal.aborted ? "aborted" : "done");
+            }
+          }
+        }
+        // CC#51 — if the quota branch above already recovered (response set),
+        // skip the generic error-recovery path and fall through to the normal
+        // post-catch processing (log response, process tool calls).
+        if (response === undefined) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Provider text is unreliable about WHY it failed: free-tier gateways
+          // return generic "HTTP 500 Internal server error" when the real cause
+          // is an oversized prompt. When the local estimate says we're near the
+          // window, treat opaque server errors as suspected overflow and try
+          // one compact+retry — mirroring pi's silent-overflow heuristic.
+          const nearWindow =
+            this.#contextWindow > 0 &&
+            this.#estimateContext() >= OVERFLOW_SUSPECT_RATIO * this.#contextWindow;
+          const opaqueFailure =
+            /HTTP [45]\d\d|fetch failed|terminated|socket hang|other side closed/i.test(message);
+          if (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure)) throw err;
+          // P#36④ — the failed request was part of THIS turn: its user request
+          // and everything logged before it stay in the log, but compaction may
+          // fold them into the summary. Re-prime the turn with an explicit
+          // continuation message AFTER compacting so "retry the step" becomes
+          // "resume the interrupted turn": the model re-reads its goal instead
+          // of silently dropping it (pi: overflow → resume the task).
+          const c = await this.#compact(turnId);
+          if (c.usage) usage = addUsage(usage, c.usage);
+          if (c.applied) contextNow = this.#estimateContext();
+          if (!this.#overflowReprimed) {
+            this.#overflowReprimed = true;
+            this.#log.append({
+              type: "user/message",
+              turnId,
+              text:
+                `[context recovery] The previous model request failed (likely context overflow) ` +
+                `and older history was just summarized. Resume the interrupted task from the summary. ` +
+                `${this.#turnRequestPreview(turnId)}`,
+            });
+          }
+          response = await doComplete();
+        }
       }
       usage = addUsage(usage, response.usage);
       if (typeof response.genMs === "number") genMs += response.genMs;
@@ -469,6 +625,7 @@ export class AgentLoop {
             this.#tools.invoke(call.name, call.args, {
               turnId,
               inject: (ctxText) => this.inject(ctxText),
+              source: this.#inputSource,
             });
           // MK#44 (T1): dispatch facts land BEFORE the tool/call event (the
           // assistant's call is appended with its outcome below) but BEFORE
@@ -586,7 +743,7 @@ export class AgentLoop {
   #estimateTokens(messages: ChatMessage[]): number {
     let tokens = 0;
     for (const m of messages) {
-      tokens += estimateTokensText(m.content);
+      tokens += estimateTokensContent(m.content);
       for (const tc of m.toolCalls ?? []) {
         tokens += estimateTokensText(`${tc.name} ${JSON.stringify(tc.args ?? {})}`);
       }

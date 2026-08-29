@@ -27,6 +27,47 @@ export interface Skill {
   secretPatterns?: string[];
 }
 
+/**
+ * CC#52 — per-session load-skill de-duplication.
+ *
+ * `load_skill` returns the full (truncated) body every call, so re-invoking an
+ * already-loaded skill re-appends a duplicate copy of its instructions to the
+ * transcript. This tracker records which skills were already loaded this
+ * session so a repeat call can return a short recap instead of the full body.
+ *
+ * Compaction (`reset`) invalidates the marks: after context is summarized the
+ * instructions may no longer be present, so a reload is allowed again.
+ */
+export class SkillLoadTracker {
+  /** skill name → monotonic load counter (approximates the turn it was loaded at). */
+  #loaded = new Map<string, number>();
+
+  isLoaded(name: string): boolean {
+    return this.#loaded.has(name);
+  }
+
+  /**
+   * Mark a skill as loaded (first call). Returns the recap string to include
+   * when a repeat load happens. `tag` is a short human-readable position label
+   * (e.g. "earlier in this session" or a turn counter).
+   */
+  markLoaded(name: string, tag = "earlier in this session"): string {
+    const n = (this.#loaded.get(name) ?? 0) + 1;
+    this.#loaded.set(name, n);
+    return tag;
+  }
+
+  /** Invalidate all load marks (call on compaction). */
+  reset(): void {
+    this.#loaded.clear();
+  }
+
+  /** Names of skills loaded so far this session. */
+  loadedNames(): string[] {
+    return [...this.#loaded.keys()];
+  }
+}
+
 export function parseSkillMd(
   raw: string,
   fallbackName: string,

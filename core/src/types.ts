@@ -74,6 +74,13 @@ export interface ToolCall {
 export interface ToolContext {
   turnId: string;
   inject(text: string): void;
+  /**
+   * CC#60 — where this turn's input came from. "tty" (default): a human at a
+   * keyboard. "injected": serve/attach POST /message or a steering queue —
+   * message text, NOT keyboard approval. Gates use this so injected input can
+   * never approve a pending action.
+   */
+  source?: "tty" | "injected";
 }
 
 export interface ToolDefinition {
@@ -226,11 +233,34 @@ export type SessionEvent =
       type: "app/event";
       source: string;
       payload: unknown;
+    }
+  | {
+      seq: number;
+      ts: number;
+      type: "quota_wait";
+      turnId: string;
+      /**
+       * CC#51 — the provider's usage window is exhausted (quota 429). We wait
+       * for the reset and then re-issue the SAME rejected call (not re-run the
+       * turn). Model-invisible (deriveMessages skips it).
+       */
+      /** Seconds we wait before resuming (provider Retry-After, or the default). */
+      retryAfterSec: number;
+      /** Epoch ms at which the rejected call is re-issued. */
+      resumeAtMs: number;
+      /** Which quota-wait this is (1-based), bounded by MAX_QUOTA_WAITS. */
+      wait: number;
     };
+
+export interface ContentBlock {
+  type: "text" | "image_url";
+  text?: string;
+  image_url?: { url: string };
+}
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  content: string | ContentBlock[];
   toolCalls?: ToolCall[];
   toolCallId?: string;
   name?: string;
@@ -255,6 +285,12 @@ export interface LLMRequest {
   onDelta?: (delta: string) => void;
   onRetry?: (attempt: number, error: unknown) => void;
   signal?: AbortSignal;
+  /**
+   * Enable the provider's "thinking"/reasoning mode (e.g. zhipu's
+   * `thinking: {type:"enabled"}`). Sent verbatim in the request body when
+   * true; ignored by providers that don't support it.
+   */
+  thinking?: boolean;
   /**
    * P#36 — side-channel session identity for auxiliary calls (compaction
    * summaries). When set, "{sid}" header placeholders resolve to this id

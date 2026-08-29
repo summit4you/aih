@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { readJson } from "./read-json.js";
 
 const MARKER_REL = join(".aih", "workspace.json");
 
@@ -26,7 +27,7 @@ export interface WorkspaceIdentity {
 
 function readMarker(path: string): WorkspaceIdentity | undefined {
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as { workspaceId?: unknown };
+    const raw = readJson<{ workspaceId?: unknown }>(path);
     const id = typeof raw.workspaceId === "string" ? raw.workspaceId.trim() : "";
     if (id) return { uuid: id, path };
     // Structurally invalid marker: do not silently rewrite a foreign file.

@@ -21,8 +21,12 @@ import {
   COMPACT_CONTINUE_PROMPT,
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
+  STREAM_RESUME_PROMPT,
+  isQuotaExhaustion,
+  QuotaError,
+  StallError,
 } from "./index.js";
-import type { ChatMessage, LLMRequest, SessionEvent, ToolDefinition } from "./types.js";
+import type { ChatMessage, LLMRequest, LLMResponse, SessionEvent, ToolDefinition } from "./types.js";
 import type { LLMAdapter } from "./seams/llm.js";
 
 function assert(cond: boolean, msg: string): void {
@@ -131,7 +135,7 @@ assert(forked.all().length === events.length, "fork copies full history");
   assert(last.seq === cp.seq + 1, "appends after adopt continue the restored seq timeline");
   // deriveMessages must not be confused by checkpoint markers.
   const msgs = restored.deriveMessages("sys");
-  assert(msgs.some((m) => m.content.includes("turn one")) && !msgs.some((m) => m.content.includes("turn two")), "deriveMessages ignores checkpoint markers");
+  assert(msgs.some((m) => String(m.content).includes("turn one")) && !msgs.some((m) => String(m.content).includes("turn two")), "deriveMessages ignores checkpoint markers");
 }
 
 // --- MK#44/#45: tool/dispatch facts + recovery classifier --------------------
@@ -219,7 +223,7 @@ assert(forked.all().length === events.length, "fork copies full history");
   elog.append({ type: "assistant/message", turnId: "t", text: "final", toolCalls: [] });
   const derivedEligible = elog.deriveMessages("sys").filter((m) => m.role !== "system");
   assert(
-    derivedEligible.some((m) => m.role === "tool") && derivedEligible.every((m) => m.role !== "tool" || m.content.includes("r")),
+    derivedEligible.some((m) => m.role === "tool") && derivedEligible.every((m) => m.role !== "tool" || String(m.content).includes("r")),
     "tool/result still projected alongside its call",
   );
 }
@@ -604,6 +608,77 @@ const streamTurn = await loopStream.send("echo", { onDelta: (d) => (mockStreamed
 assert(mockStreamed === "streamed mock text", "MockLLM emits deltas through the loop");
 assert(streamTurn.steps === 1, "streamed turn completes normally");
 
+// CC#49 — adapter-level stall semantics: a stalled stream WITH partial text
+// must propagate immediately (AgentLoop resumes honestly); WITHOUT text it
+// must consume the retry budget like a transient failure.
+{
+  const prevFirst = process.env.AIH_FIRST_TOKEN_TIMEOUT_MS;
+  const prevStall = process.env.AIH_STALL_TIMEOUT_MS;
+  process.env.AIH_FIRST_TOKEN_TIMEOUT_MS = "150";
+  process.env.AIH_STALL_TIMEOUT_MS = "150";
+  try {
+    // A body that delivers `frames` then hangs forever (never closes).
+    const hangingBody = (frames: string[]) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const f of frames) controller.enqueue(new TextEncoder().encode(`data: ${f}\n\n`));
+          // no controller.close() — the stream stalls
+        },
+      });
+    // 1) partial text + stall → StallError thrown immediately, no retry.
+    let partialCalls = 0;
+    const partialLlm = new OpenAICompatibleLLM({
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "k",
+      model: "m",
+      retries: 2, // budget that would normally survive — must NOT be used
+      fetchImpl: (async () => {
+        partialCalls += 1;
+        return new Response(
+          hangingBody([JSON.stringify({ choices: [{ delta: { content: "Hel" } }] })]),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }) as typeof fetch,
+    });
+    const partialErr = (await partialLlm.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      onDelta: () => {},
+    }).catch((e: unknown) => e)) as StallError;
+    assert(partialErr instanceof StallError, "stalled stream with partial text throws StallError");
+    assert(partialErr.partialText === "Hel", "StallError carries the partial text");
+    assert(partialCalls === 1, "partial-text stall is NOT retried (propagates for honest resume)");
+    // 2) no text + stall → folded into the retry budget.
+    let emptyCalls = 0;
+    const emptyLlm = new OpenAICompatibleLLM({
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "k",
+      model: "m",
+      retries: 1,
+      fetchImpl: (async () => {
+        emptyCalls += 1;
+        return new Response(hangingBody([]), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }) as typeof fetch,
+    });
+    const emptyErr = (await emptyLlm.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      onDelta: () => {},
+    }).catch((e: unknown) => e)) as StallError;
+    assert(emptyErr instanceof StallError, "stalled stream without text throws StallError");
+    assert(emptyErr.partialText === "", "empty-partial StallError carries no text");
+    assert(emptyCalls === 2, "empty-partial stall consumes the retry budget (2 attempts)");
+  } finally {
+    if (prevFirst === undefined) delete process.env.AIH_FIRST_TOKEN_TIMEOUT_MS;
+    else process.env.AIH_FIRST_TOKEN_TIMEOUT_MS = prevFirst;
+    if (prevStall === undefined) delete process.env.AIH_STALL_TIMEOUT_MS;
+    else process.env.AIH_STALL_TIMEOUT_MS = prevStall;
+  }
+}
+
 {
   // F#30: an adapter that reports per-request genMs (like the streaming
   // OpenAI adapter does) must see it land on the turn/end event.
@@ -691,7 +766,7 @@ assert(
   );
   const derivedOk = compactLog.deriveMessages("sys");
   assert(
-    derivedOk.some((m) => m.role === "user" && m.content.includes("echo hi")),
+    derivedOk.some((m) => m.role === "user" && String(m.content).includes("echo hi")),
     "valid coverage: projection applies (tail user message visible)",
   );
   // Tamper with an event covered by the summary → digest mismatch → fail
@@ -703,7 +778,7 @@ assert(
   );
   const tamperedDerived = tampered.deriveMessages("sys");
   assert(
-    tamperedDerived.some((m) => m.content.includes("TAMPERED")),
+    tamperedDerived.some((m) => String(m.content).includes("TAMPERED")),
     "coverage mismatch fails open to raw events (no false projection)",
   );
 }
@@ -807,7 +882,7 @@ assert(
   });
   const derived = bLog.deriveMessages("sys");
   assert(
-    derived[0]?.role === "system" && derived[0].content.includes("Lessons from an abandoned branch"),
+    derived[0]?.role === "system" && String(derived[0].content).includes("Lessons from an abandoned branch"),
     "branch summary folds into the leading system message",
   );
   assert(
@@ -826,8 +901,8 @@ assert(
   const derived2 = SessionLog.fromEvents(bLog.all().map((e) => ({ ...e }))).deriveMessages("sys");
   assert(
     derived2[0]?.role === "system" &&
-      derived2[0].content.includes("earlier work summarized") &&
-      derived2[0].content.includes("Lessons from an abandoned branch"),
+      String(derived2[0].content).includes("earlier work summarized") &&
+      String(derived2[0].content).includes("Lessons from an abandoned branch"),
     "branch summary coexists with the compaction projection",
   );
 }
@@ -868,7 +943,7 @@ assert(replayCompacts.length === 1, "mega turn (tail over budget) still compacts
     replayCompacts[0].recent?.some(
       (m) =>
         m.role === "user" &&
-        (m.content === replayUser || replayUser.startsWith(m.content.slice(0, 100))),
+        (m.content === replayUser || replayUser.startsWith(String(m.content).slice(0, 100))),
     ) === true,
     "#compact keeps the turn's user request in the tail (verbatim or budget-truncated)",
   );
@@ -877,7 +952,7 @@ assert(
   replayDerived.some(
     (m) =>
       m.role === "user" &&
-      (m.content === replayUser || replayUser.startsWith(m.content.slice(0, 100))),
+      (m.content === replayUser || replayUser.startsWith(String(m.content).slice(0, 100))),
   ),
   "post-compaction request contains the user's request again (replay tail)",
 );
@@ -1490,6 +1565,221 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
     slog.all().some((e) => e.type === "turn/end"),
     "steered turn still completes normally",
   );
+}
+
+// ── CC#49: stream-stall protection ──────────────────────────────────────
+{
+  // 1) StallError with partial text → AgentLoop appends partial + resume
+  //    prompt, then the next LLM call completes the answer.
+  let stallFirst = true;
+  const stallLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      if (stallFirst) {
+        stallFirst = false;
+        throw new StallError("I was explaining the design of", 60_000);
+      }
+      return {
+        text: " the caching layer.",
+        toolCalls: [],
+        stopReason: "end_turn",
+      };
+    },
+  };
+  const stallLog = new SessionLog();
+  const stallTools = new ToolRegistry({ async request() { return true; } });
+  const stallLoop = new AgentLoop({ llm: stallLlm, tools: stallTools, log: stallLog });
+  const stallResult = await stallLoop.send("explain the design");
+  assert(stallResult.steps === 2, "stall-resume turn used two steps (stall + recovery)");
+  const stallEvents = stallLog.all();
+  const partialMsg = stallEvents.find(
+    (e): e is Extract<SessionEvent, { type: "assistant/message" }> =>
+      e.type === "assistant/message" && e.text === "I was explaining the design of",
+  );
+  assert(partialMsg !== undefined, "partial text is preserved in the transcript");
+  assert(partialMsg!.toolCalls.length === 0, "partial message carries empty toolCalls");
+  const resumeMsg = stallEvents.find(
+    (e): e is Extract<SessionEvent, { type: "user/message" }> =>
+      e.type === "user/message" && e.text === STREAM_RESUME_PROMPT,
+  );
+  assert(resumeMsg !== undefined, "STREAM_RESUME_PROMPT is appended after the partial text");
+  const finalMsg = stallEvents.find(
+    (e): e is Extract<SessionEvent, { type: "assistant/message" }> =>
+      e.type === "assistant/message" && e.text === " the caching layer.",
+  );
+  assert(finalMsg !== undefined, "recovery response completes the answer");
+  const stallDerived = stallLog.deriveMessages("sys");
+  const stallAssistantTexts = stallDerived
+    .filter((m) => m.role === "assistant")
+    .map((m) => m.content);
+  assert(
+    stallAssistantTexts.some((t) => t === "I was explaining the design of"),
+    "partial text is visible in derived messages",
+  );
+  assert(
+    stallAssistantTexts.some((t) => t === " the caching layer."),
+    "recovery text is visible in derived messages",
+  );
+
+  // 2) StallError with empty partial text → propagates to caller (no resume).
+  const emptyStallLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      throw new StallError("", 60_000);
+    },
+  };
+  const emptyStallLog = new SessionLog();
+  const emptyStallLoop = new AgentLoop({
+    llm: emptyStallLlm,
+    tools: stallTools,
+    log: emptyStallLog,
+  });
+  let emptyStallThrew = false;
+  try {
+    await emptyStallLoop.send("explain the design");
+  } catch (err) {
+    emptyStallThrew = err instanceof StallError && err.partialText === "";
+  }
+  assert(emptyStallThrew, "empty-partial StallError propagates to the caller");
+
+  // 3) Bounded: a second StallError in the same turn (after one resume)
+  //    propagates instead of looping forever.
+  let doubleStallCalls = 0;
+  const doubleStallLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      doubleStallCalls += 1;
+      if (doubleStallCalls === 1) {
+        throw new StallError("first partial", 60_000);
+      }
+      throw new StallError("second partial", 60_000);
+    },
+  };
+  const doubleStallLog = new SessionLog();
+  const doubleStallLoop = new AgentLoop({
+    llm: doubleStallLlm,
+    tools: stallTools,
+    log: doubleStallLog,
+  });
+  let doubleStallThrew = false;
+  try {
+    await doubleStallLoop.send("explain the design");
+  } catch (err) {
+    doubleStallThrew = err instanceof StallError;
+  }
+  assert(doubleStallThrew, "second StallError in same turn propagates (bounded resume)");
+  const doubleEvents = doubleStallLog.all();
+  const resumeCount = doubleEvents.filter(
+    (e) => e.type === "user/message" && e.text === STREAM_RESUME_PROMPT,
+  ).length;
+  assert(resumeCount === 1, "exactly one STREAM_RESUME_PROMPT appended (bounded to MAX_STALL_RESUMES)");
+}
+
+// ── CC#51: usage-limit (quota) auto-resume ─────────────────────────────
+{
+  // 1) isQuotaExhaustion: quota 429 vs transient 429 vs non-quota status.
+  assert(isQuotaExhaustion(429, "rate limit exceeded, quota resets at 00:00 UTC"), "quota keyword 429 → quota");
+  assert(isQuotaExhaustion(429, "Your credits are exhausted"), "credits keyword 429 → quota");
+  assert(!isQuotaExhaustion(429, "slow down"), "plain 429 without quota keyword → NOT quota");
+  assert(isQuotaExhaustion(429, "try again later", 120), "429 with large Retry-After → quota");
+  assert(!isQuotaExhaustion(429, "try again later", 2), "429 with small Retry-After → NOT quota");
+  assert(!isQuotaExhaustion(500, "quota"), "non-429/402 → NOT quota");
+  assert(isQuotaExhaustion(402, "insufficient credits"), "402 with credits → quota");
+
+  // 2) Adapter throws QuotaError (not a retryable HTTP error) for a quota 429.
+  const quotaAdapter = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 3,
+    fetchImpl: (async () =>
+      new Response("rate limit: quota exhausted, resets in 60s", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      })) as typeof fetch,
+  });
+  const quotaErr = (await quotaAdapter
+    .complete({ messages: [{ role: "user", content: "hi" }], tools: [] })
+    .catch((e: unknown) => e)) as QuotaError;
+  assert(quotaErr instanceof QuotaError, "quota 429 → QuotaError (not a retried HTTP error)");
+  assert(quotaErr.retryAfterSec === 60, "QuotaError carries the Retry-After horizon");
+
+  // 3) AgentLoop: quota 429 → wait → re-issue SAME call → success. The
+  //    quota_wait event is logged and the turn completes (not an error).
+  let quotaCalls = 0;
+  const quotaLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      quotaCalls += 1;
+      if (quotaCalls === 1) throw new QuotaError(429, "quota exhausted", 1);
+      return { text: "done after quota reset", toolCalls: [], stopReason: "end_turn" };
+    },
+  };
+  const quotaLog = new SessionLog();
+  const quotaTools = new ToolRegistry({ async request() { return true; } });
+  const quotaLoop = new AgentLoop({ llm: quotaLlm, tools: quotaTools, log: quotaLog });
+  let beginInfo: { retryAfterSec: number; resumeAtMs: number; wait: number } | undefined;
+  let endReason: string | undefined;
+  const quotaResult = await quotaLoop.send("explain", {
+    quotaWait: {
+      begin: (i) => { beginInfo = i; },
+      end: (r) => { endReason = r; },
+    },
+  });
+  assert(quotaResult.stopReason === "end_turn", "quota turn completes after auto-resume");
+  assert(quotaCalls === 2, "quota 429 re-issued the SAME call once (2 total)");
+  assert(beginInfo !== undefined, "quotaWait.begin fired");
+  assert(beginInfo!.wait === 1 && beginInfo!.retryAfterSec === 1, "begin carries wait=1, retryAfterSec=1");
+  assert(endReason === "done", "quotaWait.end fired with reason=done");
+  const quotaEvents = quotaLog.all();
+  const quotaWaitEvent = quotaEvents.find((e) => e.type === "quota_wait");
+  assert(quotaWaitEvent !== undefined, "quota_wait event logged");
+  assert(quotaWaitEvent!.wait === 1, "quota_wait wait=1");
+  const quotaAssistant = quotaEvents.find(
+    (e) => e.type === "assistant/message" && e.text === "done after quota reset",
+  );
+  assert(quotaAssistant !== undefined, "recovered response is in the transcript");
+
+  // 4) Bounded: quota 429 on EVERY call → QuotaError propagates after the
+  //    wait budget (MAX_QUOTA_WAITS) is exhausted.
+  let alwaysQuotaCalls = 0;
+  const alwaysQuotaLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      alwaysQuotaCalls += 1;
+      throw new QuotaError(429, "quota exhausted", 1);
+    },
+  };
+  const alwaysQuotaLog = new SessionLog();
+  const alwaysQuotaLoop = new AgentLoop({
+    llm: alwaysQuotaLlm,
+    tools: quotaTools,
+    log: alwaysQuotaLog,
+  });
+  let alwaysQuotaThrew = false;
+  try {
+    await alwaysQuotaLoop.send("explain", {
+      quotaWait: { begin: () => {}, end: () => {} },
+    });
+  } catch (err) {
+    alwaysQuotaThrew = err instanceof QuotaError;
+  }
+  assert(alwaysQuotaThrew, "quota budget exhausted → QuotaError propagates");
+  const alwaysQuotaWaits = alwaysQuotaLog.all().filter((e) => e.type === "quota_wait").length;
+  assert(alwaysQuotaWaits === 2, `quota waits bounded (got ${alwaysQuotaWaits}, want 2 = MAX_QUOTA_WAITS)`);
+
+  // 5) Non-interactive (no quotaWait hook) → QuotaError propagates immediately,
+  //    no wait, no quota_wait event (run mode stays predictable).
+  const noHookLlm: LLMAdapter = {
+    async complete(): Promise<LLMResponse> {
+      throw new QuotaError(429, "quota exhausted", 60);
+    },
+  };
+  const noHookLog = new SessionLog();
+  const noHookLoop = new AgentLoop({ llm: noHookLlm, tools: quotaTools, log: noHookLog });
+  let noHookThrew = false;
+  try {
+    await noHookLoop.send("explain");
+  } catch (err) {
+    noHookThrew = err instanceof QuotaError;
+  }
+  assert(noHookThrew, "no quotaWait hook → QuotaError propagates immediately");
+  assert(noHookLog.all().filter((e) => e.type === "quota_wait").length === 0, "no quota_wait event in non-interactive mode");
 }
 
 console.log("\nAIH core smoke test passed.");

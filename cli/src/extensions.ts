@@ -31,6 +31,7 @@ import type {
   ToolHooks,
 } from "@aih/core";
 import type { ToolRegistry } from "@aih/core";
+import { AskError } from "@aih/core";
 
 export interface ExtensionContext {
   cwd: string;
@@ -193,10 +194,18 @@ export function createExtensionEventBridge(): ExtensionEventBridge & { hookSet()
               before: async (info: ToolHookInfo): Promise<void> => {
                 for (const h of beforeHandlers) {
                   const r = safeRun(h, info, "tool:before");
-                  if (r && typeof r === "object" && r !== null && "cancel" in (r as Record<string, unknown>)) {
-                    // Cancel semantics ride the existing hook waterfall:
-                    // throwing vetoes the call (ToolRegistry before-hook contract).
-                    throw new Error(String((r as { cancel: unknown }).cancel ?? "cancelled by extension"));
+                  if (r && typeof r === "object" && r !== null) {
+                    const rec = r as Record<string, unknown>;
+                    // CC#53 — `{ ask: true }` floors at a human confirmation
+                    // (AskError routes to the approval gate) instead of a veto.
+                    if ("ask" in rec && rec.ask) {
+                      throw new AskError(String(rec.ask === true ? "extension requires confirmation" : rec.ask));
+                    }
+                    if ("cancel" in rec) {
+                      // Cancel semantics ride the existing hook waterfall:
+                      // throwing vetoes the call (ToolRegistry before-hook contract).
+                      throw new Error(String(rec.cancel ?? "cancelled by extension"));
+                    }
                   }
                 }
               },

@@ -34,6 +34,13 @@ else
   printf '  warn  dependencies not installed yet (run: npm run bootstrap)\n'
 fi
 
+# CC#59 — credential-scope self check: a provider secret must only ever ride to
+# its own host. If an Authorization/api-key header would be sent to a different
+# host (e.g. after AIH_BASE_URL / --base-url override), the leak guard must drop
+# it. The check below builds a mismatch and asserts the sensitive header is gone.
+check "credential scope: leak guard drops secrets on host mismatch" "node -e 'const {credentialSafeHeaders}=require(\"./cli/dist/config.js\");const r=credentialSafeHeaders({authorization:\"Bearer X\",\"x-api-key\":\"k\",\"user-agent\":\"aih\"},\"https://api.anthropic.com/v1\",\"https://evil.example.com/v1\");if(\"authorization\" in r||\"x-api-key\" in r) process.exit(1);if(r[\"user-agent\"]!==\"aih\") process.exit(2)'"
+printf '  credential scope: providers → own host only (leak guard active)\n'
+
 if [ "$fail" -eq 0 ]; then
   printf '\nready.\n'
 else

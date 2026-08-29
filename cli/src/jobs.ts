@@ -16,6 +16,7 @@ import type { ChildProcess } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readJson } from "./read-json.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled";
 
@@ -51,7 +52,7 @@ export function loadBoard(cwd: string): JobBoard {
   const p = jobsFile(cwd);
   if (!existsSync(p)) return { jobs: [] };
   try {
-    const parsed = JSON.parse(readFileSync(p, "utf8")) as JobBoard;
+    const parsed = readJson<JobBoard>(p);
     return { jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [] };
   } catch {
     return { jobs: [] };

@@ -20,6 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { userAihDir } from "./paths.js";
+import { readJson } from "./read-json.js";
 
 export type TrustDecision = "trusted" | "untrusted";
 
@@ -50,7 +51,7 @@ function readTrustFile(): TrustRecord {
   const p = trustFilePath();
   if (!existsSync(p)) return { projects: {} };
   try {
-    const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<TrustRecord>;
+    const raw = readJson<Partial<TrustRecord>>(p);
     return { projects: raw.projects ?? {} };
   } catch {
     // Corrupt trust file: fail closed (treat as no decisions), never throw.

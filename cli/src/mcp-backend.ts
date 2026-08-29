@@ -58,6 +58,24 @@ function extractText(result: unknown): unknown {
   }
 }
 
+/**
+ * CC#56 — normalize MCP tool call arguments to a real object. Some providers
+ * serialize a tool's arguments to a JSON string (notably when the tool's
+ * parameter schema is empty {}). A string payload is parsed back to an object;
+ * on failure the raw string is returned (it is what the provider sent).
+ */
+export function normalizeMcpArgs(callArgs: unknown): unknown {
+  let args: unknown = callArgs ?? {};
+  if (typeof args === "string" && args.trim()) {
+    try {
+      args = JSON.parse(args as string);
+    } catch {
+      /* keep the raw string */
+    }
+  }
+  return args;
+}
+
 export async function connectBackend(
   command: string,
   args: string[],
@@ -91,9 +109,14 @@ export async function connectBackend(
           required: [],
         }) as ToolSchema["parameters"],
         execute: async (callArgs) => {
+          // CC#56 — defensive: some providers serialize a tool's arguments to a
+          // JSON string (notably when the tool's parameter schema is empty {}).
+          // Normalize a string payload back to an object so the MCP server
+          // receives real typed arguments, matching the schema.
+          const args = normalizeMcpArgs(callArgs);
           const result = await client.callTool({
             name: tool.name,
-            arguments: (callArgs ?? {}) as Record<string, unknown>,
+            arguments: (args ?? {}) as Record<string, unknown>,
           });
           if ((result as { isError?: boolean }).isError) {
             throw new Error(JSON.stringify(extractText(result)));

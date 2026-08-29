@@ -203,9 +203,14 @@ export type SessionEvent = {
     source: string;
     payload: unknown;
 };
+export interface ContentBlock {
+    type: "text" | "image_url";
+    text?: string;
+    image_url?: { url: string };
+}
 export interface ChatMessage {
     role: "system" | "user" | "assistant" | "tool";
-    content: string;
+    content: string | ContentBlock[];
     toolCalls?: ToolCall[];
     toolCallId?: string;
     name?: string;
@@ -228,6 +233,12 @@ export interface LLMRequest {
     onDelta?: (delta: string) => void;
     onRetry?: (attempt: number, error: unknown) => void;
     signal?: AbortSignal;
+    /**
+     * Enable the provider's "thinking"/reasoning mode (e.g. zhipu's
+     * `thinking: {type:"enabled"}`). Sent verbatim in the request body when
+     * true; ignored by providers that don't support it.
+     */
+    thinking?: boolean;
     /**
      * P#36 — side-channel session identity for auxiliary calls (compaction
      * summaries). When set, "{sid}" header placeholders resolve to this id

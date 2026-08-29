@@ -50,6 +50,7 @@ import { DenyGate, SessionGate } from "./gate.js";
 import {
   loadModelCatalog,
   loadPermissionRules,
+  loadAutoAllowReadonly,
   loadAgentProfile,
   listAgentProfiles,
   normalizeModelEntries,
@@ -122,9 +123,12 @@ import {
   searchSkills,
   skillSecretPatterns,
   suggestSkills,
+  SkillLoadTracker,
   type RemoteSkill,
   type Skill,
 } from "./skills.js";
+import { isKnownSlashCommand } from "./slash.js";
+import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
 import { registerDevTools } from "./dev-tools.js";
 import { registerGeneralTools, todoStateFromLog, applyTodoState } from "./general-tools.js";
 import {
@@ -299,7 +303,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     "detail",
     "note",
     "sender",
+    "image",
   ]);
+  const booleanFlags = new Set(["thinking"]);
   const optionalValueFlags = new Set(["continue", "c"]);
   const flags: Record<string, string | boolean> = {};
   const positionals: string[] = [];
@@ -594,6 +600,8 @@ export function makeSessionGate(flags: Record<string, string | boolean>): Sessio
     makeBaseGate(flags),
     rules,
     (rule) => savePermissionRule(rule),
+    // CC#54 — opt-in read-only auto-allow from config (default off).
+    loadAutoAllowReadonly(),
   );
 }
 
@@ -607,10 +615,11 @@ export function agentProfilePrompt(flags: Record<string, string | boolean>): str
 
 export function registerSkillTool(
   registry: ToolRegistry,
-  opts?: { projectTrusted?: boolean },
+  opts?: { projectTrusted?: boolean; loadTracker?: SkillLoadTracker },
 ): Skill[] {
   // P#40 trust gate: project-scope skills load only for trusted directories.
   // User + builtin skills are unaffected (they are not repo-controlled).
+  const loadTracker = opts?.loadTracker ?? new SkillLoadTracker();
   const skills = discoverSkills().filter(
     (s) => s.scope !== "project" || opts?.projectTrusted !== false,
   );
@@ -635,6 +644,16 @@ export function registerSkillTool(
           `unknown skill: ${name}; available: ${skills.map((s) => s.name).join(", ")}`,
         );
       }
+      // CC#52 — avoid re-appending a full duplicate copy on a repeat load.
+      if (loadTracker.isLoaded(name)) {
+        const recap = skill.body.trim().slice(0, 200);
+        return (
+          `skill "${name}" was already loaded ${loadTracker.markLoaded(name)}; ` +
+          `its full instructions are already in context — do not load again unless expired. ` +
+          `recap (first ~200 chars): ${recap}`
+        );
+      }
+      loadTracker.markLoaded(name);
       return skill.body.slice(0, 6000);
     },
   });
@@ -980,7 +999,8 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     const gate = makeSessionGate(flags);
     const registry = new ToolRegistry(gate);
     for (const def of await backend.listTools()) registry.register(def);
-    const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
+    const skillTracker = new SkillLoadTracker(); // CC#52 — per-session load-skill dedup
+    const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted", loadTracker: skillTracker });
     registerArchiveReadTool(registry);
     void loadExtensions(registry, {
       enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
@@ -1191,7 +1211,8 @@ async function cmdWorkflow(
       const gate = makeSessionGate(flags);
       const registry = new ToolRegistry(gate);
       for (const def2 of await backend.listTools()) registry.register(def2);
-      const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
+      const skillTracker = new SkillLoadTracker(); // CC#52 — per-session load-skill dedup
+      const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted", loadTracker: skillTracker });
       if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
       attachAudit(registry, flags);
       const log = loadSession(sessionPath);
@@ -1268,6 +1289,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   let agentMode: "build" | "plan" = "build";
   let registry = new ToolRegistry(gate);
   let skills: Skill[] = [];
+  // CC#52 — session-lived load-skill dedup tracker; survives registry rebuilds,
+  // reset on compaction so a skill can be re-loaded once its instructions are
+  // likely no longer in context.
+  const skillTracker = new SkillLoadTracker();
   const tuiRef: { current: Tui | null } = { current: null };
   // P#39 — TUI slash commands contributed by extensions.
   const extensionCommands = new Map<string, { run(args: string): void | Promise<void> }>();
@@ -1279,7 +1304,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       if (agentMode === "build" || def.kind !== "write") registry.register(def);
     }
     registry.planMode(agentMode === "plan");
-    skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted" });
+    skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted", loadTracker: skillTracker });
     registerArchiveReadTool(registry);
     void loadExtensions(registry, {
       enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
@@ -1538,12 +1563,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     onLine: handleLine,
     onLineBusy: (line) => {
       const t = line.trim();
-      // Slash commands need a quiet session — keep the queued fallback for them.
-      if (!t || t.startsWith("/")) return false;
+      // Slash commands need a quiet session — keep the queued fallback for
+      // them. Known slash only: unknown "/..." is a message and gets steered.
+      if (!t || isKnownSlash(t)) return false;
       loop.steer(t);
       tui.pushSystem("↳ steering — lands before the next step of the running turn");
       return true;
     },
+    onLineKnownSlash: (line) => isKnownSlash(line),
     onTab: () => setMode(agentMode === "build" ? "plan" : "build"),
     onPalette: () => {
       void openPalette();
@@ -1762,6 +1789,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         tui.push({ role: "assistant", text: event.text });
       } else if (event.type === "compaction") {
         if (event.trigger === "manual") return; // /compact prints its own detailed line
+        skillTracker.reset(); // CC#52 — instructions may be summarized away; allow reload
         const window = resolveContextWindow(flags);
         const pct = usedTokens ? Math.round((usedTokens / window) * 100) : null;
         tui.pushSystem(
@@ -1811,12 +1839,42 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     input: string,
   ): Promise<Awaited<ReturnType<AgentLoop["send"]>>> {
     busy = true;
+    // CC#51 — usage-limit (quota) auto-resume: when the provider spends its
+    // usage window it returns a quota 429. Instead of ending the turn with an
+    // error we WAIT for the reset and re-issue the same call. Opt out with
+    // AIH_QUOTA_AUTO_RESUME=0. (Non-interactive `run` never passes this hook,
+    // so it fails fast and predictably.)
+    const quotaAutoResume = process.env.AIH_QUOTA_AUTO_RESUME !== "0";
+    const quotaWait = quotaAutoResume
+      ? {
+          begin: (info: { retryAfterSec: number; resumeAtMs: number; wait: number }) => {
+            const at = new Date(info.resumeAtMs).toLocaleTimeString();
+            tui.pushSystem(
+              `⏳ [quota] usage limit exhausted — will auto-resume at ${at} ` +
+                `(~${info.retryAfterSec}s, wait ${info.wait})`,
+            );
+          },
+          end: (reason: string) => {
+            tui.pushSystem(
+              reason === "aborted"
+                ? "⏹ quota wait aborted"
+                : "⏳ [quota] window reset — resuming the interrupted call…",
+            );
+          },
+        }
+      : undefined;
     const promise = loop
       .send(
         input,
         streaming
-          ? { onDelta: (d) => tui.pushDelta(d), onRetry: () => tui.resetStream() }
-          : undefined,
+          ? {
+              onDelta: (d) => tui.pushDelta(d),
+              onRetry: () => tui.resetStream(),
+              ...(quotaWait ? { quotaWait } : {}),
+            }
+          : quotaWait
+            ? { quotaWait }
+            : undefined,
       )
       .finally(() => {
         busy = false;
@@ -1965,6 +2023,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
   }
 
+  // Slash-command recognition (opencode semantics): a "/" input is only a
+  // command when its head token names a known builtin / skill / extension
+  // command. Everything else — including code pasted at the prompt like
+  // `setvbuf(stdout, ...)` commented with `//` or `/* ... */` — falls through
+  // to the model as a normal message instead of "unknown command".
+  const isKnownSlash = (text: string): boolean =>
+    isKnownSlashCommand(
+      text,
+      [...skills.map((s) => s.name), ...extensionCommands.keys()],
+    );
+
   async function handleLine(line: string): Promise<void> {
     const input = line.trim();
     if (!input) return;
@@ -1974,7 +2043,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     // P#35 — steering: while a turn is running, plain text input is queued
     // into the running loop (lands after the current tool batch) instead of
     // being rejected; slash commands that need a quiet session still refuse.
-    if (busy && !input.startsWith("/")) {
+    // CC slash-recognition: only KNOWN slash commands take the command path —
+    // unknown "/..." input is steered as a normal message.
+    if (busy && !isKnownSlash(input)) {
       loop.steer(input);
       tui.pushSystem("↳ steering — will land before the next step of the running turn");
       return;
@@ -2337,6 +2408,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       if (tps > 0) lines.push(`throughput: ${fmtTps(tps)} (session average)`);
       const stps = streamingTps(log.all());
       if (stps > 0) lines.push(`streaming: ${fmtTps(stps)} (completion tokens / real generation time)`);
+      // CC#57: loops breakdown — goal rounds / task subagents / best_of_n.
+      const loops = loopUsageBreakdown(log.all());
+      lines.push(...formatLoopBreakdown(loops));
       tui.pushSystem(lines.join("\n"));
       return;
     }
@@ -2541,7 +2615,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
     }
-    if (input.startsWith("/")) {
+    if (input.startsWith("/") && isKnownSlash(input)) {
       // P#39: extension-contributed commands get first crack at unknown
       // slash names.
       const extName = input.slice(1).split(" ")[0];
@@ -2555,6 +2629,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       );
       return;
     }
+    // Unknown "/..." input is not a command — treat it as a normal message
+    // (opencode semantics: pasted code like `// comment` or `/* ... */`
+    // reaches the model instead of dying on "unknown command").
 
     // P1#4: BM25 relevance auto-loading — if an installed skill clearly
     // matches this request and is not in context yet, nudge the model to

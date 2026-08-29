@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PermissionRule } from "@aih/core";
 import { userAihDir, userAihDirs } from "./paths.js";
+import { readJson } from "./read-json.js";
 
 /**
  * Global (user-level) config file. Resolves through the XDG data dir
@@ -66,6 +67,13 @@ export interface ModelEntry {
   model: string;
   /** per-model context window; overrides the provider-level value */
   contextWindow?: number;
+  /**
+   * per-model max output tokens; overrides the provider-level `maxTokens`
+   * for this model only. Some providers cap output per model (e.g. zhipu's
+   * glm-4v-flash rejects max_tokens > 1024 while glm-4-flash accepts more) —
+   * the model-level value lets both share one provider entry.
+   */
+  maxTokens?: number;
 }
 
 export interface McpServerConfig {
@@ -87,6 +95,12 @@ export interface AihConfig {
   /** multiple MCP servers (stdio) connected side-by-side and merged */
   mcpServers?: Record<string, McpServerConfig>;
   permissions?: PermissionRule[];
+  /**
+   * CC#54 — auto-approve provably read-only run_cmd commands (deterministic
+   * prefix whitelist, see cli/src/readonly-allow.ts) when the ruleset has no
+   * explicit rule. Off by default; explicit `false` in a later layer wins.
+   */
+  autoAllowReadonly?: boolean;
   /** context window (max input tokens); per-provider value wins for that provider */
   contextWindow?: number;
   /**
@@ -141,7 +155,7 @@ const PROJECT_CONFIG_FILES = ["aih.json", ".aih/config.json"];
 function readConfig(path: string): AihConfig {
   if (!existsSync(path)) return {};
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as AihConfig;
+    return readJson<AihConfig>(path);
   } catch (err) {
     throw new Error(
       `invalid config file ${path}: ${err instanceof Error ? err.message : String(err)}`,
@@ -222,13 +236,14 @@ function modelLevelWindow(
 }
 
 /** F#34 — normalize a provider's `models[]` into ids plus optional per-model
- *  context windows. Accepts the legacy string form and the `{ model,
- *  contextWindow }` object form; malformed entries are skipped silently so a
- *  single bad line can't break catalog loading. */
+ *  context windows (and F: multi-model maxTokens). Accepts the legacy string
+ *  form and the `{ model, contextWindow, maxTokens }` object form; malformed
+ *  entries are skipped silently so a single bad line can't break catalog
+ *  loading. */
 export function normalizeModelEntries(
   models: Array<string | ModelEntry> | undefined,
-): Array<{ id: string; contextWindow?: number }> {
-  const out: Array<{ id: string; contextWindow?: number }> = [];
+): Array<{ id: string; contextWindow?: number; maxTokens?: number }> {
+  const out: Array<{ id: string; contextWindow?: number; maxTokens?: number }> = [];
   for (const m of models ?? []) {
     if (typeof m === "string") {
       if (m.trim()) out.push({ id: m });
@@ -236,13 +251,35 @@ export function normalizeModelEntries(
     }
     if (m && typeof m === "object" && typeof (m as ModelEntry).model === "string" && (m as ModelEntry).model.trim()) {
       const cw = (m as ModelEntry).contextWindow;
+      const mt = (m as ModelEntry).maxTokens;
       out.push({
         id: ((m as ModelEntry).model),
         ...(typeof cw === "number" && Number.isFinite(cw) && cw > 0 ? { contextWindow: cw } : {}),
+        ...(typeof mt === "number" && Number.isFinite(mt) && mt > 0 ? { maxTokens: mt } : {}),
       });
     }
   }
   return out;
+}
+
+/** per-model max output tokens declared on the active provider's `models[]`
+ *  entry (object form). Later layers override earlier ones; plain string
+ *  entries and other providers are ignored. */
+function modelLevelMaxTokens(
+  layers: ConfigLayer[],
+  providerName: string | undefined,
+  modelId: string | undefined,
+): number | undefined {
+  if (!providerName || !modelId) return undefined;
+  let found: number | undefined;
+  for (const { config } of layers) {
+    const p = config.providers?.[providerName];
+    if (!p?.models) continue;
+    for (const e of normalizeModelEntries(p.models)) {
+      if (e.id === modelId && e.maxTokens !== undefined) found = e.maxTokens;
+    }
+  }
+  return found;
 }
 
 function fromLayers(
@@ -270,6 +307,18 @@ export function loadPermissionRules(): PermissionRule[] {
   const out: PermissionRule[] = [];
   for (const layer of loadLayers()) {
     for (const rule of layer.config.permissions ?? []) out.push(rule);
+  }
+  return out;
+}
+
+/**
+ * CC#54 — merged `autoAllowReadonly` across config layers. Later layers win
+ * per-key (explicit `false` disables an earlier `true`); default off.
+ */
+export function loadAutoAllowReadonly(): boolean {
+  let out = false;
+  for (const { config } of loadLayers()) {
+    if (typeof config.autoAllowReadonly === "boolean") out = config.autoAllowReadonly;
   }
   return out;
 }
@@ -464,6 +513,42 @@ export function providerEntry(name: string): ProviderConfig {
   return p;
 }
 
+/**
+ * CC#59 — a credential belongs to one host. When the effective baseUrl is
+ * overridden (`AIH_BASE_URL` / `--base-url`) to a host different from the
+ * provider's configured home, sensitive identity headers (authorization /
+ * api-key …) must NOT ride along to the new host. Non-sensitive headers (e.g.
+ * client identity like a user-agent / rate-pool id) still pass through.
+ */
+const SENSITIVE_HEADER_RE = /^(authorization|proxy-authorization|x-api-key|api-key|apikey|x-goog-api-key|x-amz-security-token|x-nano-fp)$/i;
+
+function hostOf(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
+}
+
+export function credentialSafeHeaders(
+  headers: Record<string, string>,
+  homeBaseUrl: string | undefined,
+  effectiveBaseUrl: string | undefined,
+): Record<string, string> {
+  if (!homeBaseUrl || !effectiveBaseUrl) return { ...headers };
+  const home = hostOf(homeBaseUrl);
+  const eff = hostOf(effectiveBaseUrl);
+  if (!home || !eff || home === eff) return { ...headers };
+  // Hosts differ → drop sensitive headers; keep non-sensitive ones.
+  const safe: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (SENSITIVE_HEADER_RE.test(k)) continue;
+    safe[k] = v;
+  }
+  return safe;
+}
+
 export function resolveLlm(opts: {  flagModel?: string;
   flagBaseUrl?: string;
   flagProvider?: string;
@@ -506,13 +591,26 @@ export function resolveLlm(opts: {  flagModel?: string;
     provider?.apiKeyEnv ??
     (providerName ? `AIH_${providerName.toUpperCase()}_API_KEY` : "AIH_API_KEY");
 
-  const headers = { ...(provider?.headers ?? {}) };
+  // CC#59 — a credential only rides to its own host. If the effective baseUrl
+  // (possibly overridden by AIH_BASE_URL / --base-url) targets a different host
+  // than the provider's configured home, sensitive headers are dropped.
+  const homeBaseUrl = fromLayers(layers, (c) =>
+    provider?.baseUrl !== undefined ? provider.baseUrl : c.baseUrl,
+  );
+  const headers = credentialSafeHeaders({ ...(provider?.headers ?? {}) }, homeBaseUrl?.value, baseUrl?.value);
 
   const keyless = provider?.keyless === true;
+
+  // Model-level maxTokens overrides the provider tier, so models with
+  // different output caps (e.g. zhipu glm-4v-flash ≤ 1024) share one
+  // provider entry without forcing every model down to the smallest cap.
+  const mMaxTokens = modelLevelMaxTokens(layers, providerName, model.value);
   const maxTokens =
-    typeof provider?.maxTokens === "number" && provider.maxTokens > 0
-      ? provider.maxTokens
-      : undefined;
+    mMaxTokens !== undefined
+      ? mMaxTokens
+      : typeof provider?.maxTokens === "number" && provider.maxTokens > 0
+        ? provider.maxTokens
+        : undefined;
 
   // F#34 — the active model's own models[] entry overrides the provider tier.
   const mWindow = modelLevelWindow(layers, providerName, model.value);

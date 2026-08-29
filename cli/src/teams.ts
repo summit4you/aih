@@ -18,6 +18,7 @@ import type { ChildProcess } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readJson } from "./read-json.js";
 import { spawnJob } from "./jobs.js";
 
 export type TaskStatus = "todo" | "claimed" | "done" | "failed" | "cancelled";
@@ -79,7 +80,7 @@ export function loadTeam(cwd: string): TeamState {
   const p = teamFile(cwd);
   if (!existsSync(p)) return { agents: [], tasks: [] };
   try {
-    const parsed = JSON.parse(readFileSync(p, "utf8")) as TeamState;
+    const parsed = readJson<TeamState>(p);
     return {
       agents: Array.isArray(parsed.agents) ? parsed.agents : [],
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],

@@ -74,6 +74,27 @@ export interface ParseOptions {
   onReasoning?: (delta: string) => void;
   /** Fired once when first data frame arrives (for stall detection). */
   onFirstToken?: () => void;
+  /**
+   * CC#49 — fired on EVERY observed stream activity (each data frame line).
+   * The caller (llm-openai) resets its inter-frame stall timer on this.
+   */
+  onActivity?: () => void;
+}
+
+/**
+ * CC#49 — the stream went silent past the stall budget AFTER partial content
+ * had already arrived. Carries what was received so the turn can resume
+ * honestly ("[stream interrupted] continue from where you left off") instead
+ * of losing the partial answer or presenting it as complete.
+ */
+export class StallError extends Error {
+  /** Text received before the stall (may be empty). */
+  partialText: string;
+  constructor(partialText: string, silentMs: number) {
+    super(`stream stalled: no data for ${silentMs}ms`);
+    this.name = "StallError";
+    this.partialText = partialText;
+  }
 }
 
 // ── Core parser ────────────────────────────────────────────────────────
@@ -190,6 +211,8 @@ export async function consumeSSEStream(
   const firstFrameFired = { value: false };
 
   for await (const chunk of body) {
+    // CC#49 — every network chunk is activity; reset the caller's stall timer.
+    opts.onActivity?.();
     buffer += decoder.decode(chunk as Buffer, { stream: true });
     let newlineAt: number;
     while ((newlineAt = buffer.indexOf("\n")) >= 0) {
@@ -258,4 +281,55 @@ export function classifyProviderError(
   if (CAPACITY_RE.test(body)) return "capacity";
   if (RETRYABLE_STATUS.has(status)) return "retryable";
   return "fatal";
+}
+
+// ── Quota-exhaustion detection (CC#51) ─────────────────────────────────
+//
+// A "quota" 429 is NOT a transient rate limit: the provider's usage window
+// is spent and will reset on a schedule (minutes, not seconds). Retrying it
+// with the normal backoff budget just burns attempts and ends the turn with
+// an error. Instead we want to WAIT for the reset and resume the SAME call
+// (not re-run the turn).
+//
+// We distinguish quota from a plain rate-limit 429 by (roadmap CC#51 spec):
+//   ① body keywords (quota / limit / credits), OR
+//   ② a Retry-After header far larger than the normal backoff cap (≥60s) —
+//      a provider telling us "come back in N minutes" is a quota window.
+
+const QUOTA_RE = /quota|limit|credits/i;
+/** Retry-After (seconds) at/above which a 429 is a quota window, not a blip. */
+const QUOTA_RETRY_AFTER_SEC = 60;
+
+/**
+ * CC#51 — true when a 429 (or 402) is a quota/usage-window exhaustion rather
+ * than a transient rate limit. `retryAfterSec` is the Retry-After header in
+ * seconds (undefined when absent).
+ */
+export function isQuotaExhaustion(
+  status: number,
+  body: string,
+  retryAfterSec?: number,
+): boolean {
+  if (status !== 429 && status !== 402) return false;
+  if (QUOTA_RE.test(body)) return true;
+  if (retryAfterSec !== undefined && retryAfterSec >= QUOTA_RETRY_AFTER_SEC)
+    return true;
+  return false;
+}
+
+/**
+ * CC#51 — a provider rejected the call because the usage window is spent.
+ * Carries the reset horizon so the caller can wait + resume the SAME call.
+ */
+export class QuotaError extends Error {
+  /** Seconds until the provider expects the window to reset (0 = unknown). */
+  retryAfterSec: number;
+  constructor(status: number, body: string, retryAfterSec: number) {
+    super(
+      `usage limit exhausted (HTTP ${status}): ${body.slice(0, 200)}` +
+        (retryAfterSec > 0 ? ` — reset in ~${retryAfterSec}s` : ""),
+    );
+    this.name = "QuotaError";
+    this.retryAfterSec = retryAfterSec;
+  }
 }

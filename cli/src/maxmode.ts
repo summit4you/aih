@@ -155,7 +155,15 @@ export async function bestOfN(
   }
 
   // Judge: one no-tools LLM call picks the best index (same pattern as /goal).
-  const body = okIdx.map((i) => `### Candidate ${i}\n${candidates[i].answer}`).join("\n\n");
+  // CC#50 — annotate partial candidates so the judge does not prefer a
+  // truncated-but-looks-complete answer over a genuinely finished one.
+  const body = okIdx
+    .map((i) => {
+      const c = candidates[i];
+      const flag = c.stopReason === "end_turn" ? "" : "[PARTIAL — subagent did not finish; treat as incomplete]\n";
+      return `### Candidate ${i}\n${flag}${c.answer}`;
+    })
+    .join("\n\n");
   const resp = await opts.llm.complete({
     messages: [
       {

@@ -1,4 +1,5 @@
 import type { ApprovalGate } from "./seams/permissions.js";
+import { AskError } from "./seams/permissions.js";
 import type {
   ToolContext,
   ToolDefinition,
@@ -132,6 +133,8 @@ export class ToolRegistry {
         tool: name,
         kind: def.kind,
         args,
+        // CC#60 — injected input (serve/steering) never approves asks.
+        source: ctx.source ?? "tty",
         ...(doomLoop
           ? { reason: `doom_loop: identical call repeated ${repeats} times — continue after repeated failures?` }
           : {}),
@@ -157,6 +160,23 @@ export class ToolRegistry {
       try {
         await before(hookInfo);
       } catch (err) {
+        // CC#53 — an AskError from a before-hook forces a human confirmation
+        // (the "ask" floor) instead of a plain veto/deny.
+        if (err instanceof AskError) {
+          const approved = await this.#gate.request({
+            tool: name,
+            kind: def.kind,
+            args,
+            source: ctx.source ?? "tty",
+            reason: `before-hook requires confirmation: ${err.message}`,
+          });
+          if (approved) break; // continue with the call
+          return {
+            ok: false,
+            error: `user rejected ${name} (before-hook ask)`,
+            permission: "denied",
+          };
+        }
         return {
           ok: false,
           error: `hook vetoed ${name}: ${err instanceof Error ? err.message : String(err)}`,

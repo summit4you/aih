@@ -165,6 +165,290 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     }
   }
 
+  // CC#55 — readJson: UTF-8 BOM tolerance for config / JSON state files.
+  {
+    const { readJson } = await import("./read-json.js");
+    const dir = mkdtempSync(join(tmpdir(), "aih-smoke-bom-"));
+    const bare = join(dir, "plain.json");
+    const bom = join(dir, "bom.json");
+    writeFileSync(bare, '{"a":1,"list":[1,2,3]}', "utf8");
+    writeFileSync(bom, "\uFEFF" + '{"a":1,"list":[1,2,3]}', "utf8");
+    const p1 = readJson<{ a: number; list: number[] }>(bare);
+    const p2 = readJson<{ a: number; list: number[] }>(bom);
+    assert(p1.a === 1 && p1.list.length === 3, "CC#55 readJson: bare JSON parses (a=1)");
+    assert(
+      p2.a === 1 && p2.list.length === 3 && JSON.stringify(p2) === '{"a":1,"list":[1,2,3]}',
+      "CC#55 readJson: BOM-prefixed JSON parses identically to bare JSON",
+    );
+    console.log("ok: CC#55 readJson strips UTF-8 BOM");
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // CC slash-recognition — pasted code like `// setvbuf(...)` must NOT be
+  // parsed as a slash command; unknown "/..." reaches the model as a message
+  // (opencode parseSlashCommand semantics: known head token or nothing).
+  {
+    const { isKnownSlashCommand, slashHeadOf, BUILTIN_SLASH_HEADS } = await import("./slash.js");
+    // the reported bug: C code whose comment starts with "//"
+    const pastedCode = `// 无缓冲：崩溃/卡死时也能实时看到日志（文件重定向默认全缓冲会吞掉现场）\n    setvbuf(stdout, nullptr, _IONBF, 0);`;
+    assert(slashHeadOf(pastedCode) === "", "slashHeadOf: '//' yields empty head (not a command)");
+    assert(slashHeadOf("/* block comment */") === "", "slashHeadOf: '/*' yields empty head");
+    assert(isKnownSlashCommand(pastedCode) === false, "pasted C code with // is a normal message, not a command");
+    assert(isKnownSlashCommand("/goal fix the build") === true, "known builtin with args → command");
+    assert(isKnownSlashCommand("/unknowncmd hello") === false, "unknown slash head → normal message (was: unknown command error)");
+    assert(isKnownSlashCommand("/SKILLS") === true, "head matching is case-insensitive");
+    assert(isKnownSlashCommand("/my-skill", ["my-skill", "ext"]) === true, "skill/extension heads count as known");
+    assert(isKnownSlashCommand("/ext run", ["ext"]) === true, "extension with args → command");
+    assert(isKnownSlashCommand("/") === false, "bare '/' is not a command");
+    assert(BUILTIN_SLASH_HEADS.has("help") && BUILTIN_SLASH_HEADS.has("exit"), "builtin heads populated");
+    console.log("ok: CC slash-recognition — pasted '// code' is a message, only known heads are commands");
+  }
+
+  // CC#59 — credential scope: sensitive headers ride only to the provider's
+  // own host. A host override (proxy / mirror / typo'd endpoint) must drop
+  // authorization-class headers while keeping innocuous ones.
+  {
+    const { credentialSafeHeaders } = await import("./config.js");
+    const headers = {
+      authorization: "Bearer sk-secret",
+      "x-api-key": "sk-also-secret",
+      "user-agent": "aih/1.0",
+      "x-custom-trace": "ok",
+    };
+    const sameHost = credentialSafeHeaders(headers, "https://api.example.com/v1", "https://api.example.com/v1");
+    assert(
+      sameHost.authorization === "Bearer sk-secret" && sameHost["x-api-key"] === "sk-also-secret",
+      "CC#59: same-host request keeps all headers (secrets go to their owner)",
+    );
+    const diffHost = credentialSafeHeaders(headers, "https://api.example.com/v1", "https://evil.example.com/v1");
+    assert(
+      !("authorization" in diffHost) && !("x-api-key" in diffHost),
+      "CC#59: host override drops authorization/x-api-key",
+    );
+    assert(
+      diffHost["user-agent"] === "aih/1.0" && diffHost["x-custom-trace"] === "ok",
+      "CC#59: non-sensitive headers survive the leak guard",
+    );
+    const missing = credentialSafeHeaders(headers, undefined, "https://x.example.com");
+    assert("authorization" in missing, "CC#59: unknown home base → pass-through (cannot judge, fails open)");
+    const proxyAuth = credentialSafeHeaders(
+      { "proxy-authorization": "Basic zzz", apikey: "k2" },
+      "https://a.com",
+      "https://b.com",
+    );
+    assert(!("proxy-authorization" in proxyAuth) && !("apikey" in proxyAuth), "CC#59: proxy-authorization/apikey also dropped");
+    console.log("ok: CC#59 credentialSafeHeaders — secrets only ride to their owning host");
+  }
+
+  // CC#57 — /usage Loops breakdown: goal rounds / task / best_of_n aggregated
+  // per source with turn-attributed tokens (spotlight, not a ledger).
+  {
+    const { loopUsageBreakdown, formatLoopBreakdown, fmtAgo } = await import("./loops.js");
+    const mkEnd = (seq: number, ts: number, turnId: string, total: number): SessionEvent =>
+      ({
+        seq,
+        ts,
+        type: "turn/end",
+        turnId,
+        stopReason: "end_turn",
+        usage: { promptTokens: total - 10, completionTokens: 10, totalTokens: total },
+      }) as SessionEvent;
+    const mkGoal = (seq: number, ts: number, turnId: string): SessionEvent =>
+      ({ seq, ts, type: "goal/judge", turnId, met: false, reason: "r", unmet: [] }) as SessionEvent;
+    const mkCall = (seq: number, ts: number, turnId: string, name: string): SessionEvent =>
+      ({ seq, ts, type: "tool/call", turnId, callId: `c${seq}`, name, args: {} }) as SessionEvent;
+
+    const t0 = 1_000_000_000_000;
+    const now = t0 + 120_000; // "2m ago" territory
+    const events: SessionEvent[] = [
+      mkEnd(0, t0, "turnA", 30_000),
+      mkGoal(1, t0 + 1_000, "turnA"),
+      mkGoal(2, t0 + 2_000, "turnA"),
+      mkGoal(3, t0 + 3_000, "turnA"),
+      mkEnd(4, t0 + 10_000, "turnB", 50_000),
+      mkCall(5, t0 + 10_100, "turnB", "task"),
+      mkEnd(6, t0 + 20_000, "turnC", 5_000),
+      mkCall(7, t0 + 20_100, "turnC", "task"),
+      mkCall(8, t0 + 20_200, "turnC", "best_of_n"),
+      // plain turn with no loop activity — must not be attributed
+      mkEnd(9, t0 + 30_000, "turnD", 999_000),
+    ];
+    const stats = loopUsageBreakdown(events);
+    const goal = stats.find((s) => s.source === "goal");
+    const task = stats.find((s) => s.source === "task");
+    const bon = stats.find((s) => s.source === "best_of_n");
+    assert(goal?.runs === 3 && goal.totalTokens === 30_000, "CC#57: goal rounds = 3 runs, turn-attributed 30k tok");
+    assert(task?.runs === 2 && task.totalTokens === 55_000, "CC#57: task = 2 runs across two turns (50k + 5k)");
+    assert(bon?.runs === 1 && bon.totalTokens === 5_000, "CC#57: best_of_n shares turnC with task");
+    assert(bon?.sharedTurn === true, "CC#57: shared turn flagged");
+    assert(!stats.some((s) => s.totalTokens > 60_000), "CC#57: plain turnD's 999k tok NOT attributed to any loop source");
+    assert(stats[0].source === "task", "CC#57: sorted by totalTokens desc (runaway first)");
+    const lines = formatLoopBreakdown(stats, now);
+    assert(lines.length >= 4 && lines[0].startsWith("loops breakdown"), "CC#57: header + one line per source");
+    assert(lines.some((l) => l.includes("goal rounds: 3 runs") && l.includes("30.0k tok") && l.includes("10.0k/run")), "CC#57: goal line format (runs · tok · per-run)");
+    assert(lines.some((l) => l.includes("last 1m ago")), "CC#57: relative last-run time (task/best_of_n last activation ~100s before now)");
+    assert(lines.some((l) => l.includes("spotlight, not a ledger")), "CC#57: shared-turn honesty note present");
+    assert(formatLoopBreakdown([], now).length === 0, "CC#57: no loop activity → no lines");
+    assert(fmtAgo(t0 + 5_000, t0 + 5_003) === "just now", "CC#57: fmtAgo just now");
+    console.log("ok: CC#57 loops breakdown — per-source runs/tok/per-run/last with honest attribution");
+  }
+
+  // CC#54 — autoAllowReadonly: deterministic read-only whitelist, off by
+  // default, never overrides explicit ask/deny rules.
+  {
+    const { isReadonlyCommand } = await import("./readonly-allow.js");
+    const { SessionGate, DenyGate } = await import("./gate.js");
+    const { ToolRegistry } = await import("@aih/core");
+
+    // whitelist accepts
+    assert(isReadonlyCommand("ls -la /tmp"), "CC#54: ls accepted");
+    assert(isReadonlyCommand("cat foo.txt"), "CC#54: cat accepted");
+    assert(isReadonlyCommand("grep -rn pattern src/"), "CC#54: grep accepted");
+    assert(isReadonlyCommand("git status"), "CC#54: git status accepted");
+    assert(isReadonlyCommand("git log --oneline -5"), "CC#54: git log accepted");
+    assert(isReadonlyCommand("AIH_X=1 ls"), "CC#54: env-var prefix tolerated");
+    // dangerous / unknown rejected
+    assert(!isReadonlyCommand("rm -rf /"), "CC#54: rm rejected");
+    assert(!isReadonlyCommand("ls > /etc/passwd"), "CC#54: redirect rejected");
+    assert(!isReadonlyCommand("cat a && rm b"), "CC#54: chaining rejected");
+    assert(!isReadonlyCommand("echo $(rm -rf x)"), "CC#54: command substitution rejected");
+    assert(!isReadonlyCommand("find . -delete"), "CC#54: find -delete rejected");
+    assert(!isReadonlyCommand("find . -exec rm {} \\;"), "CC#54: find -exec rejected");
+    assert(!isReadonlyCommand("git push origin main"), "CC#54: git push rejected (not on list)");
+    assert(!isReadonlyCommand("curl http://evil"), "CC#54: curl rejected (not on list)");
+    assert(!isReadonlyCommand("ls; rm x"), "CC#54: semicolon chaining rejected");
+    assert(!isReadonlyCommand(""), "CC#54: empty command rejected");
+
+    // Gate integration. SessionGate's ask path always prompts a human (CC#53
+    // floor), so we attach a stub TUI whose askConfirm records the prompt and
+    // answers "deny". OFF → prompt happens (and is denied); ON with a
+    // whitelist/read request → NO prompt at all (auto-allow).
+    const mkStubTui = (): { tui: unknown; prompts: string[] } => {
+      const prompts: string[] = [];
+      return {
+        prompts,
+        tui: { askConfirm: async (detail: string) => { prompts.push(detail); return "deny" as const; }, pushSystem: () => {} },
+      };
+    };
+    const attach = (gate: unknown, stub: { tui: unknown }): void => {
+      (gate as { attachTui(t: unknown): void }).attachTui(stub.tui);
+    };
+
+    // OFF (default): no rules → human prompt (recorded) → denied by the stub.
+    const offStub = mkStubTui();
+    const offGate = new SessionGate(new DenyGate(), [], undefined, false);
+    attach(offGate, offStub);
+    const offOk = await offGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" } });
+    assert(offOk === false && offStub.prompts.length === 1, "CC#54: default OFF — read-only cmd still prompts (recorded 1 prompt)");
+
+    // ON + no rules: whitelist passes with NO prompt at all.
+    const onStub = mkStubTui();
+    const onGate = new SessionGate(new DenyGate(), [], undefined, true);
+    attach(onGate, onStub);
+    const onOk = await onGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" } });
+    assert(onOk === true && onStub.prompts.length === 0, "CC#54: ON — whitelisted cmd auto-allowed, zero prompts");
+
+    // ON but non-whitelisted command → prompts → denied by the stub.
+    const badStub = mkStubTui();
+    const badGate = new SessionGate(new DenyGate(), [], undefined, true);
+    attach(badGate, badStub);
+    const badOk = await badGate.request({ tool: "run_cmd", kind: "write", args: { command: "curl http://evil.example" } });
+    assert(badOk === false && badStub.prompts.length === 1, "CC#54: ON — non-whitelisted cmd still prompts");
+
+    // ON + explicit deny rule dominates the whitelist (floor intact).
+    const denyStub = mkStubTui();
+    const denyGate = new SessionGate(new DenyGate(), [{ tool: "run_cmd", pattern: "*", action: "deny" }], undefined, true);
+    attach(denyGate, denyStub);
+    const denyOk = await denyGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" } });
+    assert(denyOk === false && denyStub.prompts.length === 0, "CC#54: explicit deny rule dominates — silent reject, no prompt");
+
+    // ON + read-kind request with no rules → auto-allow, no prompt.
+    const readStub = mkStubTui();
+    const readGate = new SessionGate(new DenyGate(), [], undefined, true);
+    attach(readGate, readStub);
+    const readOk = await readGate.request({ tool: "list_todos", kind: "read", args: {} });
+    assert(readOk === true && readStub.prompts.length === 0, "CC#54: ON — read-kind request auto-allowed, zero prompts");
+
+    console.log("ok: CC#54 autoAllowReadonly — deterministic whitelist, default off, floors intact");
+  }
+
+  // CC#60 — notification classification: injected input (serve/steering) can
+  // never approve a pending ask; only TTY keyboard input can.
+  {
+    const { SessionGate, DenyGate } = await import("./gate.js");
+    const mkStubTui = (): { tui: unknown; prompts: string[] } => {
+      const prompts: string[] = [];
+      return {
+        prompts,
+        tui: { askConfirm: async (detail: string) => { prompts.push(detail); return "once" as const; }, pushSystem: () => {} },
+      };
+    };
+    // TTY source: the ask prompts a human; the stub approves "once".
+    const ttyStub = mkStubTui();
+    const ttyGate = new SessionGate(new DenyGate(), [], undefined, false);
+    (ttyGate as { attachTui(t: unknown): void }).attachTui(ttyStub.tui);
+    const ttyOk = await ttyGate.request({ tool: "run_cmd", kind: "write", args: { command: "deploy.sh" }, source: "tty" });
+    assert(ttyOk === true && ttyStub.prompts.length === 1, "CC#60: tty source — ask prompts a human as before");
+
+    // Injected source: NO prompt at all — auto-refused even though the stub
+    // would say yes. Message text can never answer an approval.
+    const injStub = mkStubTui();
+    const injGate = new SessionGate(new DenyGate(), [], undefined, false);
+    (injGate as { attachTui(t: unknown): void }).attachTui(injStub.tui);
+    const injOk = await injGate.request({ tool: "run_cmd", kind: "write", args: { command: "deploy.sh" }, source: "injected" });
+    assert(injOk === false && injStub.prompts.length === 0, "CC#60: injected source — refused without any prompt");
+
+    // Legacy callers that don't set source still behave as tty (no behavior change).
+    const legacyStub = mkStubTui();
+    const legacyGate = new SessionGate(new DenyGate(), [], undefined, false);
+    (legacyGate as { attachTui(t: unknown): void }).attachTui(legacyStub.tui);
+    const legacyOk = await legacyGate.request({ tool: "run_cmd", kind: "write", args: {} });
+    assert(legacyOk === true && legacyStub.prompts.length === 1, "CC#60: absent source defaults to tty (back-compat)");
+
+    console.log("ok: CC#60 source classification — injected text never approves an ask; tty unchanged");
+  }
+
+  // CC#58 — TUI hard cap on a pathological single line (base64 / minified diff).
+  {
+    const { wrapStyled, MAX_WRAP_COLS } = await import("./tui.js");
+    const big = "A".repeat(100_000);
+    const t0 = Date.now();
+    const wrapped = wrapStyled(big, 80);
+    const dt = Date.now() - t0;
+    const joined = wrapped.join("\n");
+    assert(
+      joined.includes("chars truncated"),
+      "CC#58: 100k-char single line is truncated with a marker",
+    );
+    assert(joined.length < MAX_WRAP_COLS * 2, "CC#58: wrap output stays bounded");
+    assert(dt < 2000, `CC#58: rendering 100k chars is time-bounded (took ${dt}ms)`);
+    // Marker not present for normal-length lines.
+    const normal = wrapStyled("hello world ".repeat(20), 40).join("\n");
+    assert(!normal.includes("chars truncated"), "CC#58: normal lines are NOT truncated");
+    console.log("ok: CC#58 TUI caps pathological long lines with a truncated marker");
+  }
+
+  // CC#56 — MCP empty-schema args: a provider-serialized JSON string payload is
+  // normalized back to a real typed object before hitting the MCP server.
+  {
+    const { normalizeMcpArgs } = await import("./mcp-backend.js");
+    const obj = normalizeMcpArgs('{"text":"hi","n":3}');
+    assert(
+      obj !== null && typeof obj === "object" && (obj as { text: string }).text === "hi" && (obj as { n: number }).n === 3,
+      "CC#56: string args are parsed back to a typed object",
+    );
+    assert(
+      typeof normalizeMcpArgs({ text: "hi", n: 3 }) === "object",
+      "CC#56: object args pass through unchanged",
+    );
+    assert(
+      typeof normalizeMcpArgs("not-json{") === "string",
+      "CC#56: non-JSON string payload is kept as-is (no throw)",
+    );
+    assert(typeof normalizeMcpArgs(undefined) === "object", "CC#56: undefined args default to object");
+    console.log("ok: CC#56 MCP string args normalize to typed objects");
+  }
+
 
   // lastContextTokens: compaction-aware seeding. When the newest turn-boundary
   // is a compaction event (no LLM turn ran since), the stamped post-compaction
@@ -840,6 +1124,39 @@ assert(
   skillsShowMissing.status === 1 && skillsShowMissing.stderr.includes("unknown skill"),
   "skills show rejects unknown name",
 );
+
+// CC#52 — load_skill de-duplication tracker.
+{
+  const { SkillLoadTracker } = await import("./skills.js");
+  const { registerSkillTool } = await import("./index.js");
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const t = new SkillLoadTracker();
+  assert(!t.isLoaded("app-tour"), "CC#52: skill not loaded initially");
+  t.markLoaded("app-tour");
+  assert(t.isLoaded("app-tour"), "CC#52: skill marked loaded after first load");
+  assert(t.loadedNames().length === 1 && t.loadedNames()[0] === "app-tour", "CC#52: loadedNames lists the loaded skill");
+  // Compaction invalidates the mark → reload allowed.
+  t.reset();
+  assert(!t.isLoaded("app-tour"), "CC#52: compaction reset invalidates load marks");
+
+  // Tool-level: a second load_skill call returns a recap, not the full body.
+  const reg = new ToolRegistry(new AutoApprove());
+  registerSkillTool(reg, { projectTrusted: true });
+  const tool = reg.get("load_skill")!;
+  const once = await tool.execute({ name: "app-tour" }, { turnId: "t", inject: () => {} });
+  const twice = await tool.execute({ name: "app-tour" }, { turnId: "t", inject: () => {} });
+  assert(
+    typeof once === "string" && String(once).length > 200,
+    "CC#52: first load returns the full skill body",
+  );
+  assert(
+    typeof twice === "string" &&
+      String(twice).includes("already loaded") &&
+      String(twice).length < 400,
+    "CC#52: repeat load returns a short dedup recap, not a full duplicate",
+  );
+  console.log("ok: CC#52 SkillLoadTracker dedups repeat loads and resets on compaction");
+}
 
 // --- external skill registry (opencode-compatible index.json) ---
 {
@@ -2324,6 +2641,66 @@ await srv.connect(new StdioServerTransport());
   )) as { ok: boolean; error?: string };
   assert(!rf.ok && /all candidates failed/.test(rf.error ?? ""), "best_of_n reports all-candidates-failed when every subagent errors");
 
+  // CC#50 — subagent partial-results honesty marking.
+  {
+    const registerGeneralToolsMod = (await import("./general-tools.js")).registerGeneralTools;
+    const { ToolRegistry: Reg, toolCall } = await import("@aih/core");
+    const partialLlm = {
+      complete: async () => ({
+        text: "still working...",
+        toolCalls: [toolCall("c-partial", "echo3", { text: "x" })],
+        stopReason: "tool_use" as const,
+      }),
+    };
+    const fullLlm = {
+      complete: async () => ({
+        text: "All done, here is the full result.",
+        toolCalls: [],
+        stopReason: "end_turn" as const,
+      }),
+    };
+    const pParent = new Reg(new AutoApprove());
+    pParent.register({
+      name: "echo3",
+      description: "echo3",
+      kind: "read",
+      permission: "allow",
+      parameters: { type: "object", properties: { text: { type: "string" } }, required: [] },
+      execute: async () => ({ ok: 1 }),
+    });
+    const mkTask = (llm: unknown) => {
+      const g = new AutoApprove();
+      const reg = new Reg(g);
+      registerGeneralToolsMod(reg, {
+        gate: g,
+        llm: llm as NonNullable<Parameters<typeof registerGeneralToolsMod>[1]>["llm"],
+        toolsProvider: () => pParent,
+        cwd: "/tmp",
+      });
+      return reg;
+    };
+    const partial = (await mkTask(partialLlm).invoke(
+      "task",
+      { description: "short task", prompt: "go work" },
+      { turnId: "t", inject: () => {} },
+    )) as { ok: boolean; result?: { answer: string; partial: boolean; stopReason: string }; error?: string };
+    assert(partial.ok === true, "CC#50: task tool runs ok");
+    assert(
+      partial.result?.partial === true && partial.result.stopReason === "max_steps" && /^\[partial/.test(partial.result.answer),
+      "CC#50: max_steps-terminated subagent answer is marked partial",
+    );
+    const full = (await mkTask(fullLlm).invoke(
+      "task",
+      { description: "short task", prompt: "go work" },
+      { turnId: "t", inject: () => {} },
+    )) as { ok: boolean; result?: { answer: string; partial: boolean } };
+    assert(
+      full.result?.partial === false && !/^\[partial/.test(full.result.answer),
+      "CC#50: end_turn subagent answer is NOT marked partial",
+    );
+    console.log("ok: CC#50 subagent partial results are honestly marked");
+  }
+
   // runSubagent excludes task/question/best_of_n (no recursion) but keeps tools.
   const { ToolRegistry: Reg2 } = await import("@aih/core");
   const parent2 = new Reg2(new AutoApprove());
@@ -2589,6 +2966,57 @@ await srv.connect(new StdioServerTransport());
     delete process.env.AIH_TRUST_ALL_PROJECTS;
     rmSync(profDir, { recursive: true, force: true });
   }
+}
+
+// CC#53 — permission rule `ask` action + deny>ask>allow floor + AskError hook.
+{
+  const { RulesetGate, DenyAll, AskError, ToolRegistry } = await import("@aih/core");
+  // deny > ask > allow priority: a later `allow` cannot lift an earlier `ask`.
+  const gate = new RulesetGate(new DenyAll(), [
+    { tool: "write_file", action: "ask" },
+    { tool: "write_file", action: "allow" },
+    { tool: "run_cmd", action: "allow" },
+    { tool: "run_cmd", action: "deny" },
+  ]);
+  assert(
+    gate.evaluate({ tool: "write_file", kind: "write", args: { path: "/x" } }) === "ask",
+    "CC#53: ask rule is NOT overridden by a later allow (floor held)",
+  );
+  assert(
+    gate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === "deny",
+    "CC#53: deny dominates an earlier allow",
+  );
+  assert(
+    gate.evaluate({ tool: "unrelated", kind: "write", args: {} }) === undefined,
+    "CC#53: unmatched tool falls through to base",
+  );
+
+  // AskError from a before-hook routes to the approval gate (forces a prompt)
+  // instead of denying — and an approving gate lets the call through.
+  const askRec = { asked: false };
+  const recordingGate: ApprovalGate = {
+    request: async () => {
+      askRec.asked = true;
+      return true; // human approves
+    },
+  };
+  const reg = new ToolRegistry(recordingGate);
+  reg.register({
+    name: "echo4",
+    description: "echo4",
+    kind: "read",
+    permission: "allow",
+    parameters: { type: "object", properties: { text: { type: "string" } }, required: [] },
+    execute: async (a: unknown) => ({ echoed: (a as { text?: string }).text }),
+  });
+  reg.addHooks({
+    before: async () => {
+      throw new AskError("review this one");
+    },
+  });
+  const res = await reg.invoke("echo4", { text: "hi" }, { turnId: "t", inject: () => {} });
+  assert(res.ok === true && askRec.asked === true, "CC#53: AskError floors at a gate prompt; approved call runs");
+  console.log("ok: CC#53 ask rule floors (deny>ask>allow) and AskError routes to the gate");
 }
 
 // --- D#13: background jobs (board bookkeeping + spawn lifecycle) -----------
@@ -3719,9 +4147,9 @@ console.log("ok: TP#4 all security tests passed (17 cases: permission 12 + env-p
 // TP#5: file existence check
 {
   const pmPath = new URL("../../../docs/parity-matrix.md", import.meta.url).pathname;
-  const pmExists = existsSync(pmPath) || existsSync("docs/parity-matrix.md");
-  if (pmExists) {
-    const content = readFileSync(pmPath, "utf8");
+  const existing = [pmPath, "docs/parity-matrix.md"].find((p) => existsSync(p));
+  if (existing) {
+    const content = readFileSync(existing, "utf8");
     assert(content.includes("compaction") || content.includes("压缩"), "TP#5 parity-matrix: covers compaction domain");
     assert(content.includes("permission") || content.includes("权限"), "TP#5 parity-matrix: covers permission domain");
     assert(content.includes("opencode"), "TP#5 parity-matrix: references opencode");

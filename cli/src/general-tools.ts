@@ -698,8 +698,15 @@ export function registerGeneralTools(
       const lastAssistant = [...subLog.all()]
         .reverse()
         .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
-      const answer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
-      return { description: String(a.description ?? ""), steps: result.steps, stopReason: result.stopReason, answer };
+      const rawAnswer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
+      // CC#50 — honest partial marking: a subagent that hit its step limit (or
+      // stopped for any non-end_turn reason) is NOT a finished answer. Prefix a
+      // marker so the parent doesn't consume a truncated result as complete.
+      const finished = result.stopReason === "end_turn";
+      const answer = finished
+        ? rawAnswer
+        : `[partial — subagent stopped at ${result.stopReason ?? "step limit"}; re-delegate with a narrower prompt or ask it to continue] ${rawAnswer}`;
+      return { description: String(a.description ?? ""), steps: result.steps, stopReason: result.stopReason, answer, partial: !finished };
     },
   });
 

@@ -103,6 +103,9 @@ export async function startServe(
     llm,
     tools: registry,
     log,
+    // CC#60 — remote POST /message text is NOT keyboard approval: turns from
+    // serve can never approve a pending permission ask.
+    inputSource: "injected",
     systemPrompt:
       withSkillRoster(loadSystemPrompt(), skills, resolveContextWindow(flags)) + loadMemoryBlock(),
     maxStepsPerTurn: Infinity,

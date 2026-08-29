@@ -26,14 +26,23 @@ export {
   COMPACT_CONTINUE_PROMPT,
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
+  STREAM_RESUME_PROMPT,
   buildGoalJudgePrompt,
   buildBranchDistillPrompt,
 } from "./prompts.js";
 export { OpenAICompatibleLLM, DEFAULT_RETRIES, retryBackoffMs } from "./seams/llm-openai.js";
 export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
-export { consumeSSEStream, classifyProviderError, parseFrame } from "./seams/llm-sse.js";
+export {
+  consumeSSEStream,
+  classifyProviderError,
+  isQuotaExhaustion,
+  parseFrame,
+  QuotaError,
+  StallError,
+} from "./seams/llm-sse.js";
 export type { StreamAccumulator, ParseOptions, ProviderErrorClass } from "./seams/llm-sse.js";
 export {
+  AskError,
   AutoApprove,
   DenyAll,
   PolicyGate,

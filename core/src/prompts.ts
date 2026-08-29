@@ -79,6 +79,18 @@ export const EMPTY_RETRY_PROMPT =
   "make progress, or reply with a short text answer.";
 
 /**
+ * CC#49 — shown after a stream stall that cut off a partial assistant answer.
+ * The partial text was already appended to the transcript; this asks the
+ * model to continue WITHOUT repeating what it already said (honest resume,
+ * aligned with the compaction-recovery style).
+ */
+export const STREAM_RESUME_PROMPT =
+  "[stream interrupted] Your previous response was cut off by a connection " +
+  "stall. It is preserved above. Continue from where you left off — do not " +
+  "repeat the part already written; finish the remaining answer or continue " +
+  "the tool work.";
+
+/**
  * Build the augmented judge prompt: the judge may not trust the agent's
  * self-report; it checks acceptance criteria against real evidence in the
  * transcript and reports which criteria remain unmet (feeds auto-continue).

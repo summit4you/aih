@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type {
   ChatMessage,
+  ContentBlock,
   LLMRequest,
   LLMResponse,
   TokenUsage,
@@ -62,16 +63,22 @@ interface OpenAIToolCall {
 
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | null | Array<Record<string, unknown> | ContentBlock>;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 }
 
 function toOpenAIMessage(message: ChatMessage): OpenAIMessage {
+  // Content-block form (multi-modal): pass through verbatim so providers
+  // receive [{type:"text"}, {type:"image_url",...}] unchanged.
+  const rawContent: string | ContentBlock[] | null = message.content ?? null;
+  const content: OpenAIMessage["content"] = Array.isArray(rawContent)
+    ? (rawContent as Array<Record<string, unknown> | ContentBlock>)
+    : rawContent;
   if (message.role === "assistant") {
     return {
       role: "assistant",
-      content: message.content || null,
+      content,
       ...(message.toolCalls && message.toolCalls.length > 0
         ? {
             tool_calls: message.toolCalls.map((call) => ({
@@ -86,7 +93,7 @@ function toOpenAIMessage(message: ChatMessage): OpenAIMessage {
   if (message.role === "tool") {
     return {
       role: "tool",
-      content: message.content,
+      content: typeof content === "string" ? content : (content ?? null),
       tool_call_id: message.toolCallId,
     };
   }
@@ -113,7 +120,41 @@ function parseArguments(raw: string): unknown {
 }
 
 // TP#2: Import consumeSSEStream and classifyProviderError from llm-sse.ts
-import { consumeSSEStream, classifyProviderError } from "./llm-sse.js";
+import {
+  consumeSSEStream,
+  classifyProviderError,
+  isQuotaExhaustion,
+  QuotaError,
+  StallError,
+} from "./llm-sse.js";
+
+// CC#49 — stream-stall guards. Headers received but no data frame within
+// firstTokenMs, or silence between frames within stallMs → abort the request.
+// 0 disables a guard. Defaults: first token 180s, inter-frame 60s.
+const FIRST_TOKEN_TIMEOUT_MS = () =>
+  Number(process.env.AIH_FIRST_TOKEN_TIMEOUT_MS ?? "") || 180_000;
+const STALL_TIMEOUT_MS = () =>
+  Number(process.env.AIH_STALL_TIMEOUT_MS ?? "") || 60_000;
+
+/** Arm a stall watchdog: fires `fire` after `ms` unless disarmed/reset. */
+function armStallTimer(ms: number, fire: () => void): { reset(): void; disarm(): void } {
+  if (ms <= 0) return { reset() {}, disarm() {} };
+  let handle: ReturnType<typeof setTimeout> | undefined = setTimeout(fire, ms);
+  return {
+    reset() {
+      if (handle) {
+        clearTimeout(handle);
+        handle = setTimeout(fire, ms);
+      }
+    },
+    disarm() {
+      if (handle) {
+        clearTimeout(handle);
+        handle = undefined;
+      }
+    },
+  };
+}
 
 export class OpenAICompatibleLLM implements LLMAdapter {
   #options: OpenAICompatibleOptions;
@@ -159,6 +200,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     if (this.#options.maxTokens !== undefined) {
       body.max_tokens = this.#options.maxTokens;
     }
+    if (req.thinking) {
+      body.thinking = { type: "enabled" };
+    }
     if (req.onDelta) {
       body.stream = true;
       body.stream_options = { include_usage: true };
@@ -203,6 +247,16 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       if (!res.ok) {
         const text = await res.text();
         const message = `llm request failed: HTTP ${res.status} ${text}`;
+        // CC#51 — a quota/usage-window 429 is NOT a transient blip: it resets
+        // on a schedule (minutes). Throw QuotaError so the AgentLoop can wait
+        // for the reset and re-issue the SAME call (instead of burning the
+        // retry budget and ending the turn with an error).
+        const retryAfterRaw = res.headers.get("retry-after");
+        const retryAfterNum = retryAfterRaw ? Number(retryAfterRaw) : NaN;
+        const retryAfterSec = Number.isFinite(retryAfterNum) ? retryAfterNum : undefined;
+        if (isQuotaExhaustion(res.status, text, retryAfterSec)) {
+          throw new QuotaError(res.status, text, retryAfterSec ?? 0);
+        }
         const cls = classifyProviderError(res.status, text);
         if (cls === "capacity") {
           attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
@@ -216,16 +270,62 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       }
       try {
         if (req.onDelta && res.body) {
-          const acc = await consumeSSEStream(res.body, {
-            onDelta: req.onDelta,
-            onReasoning: (req as any).onReasoning,
+          // CC#49 — stall watchdogs: (1) the first data frame must arrive
+          // within AIH_FIRST_TOKEN_TIMEOUT_MS; (2) frames must keep flowing
+          // within AIH_STALL_TIMEOUT_MS. Firing cancels the read, which ends
+          // the for-await inside consumeSSEStream. With partial text we throw
+          // StallError (the AgentLoop resumes honestly); with none we fold
+          // into the normal retry budget below.
+          //
+          // The body is read through an explicit reader: res.body.cancel() is
+          // REJECTED while the stream is locked by the parse loop ("Invalid
+          // state: ReadableStream is locked") — only reader.cancel() can
+          // settle the pending read (it resolves it as {done:true}).
+          const reader = res.body.getReader();
+          const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              return reader.read().then((r) =>
+                r.done ? controller.close() : controller.enqueue(r.value),
+              );
+            },
           });
+          let stalled = false;
+          let stallMs = 0;
+          const fire = (ms: number) => {
+            if (stalled) return;
+            stalled = true;
+            stallMs = ms;
+            reader.cancel().catch(() => {});
+          };
+          const firstTimer = armStallTimer(FIRST_TOKEN_TIMEOUT_MS(), () => fire(FIRST_TOKEN_TIMEOUT_MS()));
+          let stallTimer = armStallTimer(0, () => {});
+          const activity = () => {
+            // First activity disarms the first-token guard; every activity
+            // re-arms the inter-frame guard.
+            firstTimer.disarm();
+            stallTimer.disarm();
+            stallTimer = armStallTimer(STALL_TIMEOUT_MS(), () => fire(STALL_TIMEOUT_MS()));
+          };
+          let accOut: Awaited<ReturnType<typeof consumeSSEStream>>;
+          try {
+            accOut = await consumeSSEStream(body, {
+              onDelta: req.onDelta,
+              onReasoning: (req as any).onReasoning,
+              onActivity: activity,
+            });
+          } finally {
+            firstTimer.disarm();
+            stallTimer.disarm();
+          }
+          if (stalled) {
+            throw new StallError(accOut.text, stallMs);
+          }
           return {
-            text: acc.text,
-            toolCalls: acc.toolCalls,
-            stopReason: acc.toolCalls.length > 0 ? "tool_use" : "end_turn",
-            ...(acc.finishReason ? { finishReason: acc.finishReason } : {}),
-            ...(acc.usage ? { usage: acc.usage } : {}),
+            text: accOut.text,
+            toolCalls: accOut.toolCalls,
+            stopReason: accOut.toolCalls.length > 0 ? "tool_use" : "end_turn",
+            ...(accOut.finishReason ? { finishReason: accOut.finishReason } : {}),
+            ...(accOut.usage ? { usage: accOut.usage } : {}),
             // F#30: real per-request generation time (request → last delta),
             // enabling a true streaming TPS metric (completion tokens / genMs).
             genMs: Math.max(0, Date.now() - startedAt),
@@ -234,8 +334,20 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         return toResponse(await res.json());
       } catch (err) {
         if (req.signal?.aborted) throw err;
+        // CC#49 — a stall with partial content is NOT retryable-blind: the
+        // caller (AgentLoop) resumes from the partial text. With NO content,
+        // fold into the normal retry budget like any transient failure.
+        if (err instanceof StallError) {
+          if (err.partialText.trim() !== "") throw err;
+          if (attempt < maxAttempts - 1) {
+            lastError = err;
+            continue;
+          }
+        } else if (attempt < maxAttempts - 1) {
+          lastError = err;
+          continue;
+        }
         lastError = err;
-        if (attempt < maxAttempts - 1) continue;
         throw err;
       }
     }

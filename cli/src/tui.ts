@@ -48,6 +48,8 @@ export interface TuiOptions {
    * Return false to fall back to the internal queue (shown as "queued").
    */
   onLineBusy?(line: string): boolean;
+  /** Is this trimmed input a KNOWN slash command? (used for queue labels) */
+  onLineKnownSlash?(line: string): boolean;
   ctxUsage?(): {
     used: number;
     limit: number;
@@ -197,6 +199,14 @@ function clusterWidth(cluster: string): number {
 }
 
 /** Display width of one code point in terminal cells: 0, 1, or 2. */
+/**
+ * CC#58 — hard cap (in display columns) for a single input line fed to
+ * wrapStyled. Pathological lines (base64, minified diff/JSON) are truncated to
+ * this width with a marker so the wrap loop stays O(n·cols) and rendering stays
+ * interactive.
+ */
+export const MAX_WRAP_COLS = 4000;
+
 export function width(ch: string): number {
   // Fast path for a single code point (the #clip / wrapStyled hot path): a lone
   // code point is a single grapheme cluster, so skip the Segmenter iterator.
@@ -215,7 +225,22 @@ export function cols(text: string): number {
   return n;
 }
 
-function wrapStyled(s: string, limit: number): string[] {
+export function wrapStyled(s: string, limit: number): string[] {
+  // CC#58 — hard cap on a pathological single line (base64 / minified diff).
+  // Without it the wrap loop would be O(n·cols) and freeze rendering on
+  // 10k+-char lines. We measure the plain (unstyled) width and truncate with a
+  // marker, keeping the wrap loop's cost bounded.
+  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
+  if (plain.length > MAX_WRAP_COLS) {
+    const kept = plain.slice(0, MAX_WRAP_COLS);
+    const marker = `… [+${plain.length - MAX_WRAP_COLS} chars truncated]`;
+    return wrapStyledCore(kept + marker, limit);
+  }
+  return wrapStyledCore(s, limit);
+}
+
+/** The wrap loop itself (no cap — wrapStyled handles the cap up front). */
+function wrapStyledCore(s: string, limit: number): string[] {
   const out: string[] = [];
   let cur = "";
   let n = 0;
@@ -1195,7 +1220,8 @@ constructor(opts: TuiOptions) {
           if (!steered) {
             this.#queue.push(line);
             this.pushSystem(
-              line.trim().startsWith("/")
+              // known slash → will run as a command once the turn finishes
+              (line.trim().startsWith("/") && this.#opts.onLineKnownSlash?.(line.trim())) === true
                 ? `queued (runs right after the current turn finishes): ${line}`
                 : `queued: ${line}`,
             );
