@@ -250,6 +250,26 @@ export type SessionEvent =
       resumeAtMs: number;
       /** Which quota-wait this is (1-based), bounded by MAX_QUOTA_WAITS. */
       wait: number;
+    }
+  | {
+      seq: number;
+      ts: number;
+      type: "escalate";
+      turnId?: string;
+      /**
+       * PE#4 — explicit "stop and give a human a decision" primitive, distinct
+       * from `ask` (which approves a single pending action). Emitted when the
+       * harness hits a bound it cannot resolve alone: a sensor stays red after
+       * bounded retries, a budget is exceeded, or a call fails repeatedly.
+       * Model-invisible (deriveMessages skips it). Non-interactive runs log it
+       * and exit with code 3; interactive runs surface the options in the TUI.
+       */
+      /** Why the loop stopped (e.g. "sensors red after 1 retry", "cost budget exceeded"). */
+      reason: string;
+      /** Concrete options for the human to pick from (2-4). */
+      options: string[];
+      /** The safest action if no response arrives (the playbook's "safest default"). */
+      safestDefault: string;
     };
 
 export interface ContentBlock {

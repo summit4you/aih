@@ -268,6 +268,25 @@ runExperiment(tasks, models, reps, subject, { outDir, budget })
 - 无价目表匹配时成本显示 `—` 并提示配置 `prices`；mock 模式无 usage 数据，成本/TPS 不显示
 - 冒烟测试覆盖：价格解析（精确/子串/大小写/用户覆盖/未命中）、成本计算、TPS 边界、格式化
 
+### 记分卡（harness scorecard，PE#3）
+
+「不要数 token，要数**无需人工干预且产出可接受证据的完成任务数**」（Production Agent
+Engineering 6 层 Playbook 的核心指标）。`aih scorecard [--format json]` 从现有
+append-only 会话日志 + `.aih/memory.md` 纯函数算出 6 项健康指标——**无新存储、零重依赖**：
+
+- **completion rate** = goal-met / turn（验证完成率，↑）
+- **rework rate** = 失败 tool 调用 / turn（返工率，↓）
+- **escalation rate** = escalate 事件 / turn（人工介入率，↓，PE#4 原语）
+- **recovery time** = 失败 tool → 下一次成功调用的最大间隔（恢复时长，↓）
+- **cost per verified** = 总成本 / 验证数（每验证结果成本，↓，复用 F#30 价目表）
+- **guide growth** = memory 中 dated 规则数 / 会话跨度（规则增速，理想→下降）
+
+载体：`cli/src/scorecard.ts`（纯函数 `computeScorecard` / `formatScorecard` /
+`countDatedEntries`）+ `cli/src/index.ts` `scorecard` 子命令；数据源 = 现有会话日志
+（`turn/start`、`goal/judge`、`tool/result`、`escalate`、`turn/end.usage`）+ 项目记忆。
+无价目表 / mock 模式下成本项为 `—` / 0，其余指标照常。冒烟覆盖：6 指标数值、
+recovery 跨度、guide 增速（含短跨度不外推）、空会话全 0 不报错、bullet-dated 记忆行计数。
+
 ### Persistent Memory（持久记忆）
 
 `.aih/memory.md` 是 agent 自己维护的持久知识（与 APP.md"人写契约"分离）：
@@ -371,6 +390,7 @@ npm run cli -- session distill-branch branch-a default --from 7  # 废弃分支�
 # TUI 内：/checkpoint [note] 与 /restore [seq]（回滚前自动快照完整历史）
 npm run cli -- session rm work                    # 删除
 npm run cli -- stats                              # 所有会话 token 用量汇总
+npm run cli -- scorecard [--format json]          # harness 健康记分卡（6 指标，PE#3）
 ```
 
 会话文件为 append-only JSONL（每行一个 SessionEvent），可直接审计或程序化回放。

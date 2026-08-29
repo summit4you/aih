@@ -165,6 +165,69 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     }
   }
 
+  // --- PE#3: harness health scorecard (pure over seeded events) -------------
+  {
+  const { computeScorecard, formatScorecard, countDatedEntries } = await import("./scorecard.js");
+
+  // countDatedEntries: only lines that START with a YYYY-MM-DD date count.
+  assert(countDatedEntries("") === 0, "PE#3 countDatedEntries: empty → 0");
+  assert(countDatedEntries("no date here\n  2026-08-29 rule\n2026-08-29 another\n") === 2, "PE#3 countDatedEntries: counts dated lines only");
+  assert(countDatedEntries("2026-08-29\n") === 1, "PE#3 countDatedEntries: bare dated line counts");
+  assert(countDatedEntries("- 2026-08-23 — 借鉴 LongHorizon\n* 2026-08-24 — 第二批\nno date\n") === 2, "PE#3 countDatedEntries: bullet-prefixed dated lines count (real memory.md form)");
+  assert(countDatedEntries("- 2026-08-23 — - 2026-08-23 — nested\n") === 1, "PE#3 countDatedEntries: nested re-append line counts once");
+
+  // Seeded session: 3 turns; turn 1 reworks (fail→pass), turn 2 fails &
+  // escalates, turn 3 is clean + goal-met. Span = 10 days.
+  const t0 = 1_700_000_000_000;
+  const day = 24 * 60 * 60 * 1000;
+  const ev: SessionEvent[] = [
+    { seq: 0, ts: t0, type: "turn/start", turnId: "a" },
+    { seq: 1, ts: t0 + 1000, type: "tool/result", turnId: "a", callId: "c1", ok: false, error: "boom" },
+    { seq: 2, ts: t0 + 9000, type: "tool/result", turnId: "a", callId: "c2", ok: true, result: "ok" }, // recovered in 8s
+    { seq: 3, ts: t0 + 10_000, type: "turn/end", turnId: "a", stopReason: "end_turn", usage: { promptTokens: 1_000_000, completionTokens: 0, totalTokens: 1_000_000 } },
+    { seq: 4, ts: t0 + day, type: "turn/start", turnId: "b" },
+    { seq: 5, ts: t0 + day + 1000, type: "tool/result", turnId: "b", callId: "c3", ok: false, error: "still broken" }, // unrecovered
+    { seq: 6, ts: t0 + day + 2000, type: "escalate", turnId: "b", reason: "sensor red", options: ["retry", "abort"], safestDefault: "abort" },
+    { seq: 7, ts: t0 + day + 3000, type: "turn/end", turnId: "b", stopReason: "end_turn", usage: { promptTokens: 0, completionTokens: 1_000_000, totalTokens: 1_000_000 } },
+    { seq: 8, ts: t0 + 9 * day, type: "turn/start", turnId: "c" },
+    { seq: 9, ts: t0 + 9 * day + 1000, type: "goal/judge", turnId: "c", met: true, reason: "done", unmet: [] },
+    { seq: 10, ts: t0 + 9 * day + 2000, type: "turn/end", turnId: "c", stopReason: "end_turn", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } },
+  ];
+  const price = resolvePrice("gpt-4o")!; // 2.5 / 10 per 1M
+  const mem = "2026-08-29 rule one\n2026-08-29 rule two\nundated prose\n";
+  const m = computeScorecard(ev, { price, memoryText: mem });
+
+  assert(m.started === 3, `PE#3 started = 3 turns (got ${m.started})`);
+  assert(m.verified === 1 && m.goalMet === 1, `PE#3 verified = 1 (goal met) (got ${m.verified})`);
+  assert(m.rework === 2, `PE#3 rework = 2 failed tool calls (got ${m.rework})`);
+  assert(m.escalations === 1, `PE#3 escalations = 1 (got ${m.escalations})`);
+  assert(m.recovered === 1 && m.unrecovered === 1, `PE#3 recovered=1 unrecovered=1 (got ${m.recovered}/${m.unrecovered})`);
+  assert(m.recoveryMs === 8000, `PE#3 recovery time = 8s (got ${m.recoveryMs})`);
+  assert(m.completionRate === 1 / 3, `PE#3 completion rate = 1/3 (got ${m.completionRate})`);
+  assert(m.reworkRate === 2 / 3, `PE#3 rework rate = 2/3 (got ${m.reworkRate})`);
+  assert(m.escalationRate === 1 / 3, `PE#3 escalation rate = 1/3 (got ${m.escalationRate})`);
+  // 1M input @2.5 + 1M output @10 = $12.50 total; /1 verified = $12.50
+  assert(Math.abs(m.costUsd - 12.5) < 1e-9, `PE#3 total cost = $12.50 (got ${m.costUsd})`);
+  assert(Math.abs(m.costPerVerified - 12.5) < 1e-9, `PE#3 cost per verified = $12.50 (got ${m.costPerVerified})`);
+  assert(m.guideEntries === 2, `PE#3 guide entries = 2 dated (got ${m.guideEntries})`);
+  // guide growth = entries * week / span, where span is the real event span.
+  const spanMs = (t0 + 9 * day + 2000) - t0;
+  const expectedPerWeek = (2 * 7 * 24 * 60 * 60 * 1000) / spanMs;
+  assert(Math.abs(m.guidePerWeek - expectedPerWeek) < 1e-9, `PE#3 guide growth = ${expectedPerWeek}/wk over real span (got ${m.guidePerWeek})`);
+  // Short span (< 1 week) → per-week is 0 (no extrapolation).
+  const short = computeScorecard([
+    { seq: 0, ts: 0, type: "turn/start", turnId: "s" },
+    { seq: 1, ts: 1000, type: "turn/end", turnId: "s", stopReason: "end_turn", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } },
+  ], { memoryText: "2026-08-29 a\n2026-08-29 b\n" });
+  assert(short.guideEntries === 2 && short.guidePerWeek === 0, "PE#3 guide growth: span < 1 week → per-week 0 (no extrapolation)");
+  assert(m.tokens.total === 2_000_000, `PE#3 total tokens = 2M (got ${m.tokens.total})`);
+
+  // Empty session → all-zero metrics, no crash.
+  const empty = computeScorecard([]);
+  assert(empty.started === 0 && empty.verified === 0 && empty.completionRate === 0 && empty.costPerVerified === 0, "PE#3 empty session → all-zero metrics, no crash");
+  assert(formatScorecard(empty).includes("completion rate"), "PE#3 formatScorecard renders the metric table");
+}
+
   // CC#55 — readJson: UTF-8 BOM tolerance for config / JSON state files.
   {
     const { readJson } = await import("./read-json.js");

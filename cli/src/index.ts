@@ -89,6 +89,7 @@ import {
   tokensPerSecond,
   totalCost,
 } from "./cost.js";
+import { computeScorecard, formatScorecard } from "./scorecard.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { peekWorkspaceIdentity, compareIdentity } from "./workspace-identity.js";
@@ -158,7 +159,7 @@ import {
   runWorkflow,
 } from "./workflow.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -176,6 +177,7 @@ aih session <list|show|rm|export|import|fork> [args]
                                 fork: aih session fork [source] <target> [--from seq]
                                 import: aih session import <file.jsonl|file.json> [target]
   aih stats                       token usage across saved sessions
+  aih scorecard [--format json]   harness health scorecard (6 metrics, PE#3)
   aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
                                Agent Teams: roster + task board + mailbox (D#15)
   aih skills <list|find|install|show|registry> [args]
@@ -3165,6 +3167,60 @@ function cmdStats() {
 }
 
 /**
+ * PE#3 — harness health scorecard: `aih scorecard [--format json]`.
+ *
+ * The playbook's real metric: "Do not count tokens. Count completed tasks that
+ * required no manual intervention and still produced acceptable evidence."
+ * Pure over the existing append-only session log + project memory — no new
+ * storage, so the zero-dependency / offline stance is preserved. Data sources:
+ *   - completion rate   : goal/judge met / turn/start
+ *   - rework rate       : tool/result failures / turn
+ *   - escalation rate   : escalate events / turn (PE#4)
+ *   - recovery time     : failed tool call → next passing call (max span)
+ *   - cost per verified : totalCost / verified (cost.ts)
+ *   - guide growth      : dated entries in .aih/memory.md over the session span
+ */
+function cmdScorecard(flags: Record<string, string | boolean>) {
+  const format = str(flags, "format") ?? "text";
+  const files = sessionFiles();
+  const events: SessionEvent[] = [];
+  for (const f of files) {
+    for (const event of readSessionEvents(f.name)) events.push(event);
+  }
+  if (events.length === 0) {
+    if (format === "json") {
+      console.log(JSON.stringify({ sessions: 0, metrics: computeScorecard([]) }, null, 2));
+    } else {
+      console.log("(no sessions recorded yet — run a turn first)");
+    }
+    return;
+  }
+  // Cost metrics use the active model's price (same resolution as cmdStats).
+  const modelId = process.env.AIH_MODEL ?? resolveLlm({}).model.value ?? "";
+  const price = modelId ? resolvePrice(modelId, loadPrices()) : undefined;
+  // Guide growth reads the project memory file (one dated line ≈ one rule).
+  const memPath = join(process.cwd(), ".aih", "memory.md");
+  let memoryText: string | undefined;
+  if (existsSync(memPath)) {
+    try {
+      memoryText = readFileSync(memPath, "utf8");
+    } catch {
+      memoryText = undefined;
+    }
+  }
+  const metrics = computeScorecard(events, { price, memoryText });
+  if (format === "json") {
+    console.log(JSON.stringify({ sessions: files.length, metrics }, null, 2));
+    return;
+  }
+  console.log(`scorecard  ${files.length} session${files.length === 1 ? "" : "s"} · ${events.length} events`);
+  console.log("");
+  console.log(formatScorecard(metrics));
+  console.log("");
+  console.log("direction: completion↑ · rework↓ · escalation↓ · recovery↓ · cost-per-verified↓ · guide-growth→declining");
+}
+
+/**
  * E#17 — non-interactive distill: `aih distill [--format json]`.
  * Deterministic repeated-flow extraction over the recent sessions (the same
  * pure functions /distill uses in the TUI). Non-interactive so it can run as
@@ -3940,6 +3996,8 @@ async function main() {
     }
     case "stats":
       return cmdStats();
+    case "scorecard":
+      return cmdScorecard(flags);
     case "team":
       return cmdTeam(positionals, flags);
     case "tidy":
