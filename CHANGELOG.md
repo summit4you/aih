@@ -8,6 +8,68 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
+### Added
+- **Quota auto-resume (CC#51)**: when the provider reports usage-limit
+  exhaustion (429/402 + quota/limit/credits, or `Retry-After` ≥ 60 s), the
+  interactive session waits for the reset (default 60 s, cap 1800 s) and
+  re-issues the **same** rejected call — not a re-run of the turn. Bounded to
+  2 waits (`MAX_QUOTA_WAITS`); TUI shows a wait line; `AIH_QUOTA_AUTO_RESUME=0`
+  disables. Non-interactive `run` fails fast. `quota_wait` session event.
+- **Read-only auto-allow (CC#54)**: read-only tool calls (list, read, glob,
+  grep, etc.) are auto-allowed without an `ask` prompt, reducing approval
+  friction for safe operations while write/dangerous calls still require
+  confirmation.
+- **Credential scope (CC#59)**: sensitive headers (`api-key`, `x-api-key`,
+  `x-goog-api-key`, `x-nano-fp`, `x-amz-security-token`, etc.) are dropped
+  when the effective request host differs from the provider's home host,
+  preventing key leakage to third-party or proxy endpoints.
+- **BOM tolerance (CC#55)**: `readJson` strips a UTF-8 BOM so config and
+  JSON state files saved with a BOM prefix parse correctly.
+- **MCP empty-schema (CC#56)**: tools with an empty or missing `inputSchema`
+  no longer break the MCP handshake; they are exposed with a no-arg schema.
+- **/usage Loops (CC#57)**: `/usage` now shows a per-loop (per-tool-call)
+  token breakdown alongside the session totals.
+- **TUI truncation (CC#58)**: long lines in the TUI transcript truncate
+  cleanly at the terminal width instead of wrapping and overflowing.
+- **Injected-source isolation (CC#60)**: approval requests with
+  `source: "injected"` (from `serve`/`attach` remote `POST /message`) are
+  rejected directly without a human prompt — a remote message cannot spoof
+  an approval. TTY keyboard approvals are unaffected.
+- **Question tool (35cec96)**: the agent must use the `question` tool for
+  user decisions instead of writing the question as assistant text and
+  continuing to act. The user actually sees and answers the question before
+  the agent proceeds (opencode / Claude Code parity).
+- **Bilingual docs site (77dfa9a, 5811654, 72456f3)**: static zh + en docs
+  at `docs-site/` with opencode.ai / Starlight typography, 8 new page pairs
+  (agents, commands, coding, tui, architecture, troubleshooting, development,
+  changelog), language switcher, real TUI screenshots, and a GitHub Pages
+  deploy workflow (`.github/workflows/docs.yml`). Live at
+  `https://summit4you.github.io/aih/`.
+- **Harness health scorecard (PE#3)**: `aih scorecard [--format json]`
+  reports the six playbook metrics — completion rate, rework rate,
+  escalation rate, recovery time, cost per verified result, and guide
+  growth — computed purely over the existing append-only session log +
+  `.aih/memory.md` (no new storage, zero new dependencies).
+- **`escalate` session event (PE#4 foundation)**: a first-class
+  "stop and hand a human a decision" primitive (distinct from `ask`), with
+  `reason` / `options` / `safestDefault`. Gives the scorecard's escalation
+  metric a real data source and sets up bounded sensor/budget escalation.
+
+### Fixed
+- **Slash-command parsing**: pasted code whose comment starts with `//`
+  (e.g. `// setvbuf(stdout, …)`) is no longer parsed as a slash command;
+  unknown `/…` reaches the model as a normal message (opencode
+  `parseSlashCommand` parity).
+- **Subagent partial results (CC#50)**: subagent turns that produce partial
+  output before an error no longer lose the partial text.
+- **load_skill dedup (CC#52)**: loading an already-loaded skill is a no-op
+  instead of duplicating its instructions in context.
+- **Permission ask for write tools (CC#53)**: write-kind tools that are
+  marked `ask` now consistently prompt before executing (previously some
+  paths bypassed the gate).
+
 ## [0.3.0] - 2026-08-26
 
 ### Added

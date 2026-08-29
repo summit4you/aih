@@ -1,6 +1,6 @@
 {
   "name": "aih",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "App Intelligence Harness: a universal framework for making ordinary applications AI-assisted",
   "type": "module",
