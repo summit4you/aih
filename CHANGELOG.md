@@ -8,18 +8,12 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
 ### Added
 - **Per-event session durability**: chat now appends every event to the
   session file as it happens (byte-watermarked incremental flush), so a long
   multi-tool turn survives a crash or kill instead of living only in memory.
-- **Capacity-burst retry patience**: gateway capacity failures (zen's
-  "Upstream request failed: Endpoint is unavailable") triple the retry
-  budget — ~2 minutes of backoff patience at the 8s cap instead of ~20s —
-  so free-tier flaps ride out invisibly. Plain 5xx keeps the base budget.
-
-## [0.3.0] - 2026-08-26
-
-### Added
 - **Extension API (P#39)**: `.aih/extensions/*.mjs` modules — `registerTool`,
   `registerCommand`, `on("tool:before" | "tool:after" | "turn:end")` handlers
   that can cancel calls or rewrite results in place. `--no-extensions`
@@ -134,6 +128,10 @@ the versions listed here (`scripts/package` derives the version from
   tool calls synthetically ("arguments may be truncated; re-issue") and
   aborted batches pair skipped calls with cancelled results.
 - **steering while busy** lands mid-turn instead of waiting for turn end.
+- **Capacity-burst retry patience**: gateway capacity failures (zen's
+  "Upstream request failed: Endpoint is unavailable") triple the retry
+  budget — ~2 minutes of backoff patience at the 8s cap instead of ~20s —
+  so free-tier flaps ride out invisibly. Plain 5xx keeps the base budget.
 
 ## [0.2.0]
 
