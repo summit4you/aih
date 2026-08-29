@@ -1,0 +1,18 @@
+[
+  { "href": "index", "label": "Introduction" },
+  { "href": "install", "label": "Installation" },
+  { "href": "quickstart", "label": "Quick start" },
+  { "href": "config", "label": "Configuration" },
+  { "href": "adapter", "label": "Integrate your app" },
+  { "href": "tools", "label": "Tools" },
+  { "href": "coding", "label": "Coding agent" },
+  { "href": "permissions", "label": "Permissions" },
+  { "href": "sessions", "label": "Sessions" },
+  { "href": "agents", "label": "Agents" },
+  { "href": "tui", "label": "Interactive terminal" },
+  { "href": "commands", "label": "Commands" },
+  { "href": "architecture", "label": "Architecture" },
+  { "href": "troubleshooting", "label": "Troubleshooting" },
+  { "href": "development", "label": "Development" },
+  { "href": "changelog", "label": "Changelog" }
+]

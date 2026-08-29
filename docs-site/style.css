@@ -13,6 +13,21 @@
   --sidebar-w: 240px;
   --content-max: 840px;
   --radius: 8px;
+  /* typography — matched to opencode.ai/docs (Starlight tokens) */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  --text-base: 16px;
+  --text-h1: 2rem;
+  --text-h2: 1.5rem;
+  --text-h3: 1.25rem;
+  --text-h4: 1.125rem;
+  --text-code: 0.875rem;
+  --leading: 1.75;            /* Starlight --sl-line-height */
+  --leading-heading: 1.2;    /* Starlight --sl-line-height-headings */
+  --heading-weight: 600;     /* Starlight heading font-weight */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -32,13 +47,13 @@
 html { scroll-behavior: smooth; }
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-sans);
   color: var(--fg);
   background: var(--bg);
-  line-height: 1.7;
-  font-size: 15px;
+  line-height: var(--leading);
+  font-size: var(--text-base);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 .shell {
   display: flex;
@@ -53,11 +68,13 @@ body {
   width: var(--sidebar-w);
   border-right: 1px solid var(--border);
   background: var(--bg-sidebar);
-  padding: 20px 14px 40px;
+  padding: 20px 14px 24px;
   position: sticky;
   top: 0;
   height: 100vh;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 .brand {
   display: flex;
@@ -97,6 +114,34 @@ body {
   font-weight: 600;
 }
 
+/* language switcher (pinned to sidebar bottom) */
+.nav-lang {
+  margin-top: auto;
+  padding: 14px 10px 4px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.nav-lang-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+}
+.lang-switch {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: background 0.12s, border-color 0.12s;
+}
+.lang-switch:hover { background: var(--accent-soft); border-color: var(--accent); }
+
 /* ---- content ---- */
 .content {
   flex: 1;
@@ -105,19 +150,24 @@ body {
 }
 .content > * { max-width: var(--content-max); }
 .content h1 {
-  font-size: 30px;
-  line-height: 1.25;
+  font-size: var(--text-h1);
+  line-height: var(--leading-heading);
   margin: 0 0 8px;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  font-weight: var(--heading-weight);
 }
 .content h2 {
-  font-size: 21px;
-  margin: 40px 0 12px;
-  padding-top: 18px;
+  font-size: var(--text-h2);
+  line-height: var(--leading-heading);
+  margin: 44px 0 14px;
+  padding-top: 20px;
   border-top: 1px solid var(--border);
   scroll-margin-top: 20px;
+  font-weight: var(--heading-weight);
+  letter-spacing: -0.01em;
 }
-.content h3 { font-size: 17px; margin: 28px 0 8px; }
+.content h3 { font-size: var(--text-h3); line-height: var(--leading-heading); margin: 28px 0 8px; font-weight: var(--heading-weight); }
+.content h4 { font-size: var(--text-h4); line-height: var(--leading-heading); margin: 22px 0 6px; font-weight: var(--heading-weight); }
 .content p { margin: 12px 0; }
 .content > p:first-of-type,
 .content p.lead {
@@ -132,8 +182,8 @@ body {
 
 /* inline code */
 .content code {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.88em;
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
   background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -146,7 +196,7 @@ body {
   border-radius: var(--radius);
   padding: 14px 16px;
   overflow-x: auto;
-  font-size: 13px;
+  font-size: var(--text-code);
   line-height: 1.6;
   margin: 14px 0;
   border: 1px solid rgba(255,255,255,0.04);

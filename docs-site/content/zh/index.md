@@ -35,14 +35,17 @@ build/plan 双模式、权限模型、技能层与 TUI 交互范式。
 
 ## 实际运行
 
-一条命令，模型即调用应用工具。下面是 `aih run "add a todo: buy milk" --mock`
-的一次真实运行（离线演示，无需 API key）——模型规划、调用 `add_todo`、返回结果，
-全程落在 append-only 会话日志里：
+打开交互终端（opencode 风格 TUI），输入一句话，模型即调用应用工具。下面是一次
+**真实运行**的终端截图（`--mock` 离线演示，无需 API key）——模型规划、调用
+`add_todo`、返回结果，右侧是实时上下文用量，底部是状态栏：
 
 <figure>
-  <img src="assets/aih-run.png" alt="AIH CLI 运行截图：aih run 命令调用 add_todo 工具并返回结果" loading="lazy">
-  <figcaption>AIH CLI 一次性问答 —— 模型调用 <code>add_todo</code> 工具，结果写入会话日志</figcaption>
+  <img src="assets/aih-tui.png" alt="AIH 交互终端运行截图：输入 add a todo buy milk，模型调用 add_todo 工具并返回 Added via mock" loading="lazy">
+  <figcaption>AIH 交互终端 —— 一句话驱动 <code>add_todo</code> 工具，实时上下文用量与状态栏</figcaption>
 </figure>
+
+> 这张图是对真实 TUI 输出的逐格截图（PTY + 终端仿真），非手绘示意。
+> 一次性问答形态见 [`aih run`](quickstart)。
 
 ## 特性亮点
 
