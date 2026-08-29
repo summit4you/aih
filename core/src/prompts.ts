@@ -39,6 +39,26 @@ export const GOAL_CONTRACT_TEMPLATE = `Goal contract:
 - Current state: <verified facts about progress so far>
 - Next move: <the immediate concrete action>`;
 
+/**
+ * Decision-asking rule (opencode/mimo-code/Claude-Code "askUser" parity).
+ * Without an explicit prompt contract, models trained on developer chat treat
+ * asking as weak and instead write the question as assistant text and keep
+ * acting — which never reaches the user and runs the turn on assumptions.
+ * The tool alone (question) is not enough; the system prompt must say WHEN
+ * asking is mandatory and forbid the natural-language-then-continue pattern.
+ */
+export const DECISION_QUESTION_RULE = `# Handling user decisions
+When the task is ambiguous, has multiple valid approaches, or needs a decision/confirmation the user has not given you:
+1. Gather enough context first (read/search) so the question is useful.
+2. Call the question tool and WAIT for the user's answer. Never proceed on an unconfirmed assumption.
+3. NEVER write your question as assistant text and then keep working — that text never reaches the user and the turn continues blind. If you must ask, ask through the question tool.
+4. When the answer set is small and known, pass 2-4 concrete options with the question.
+5. In a headless (non-interactive) session the question tool errors — then pick the most reasonable option yourself, state the assumption explicitly, and continue.
+Examples:
+- "add auth" → question: OAuth vs JWT vs session-cookies
+- "the spec says 7 more pages — finish them or deploy first?" → question: finish-all vs deploy-first
+Specific tasks with exact file paths/lines/instructions need no question: act directly.`;
+
 /** One-line JSON verdict schema expected back from the goal judge. */
 export const GOAL_VERDICT_SCHEMA =
   '{"met": true|false, "reason": "<one short line>", "unmet": ["<criterion or empty>"]}';

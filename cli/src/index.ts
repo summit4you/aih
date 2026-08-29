@@ -28,6 +28,7 @@ import {
   FINAL_STATE_GUARD,
   GOAL_CONTRACT_TEMPLATE,
   TASK_CONTRACT_RULES,
+  DECISION_QUESTION_RULE,
   buildGoalJudgePrompt,
   buildBranchDistillPrompt,
   toolCall,
@@ -562,7 +563,7 @@ export function loadMemoryBlock(cwd = process.cwd()): string {
 
 export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [

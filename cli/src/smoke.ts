@@ -3777,6 +3777,7 @@ import {
   SessionLog,
   FINAL_STATE_GUARD,
   TASK_CONTRACT_RULES,
+  DECISION_QUESTION_RULE,
 } from "@aih/core";
 
 {
@@ -3910,6 +3911,16 @@ import {
   assert(TASK_CONTRACT_RULES.length > 100, "TP#3.12 prompts: TASK_CONTRACT_RULES is substantial");
   assert(/acceptance|constraint|verifiable/i.test(TASK_CONTRACT_RULES), "TP#3.12 prompts: TASK_CONTRACT_RULES mentions acceptance criteria");
   console.log("ok: TP#3.12 TASK_CONTRACT_RULES present");
+}
+
+{
+  // TP#3.14 — DECISION_QUESTION_RULE: models must ask via the question tool
+  assert(typeof DECISION_QUESTION_RULE === "string", "TP#3.14 prompts: DECISION_QUESTION_RULE is string");
+  assert(DECISION_QUESTION_RULE.length > 150, "TP#3.14 prompts: DECISION_QUESTION_RULE is substantial");
+  assert(/question tool/i.test(DECISION_QUESTION_RULE), "TP#3.14 prompts: requires the question tool");
+  assert(/wait|never|assumption/i.test(DECISION_QUESTION_RULE), "TP#3.14 prompts: forbids proceeding on assumptions");
+  assert(/headless|non-interactive/i.test(DECISION_QUESTION_RULE), "TP#3.14 prompts: handles headless fallback");
+  console.log("ok: TP#3.14 DECISION_QUESTION_RULE present");
 }
 
 {

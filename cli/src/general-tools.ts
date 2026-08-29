@@ -393,14 +393,27 @@ export function registerGeneralTools(
 
   reg({
     name: "question",
-    description: "Ask the user a question and wait for their answer (interactive sessions only).",
+    description:
+      "Ask the user a question and BLOCK until they answer (interactive sessions only). " +
+      "Use this MANDATORILY whenever you need a decision, clarification, or confirmation from the user " +
+      "that you cannot reasonably infer yourself — e.g. choosing between approaches, resolving ambiguity, " +
+      "picking a scope, or confirming a risky action. Do NOT ask the user by writing the question as " +
+      "assistant text and then continuing to act; that never reaches the user and the turn runs on " +
+      "unconfirmed assumptions. Instead call this tool and wait for the answer before proceeding. " +
+      "Provide 2-4 concrete `options` when the answer is one of a small known set (much better UX). " +
+      "In headless (non-TTY) sessions this tool errors — then pick the most reasonable option yourself, " +
+      "state the assumption, and continue.",
     kind: "read",
     permission: "allow",
     parameters: {
       type: "object",
       properties: {
-        question: { type: "string", description: "the question to ask" },
-        options: { type: "array", description: "optional list of suggested answers", items: { type: "string" } },
+        question: { type: "string", description: "the question to ask the user" },
+        options: {
+          type: "array",
+          description: "optional 2-4 concrete suggested answers the user can pick from",
+          items: { type: "string" },
+        },
       },
       required: ["question"],
     },
