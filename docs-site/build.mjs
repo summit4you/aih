@@ -120,6 +120,10 @@ cpSync(join(ROOT, "app.js"), join(DIST, "app.js"));
 if (readdirSync(ROOT).includes("favicon.svg")) {
   cpSync(join(ROOT, "favicon.svg"), join(DIST, "favicon.svg"));
 }
+// static assets (screenshots etc.) → dist/assets/
+if (readdirSync(ROOT).includes("assets")) {
+  cpSync(join(ROOT, "assets"), join(DIST, "assets"), { recursive: true });
+}
 
 console.log(`docs-site: built ${built.length} pages → ${relative(process.cwd(), DIST)}/`);
 for (const b of built.sort()) console.log(`  ok  ${b}`);

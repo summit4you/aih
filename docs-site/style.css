@@ -11,7 +11,7 @@
   --code-block-bg: #0f172a;
   --code-block-fg: #e2e8f0;
   --sidebar-w: 240px;
-  --content-max: 760px;
+  --content-max: 840px;
   --radius: 8px;
 }
 @media (prefers-color-scheme: dark) {
@@ -42,7 +42,7 @@ body {
 }
 .shell {
   display: flex;
-  max-width: 1160px;
+  max-width: 1440px;
   margin: 0 auto;
   min-height: 100vh;
 }
@@ -175,6 +175,24 @@ body {
 }
 .content th { background: var(--bg-sidebar); font-weight: 600; }
 .content tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-sidebar) 55%, transparent); }
+/* figure / screenshot */
+.content figure {
+  margin: 22px 0;
+}
+.content figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+}
+.content figcaption {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--fg-muted);
+  text-align: center;
+}
 /* blockquote / callout */
 .content blockquote {
   margin: 16px 0;

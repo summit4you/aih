@@ -33,6 +33,17 @@ build/plan 双模式、权限模型、技能层与 TUI 交互范式。
 | **CLI 接入** | 交互终端、一次性问答、脚本管道 | `aih` / `aih run` / `aih chat` |
 | **内嵌 Copilot**（SDK） | 直接复用 L1 内核，把工具注册进 `AgentLoop` | `@aih/core` |
 
+## 实际运行
+
+一条命令，模型即调用应用工具。下面是 `aih run "add a todo: buy milk" --mock`
+的一次真实运行（离线演示，无需 API key）——模型规划、调用 `add_todo`、返回结果，
+全程落在 append-only 会话日志里：
+
+<figure>
+  <img src="assets/aih-run.png" alt="AIH CLI 运行截图：aih run 命令调用 add_todo 工具并返回结果" loading="lazy">
+  <figcaption>AIH CLI 一次性问答 —— 模型调用 <code>add_todo</code> 工具，结果写入会话日志</figcaption>
+</figure>
+
 ## 特性亮点
 
 - **通用 agent 内核**：工具来自外接应用；交互终端默认再挂一套本地通用工具（文件/命令/搜索/网页）
