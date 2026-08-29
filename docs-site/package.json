@@ -1,0 +1,14 @@
+{
+  "name": "@aih/docs-site",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "AIH documentation site (static, GitHub Pages) — opencode.ai/docs-style, zh-CN",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs && node check.mjs"
+  },
+  "devDependencies": {
+    "marked": "^18.0.11"
+  }
+}

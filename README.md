@@ -788,7 +788,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
 - **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子（✅ D#11 脱敏/计时 + 技能驱动）、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）、后台 jobs（✅ D#13）、Agent Teams（✅ D#15）—— 余：沙箱 seam（✅ D#12 接口已留，默认本地）。
-- **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）。余：checkpoint 回滚。
+- **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）；checkpoint 回滚（✅ F#28 `/checkpoint`+`/restore`）。
 - **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS ✅ F#30；side-by-side diff ✅ F#31（双色单元格 + 行号列 + 窄屏回退）。
 - **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。

@@ -1,0 +1,10 @@
+[
+  { "href": "index", "label": "简介" },
+  { "href": "install", "label": "安装" },
+  { "href": "quickstart", "label": "快速开始" },
+  { "href": "config", "label": "配置" },
+  { "href": "adapter", "label": "接入你的应用" },
+  { "href": "tools", "label": "工具" },
+  { "href": "permissions", "label": "权限" },
+  { "href": "sessions", "label": "会话" }
+]
