@@ -73,6 +73,19 @@ export const COMPACT_CONTINUE_PROMPT =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
 
 /**
+ * T#trunc — injected into the system prompt so the model does not mistake
+ * output plumbing for an environment failure. A single tool result is capped
+ * at TOOL_OUTPUT_MAX_CHARS (8K); a turn's total at TURN_TOOL_BUDGET_CHARS
+ * (512K). When either trips, the model sees a literal marker instead of the
+ * full text — a normal, recoverable condition, NOT a dead output channel.
+ */
+export const TOOL_OUTPUT_NOTES = `# Tool output limits
+A single tool result is capped (≈8KB); a whole turn's tool output is capped (≈512KB). When a cap is hit you see a marker (e.g. "[truncated]" or a "budget exhausted" note) instead of full output — that is NORMAL and RECOVERABLE, not a broken output channel. Do NOT conclude the environment has failed and do NOT re-run the same tool to "prove" it works.
+- To read a large file fully, print a specific line range (e.g. read_file with a small offset/max_lines, or sed/awk a narrow range) rather than reading the whole thing.
+- Prefer targeted greps over broad cat/dump commands.
+- If you have already gathered enough to answer, stop issuing tools and deliver your result.`;
+
+/**
  * Final-step handoff, injected as an assistant prefill when a turn reaches its
  * (opt-in) step budget (opencode/MiMo-Code `MAX_STEPS_PROMPT`,
  * packages/core/src/session/runner/max-steps.ts): the model must stop calling

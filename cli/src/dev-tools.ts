@@ -18,6 +18,41 @@ function safePath(cwd: string, p: string | undefined): string {
   return target;
 }
 
+/**
+ * FA#1 — middle-truncate: keep head + tail, elide the middle.
+ *
+ * Shell output states its verdict at the END — a pytest run in the last three
+ * lines, a webpack build in the last error, a script in its exit status. A
+ * head-only cut drops exactly the lines the tool was called for, forcing the
+ * model to spend a turn reading the spill file to get them back (FrontierAgent
+ * and codex both cut the middle for this reason).
+ *
+ * Pure (no I/O) so it is unit-testable in isolation. Returns the input
+ * unchanged when it fits the budget. The elided middle is marked so the model
+ * knows context was dropped and can re-fetch via `output_file` / `read_file`.
+ */
+export function truncateMiddle(
+  text: string,
+  budget: number,
+  opts?: { headRatio?: number },
+): { text: string; truncated: boolean; elidedChars: number } {
+  if (text.length <= budget) return { text, truncated: false, elidedChars: 0 };
+  // headRatio is the share of the budget given to the head; the rest goes to
+  // the tail. 0.5 (symmetric) is the default — the tail carries the verdict,
+  // the head carries the initial context (command banner, first errors).
+  const headRatio = Math.min(1, Math.max(0, opts?.headRatio ?? 0.5));
+  const headLen = Math.floor(budget * headRatio);
+  const tailLen = budget - headLen;
+  const head = text.slice(0, headLen);
+  const tail = text.slice(text.length - tailLen);
+  const elided = text.length - headLen - tailLen;
+  return {
+    text: `${head}\n… ${elided} chars elided …\n${tail}`,
+    truncated: true,
+    elidedChars: elided,
+  };
+}
+
 export function registerDevTools(
   registry: ToolRegistry,
   cwd = process.cwd(),
@@ -167,13 +202,16 @@ export function registerDevTools(
           /* keep_output is best-effort; the in-band stdout below still returns */
         }
       }
-      const capped = output.length > MAX_OUT;
+      // FA#1 — middle-truncate (keep head + tail, elide the middle) so the
+      // verdict lines at the end of shell output survive the in-band cap.
+      const { text: stdout, truncated, elidedChars } = truncateMiddle(output, MAX_OUT);
       return {
         code,
         timed_out: killed,
-        stdout: output.slice(0, MAX_OUT),
+        stdout,
         stderr: "",
-        truncated: capped,
+        truncated,
+        elided_chars: elidedChars,
         sandbox: backend.name,
         ...(outputFile ? { output_file: outputFile, output_bytes: Buffer.byteLength(output) } : {}),
       };

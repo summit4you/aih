@@ -1,9 +1,15 @@
 import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
 import { createHash } from "node:crypto";
+import { scanRecovery } from "./recovery.js";
 
-// Tool outputs exceeding this are truncated before being sent to the LLM.
-// Matches opencode's TOOL_OUTPUT_MAX_CHARS; must stay in sync with cost.ts.
-export const TOOL_OUTPUT_MAX_CHARS = 2_000;
+// Single tool-result cap (characters) for what the MODEL sees in the projected
+// conversation. Raised from opencode's 2K default to 8K: a 2K cap truncated
+// most real source-file reads (657/2404 results in one session) down to a
+// first strophe plus "[truncated]", which the model repeatedly mistook for a
+// dead output channel and entered a blind retry loop. 8K ≈ 2K tokens keeps a
+// single file read mostly intact while still bounding one huge result; the
+// per-turn aggregate budget (TURN_TOOL_BUDGET_CHARS) bounds the total.
+export const TOOL_OUTPUT_MAX_CHARS = 8_192;
 
 export function truncateToolOutput(value: string): string {
   return value.length <= TOOL_OUTPUT_MAX_CHARS
@@ -16,7 +22,13 @@ export function truncateToolOutput(value: string): string {
 // dumps N × 2K into the next request. This is the coarser, turn-level cap:
 // the total tool content for one turn is bounded, with the EARLIEST results
 // kept intact (they carry the first context) and later ones truncated.
-export const TURN_TOOL_BUDGET_CHARS = 12_000;
+// Default raised to 512K (≈128K tokens) so long agentic loops — a turn that
+// reads source files, greps, edits, re-tests, and iterates many times — run to
+// completion instead of being cut off mid-task. 64K was still too tight for
+// such loops. See agent-loop pre-flight compact (each turn's first step) for
+// the real context-overflow guard; this cap is only a last-resort flood
+// barrier, and when it trips the model still gets an explicit directive.
+export const TURN_TOOL_BUDGET_CHARS = 512_000;
 
 // FA#2 (FrontierAgent ContextSizeGuard parity) — directive appended to the
 // model-visible conversation when a turn's tool-output budget is exhausted.
@@ -376,6 +388,15 @@ export class SessionLog {
           // compacted/replayed tail could already carry one) — and never
           // break tool pairing, which is why the directive is a trailing
           // user message after all tool replies.
+          //
+          // IMPORTANT: only append the directive when the truncation hit the
+          // CURRENT (still-open) turn. Historical CLOSED turns can also bust
+          // the per-turn budget — but their work already ended, so telling the
+          // model to "stop and wrap up" a brand-new turn is a false alarm that
+          // makes every resume of a long session look budget-exhausted from
+          // the first message. The truncation of old results still stands
+          // (it bounds context); only the actionable "stop" nudge is gated to
+          // the live turn.
           let hasDirective = false;
           for (const m of messages) {
             if (
@@ -387,7 +408,17 @@ export class SessionLog {
               break;
             }
           }
-          if (!hasDirective) {
+          const openTurnId = scanRecovery(this.#events).openTurn;
+          const openTurnTruncated =
+            openTurnId !== undefined &&
+            messages.some(
+              (m) =>
+                m.role === "tool" &&
+                typeof m.content === "string" &&
+                m.content.includes("turn tool-output budget exhausted") &&
+                (m.toolCallId ? turnByCallId.get(m.toolCallId) === openTurnId : false),
+            );
+          if (!hasDirective && openTurnTruncated) {
             messages.push({ role: "user", content: TURN_BUDGET_STOP_DIRECTIVE });
           }
         }

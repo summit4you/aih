@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import type { PermissionRule } from "@aih/core";
 import { userAihDir, userAihDirs } from "./paths.js";
 import { readJson } from "./read-json.js";
+import { loadEnvSafety, mergeSafety } from "./safety.js";
+import type { SafetyConfig } from "./safety.js";
 
 /**
  * Global (user-level) config file. Resolves through the XDG data dir
@@ -119,6 +121,34 @@ export interface AihConfig {
    *        "permissions": [{ "tool": "*", "action": "deny" }] } }
    */
   agents?: Record<string, AgentProfile>;
+  /**
+   * PE#1/PE#2 — safety seam (harness enforces, not the model):
+   *   - `budget`: hard constraints + tripwire —
+   *     { "maxCostUsd": 1, "maxWrites": 50, "timeoutMs": 3600000,
+   *       "denyPaths": ["node_modules", ".git"] }
+   *   - `sensors`: computational 写后验证 — a command runs after successful
+   *     writes; red → bounded retry feedback; final red → escalate.
+   *     [{ "name": "typecheck", "command": "npx tsc -b",
+   *        "onTools": ["write_file","edit","apply_patch"], "timeoutMs": 60000 }]
+   *   - `sensorRetries`: red retries before escalation (default 1).
+   * Env overrides: AIH_BUDGET / AIH_SENSORS / AIH_SENSOR_RETRIES.
+   */
+  safety?: {
+    budget?: {
+      maxCostUsd?: number;
+      maxWrites?: number;
+      timeoutMs?: number;
+      denyPaths?: string[];
+    };
+    sensors?: Array<{
+      name: string;
+      onTools?: string[];
+      pathPrefix?: string;
+      command: string;
+      timeoutMs?: number;
+    }>;
+    sensorRetries?: number;
+  };
 }
 
 export interface AgentProfile {
@@ -301,6 +331,23 @@ export function loadPrices(): Record<string, { input: number; output: number }> 
     if (config.prices) out = { ...(out ?? {}), ...config.prices };
   }
   return out;
+}
+
+/**
+ * PE#1/PE#2 — merged `safety` block across config layers (later layers win
+ * per-key), then env overrides (AIH_BUDGET / AIH_SENSORS / AIH_SENSOR_RETRIES
+ * win over the file). The CLI wires the result into the AgentLoop; absent
+ * config → `{}` (the loop no-ops the safety seam).
+ */
+export function loadSafety(): SafetyConfig {
+  let file: SafetyConfig = {};
+  for (const { config } of loadLayers()) {
+    const s = config.safety;
+    if (!s) continue;
+    file = mergeSafety(file, s);
+  }
+  // env wins over the file layer
+  return mergeSafety(file, loadEnvSafety());
 }
 
 export function loadPermissionRules(): PermissionRule[] {

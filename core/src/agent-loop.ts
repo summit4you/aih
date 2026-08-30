@@ -1,6 +1,8 @@
 import type { LLMAdapter } from "./seams/llm.js";
 import { QuotaError, StallError } from "./seams/llm-sse.js";
 import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT } from "./prompts.js";
+import type { LoopObserver } from "./observers.js";
+import { LoopAbort, notifyObservers } from "./observers.js";
 
 /** Max consecutive empty responses (no text + no tool call) we nudge the model to retry before ending the turn. */
 const MAX_EMPTY_RETRIES = 2;
@@ -35,7 +37,9 @@ function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
 }
 import { coverageDigest, SessionLog } from "./session-log.js";
 import type { ToolRegistry } from "./tool-registry.js";
-import type { ChatMessage, ContentBlock, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
+import type { ChatMessage, ContentBlock, LLMResponse, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
+import { BudgetExceeded, BudgetTracker } from "./budget.js";
+import type { BudgetVerdict } from "./budget.js";
 
 function addUsage(a: TokenUsage | undefined, b: TokenUsage | undefined): TokenUsage | undefined {
   if (!b) return a;
@@ -94,6 +98,50 @@ export interface AgentLoopOptions {
    * Injected turns can never approve a pending permission ask.
    */
   inputSource?: "tty" | "injected";
+  /**
+   * FA#5 — pluggable loop observers. Each observer implements only the
+   * callbacks it needs (onTurnStart/onTurnEnd/onModelResponse/onToolCall/
+   * onToolResult/onCompaction). A LoopObserver may throw LoopAbort to stop
+   * the turn. Default: no observers.
+   */
+  observers?: readonly LoopObserver[];
+  /**
+   * PE#2 — budget tracker (hard constraint + tripwire). When present, the
+   * loop checks it after each step: a HARD verdict emits an `escalate` event
+   * and stops the turn (stopReason "escalated"); a SOFT (tripwire) verdict is
+   * surfaced via `onTripwire` (non-silent notice) and latched. Absent → no-op.
+   */
+  budget?: BudgetTracker;
+  /**
+   * PE#2 — price resolver: converts a TokenUsage chunk into dollars. The CLI
+   * wires cost.ts's costForUsage (prices are a CLI concern). Absent → cost
+   * enforcement is skipped (writes/timeout/scope still enforced).
+   */
+  costOf?: (usage: TokenUsage) => number;
+  /**
+   * PE#2 — called with the soft (tripwire) verdict before the loop continues.
+   * The caller decides how to surface it (TUI system row / stderr line).
+   */
+  onTripwire?: (v: Extract<BudgetVerdict, { state: "soft" }>) => void;
+  /**
+   * PE#1 — computational sensors (写后验证循环). When present, after each
+   * successful write-kind tool call the applicable sensors run; a red verdict
+   * injects feedback for the model to fix (bounded retries); the final red
+   * triggers escalation. Absent → no-op.
+   */
+  sensors?: import("./budget.js").SensorLoop;
+  /**
+   * PE#4 — escalate primitive. Called when the harness hits a bound it cannot
+   * resolve alone (sensor red after retries, budget hard, repeated failure).
+   * The caller decides: interactive → surface options in the TUI;
+   * non-interactive → log the event and exit with code 3.
+   * Model-invisible: the `escalate` event is skipped by deriveMessages.
+   */
+  onEscalate?: (v: {
+    reason: string;
+    options: string[];
+    safestDefault: string;
+  }) => void;
 }
 
 const CONTEXT_ERROR =
@@ -153,7 +201,11 @@ const OVERFLOW_SUSPECT_RATIO = 0.6;
 //  - rolling summary: each new summary folds in the previous one;
 //  - a structured summary template;
 //  - tool outputs truncated when serialized for the summary input.
-const TOOL_OUTPUT_MAX_CHARS = 2_000; // opencode: TOOL_OUTPUT_MAX_CHARS
+// Char cap for tool outputs serialized into the compaction-summary input
+// (#serializeMessages). This is an INTERNAL summary-input bound (keeps the
+// summary LLM prompt small) — distinct from session-log's TOOL_OUTPUT_MAX_CHARS
+// (8K), which caps what the model sees in the projected conversation.
+const TOOL_OUTPUT_MAX_CHARS = 2_000;
 const MAX_RECENT_TOKENS = 15_000;   // opencode: MAX_PRESERVE_RECENT_TOKENS
 const MIN_RECENT_TOKENS = 500;      // floor for the verbatim recent tail
 const RESERVED_RATIO = 0.2;         // fraction of the window reserved for output
@@ -214,6 +266,20 @@ export class AgentLoop {
   /** P#36④ — re-primed the interrupted turn once after an overflow recovery. */
   #overflowReprimed = false;
   #onPromptInput?: (messages: ChatMessage[]) => void;
+  /** FA#5 — pluggable loop observers (each implements only the callbacks it needs). */
+  #observers: readonly LoopObserver[];
+  /** PE#2 — budget tracker (hard constraint + tripwire). */
+  #budget?: BudgetTracker;
+  /** PE#2 — price resolver (usage → $). */
+  #costOf?: (usage: TokenUsage) => number;
+  /** PE#2 — soft (tripwire) verdict surface hook. */
+  #onTripwire?: (v: Extract<BudgetVerdict, { state: "soft" }>) => void;
+  /** PE#1 — computational sensors (写后验证循环). */
+  #sensors?: import("./budget.js").SensorLoop;
+  /** PE#4 — escalate primitive hook. */
+  #onEscalate?: (v: { reason: string; options: string[]; safestDefault: string }) => void;
+  /** PE#2 — latched tripwire (fires once per task). */
+  #tripwireFired = false;
   /** CC#60 — "tty" | "injected"; injected turns cannot approve asks. */
   #inputSource: "tty" | "injected" = "tty";
   #inbox: string[] = [];
@@ -239,7 +305,118 @@ export class AgentLoop {
       Math.floor(options.readConcurrency ?? (Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4)),
     );
     this.#onPromptInput = options.onPromptInput;
+    this.#observers = options.observers ?? [];
     this.#inputSource = options.inputSource ?? "tty";
+    this.#budget = options.budget;
+    this.#costOf = options.costOf;
+    this.#onTripwire = options.onTripwire;
+    this.#sensors = options.sensors;
+    this.#onEscalate = options.onEscalate;
+  }
+
+  /**
+   * PE#4 — emit an `escalate` event (model-invisible) and invoke the
+   * onEscalate hook. The caller decides interactive (TUI options) vs
+   * non-interactive (exit code 3) handling. Returns the event for logging.
+   */
+  escalate(reason: string, options: string[], safestDefault: string, turnId?: string) {
+    this.#log.append({
+      type: "escalate",
+      ...(turnId ? { turnId } : {}),
+      reason,
+      options,
+      safestDefault,
+    });
+    this.#onEscalate?.({ reason, options, safestDefault });
+  }
+
+  /**
+   * PE#2 — accumulate cost + writes into the budget tracker and check the
+   * verdict. Returns "stop" when a HARD bound was hit (the caller must break
+   * the turn with stopReason "escalated"); "continue" otherwise. A SOFT
+   * (tripwire) verdict is surfaced via onTripwire and latched, then continues.
+   */
+  async #enforceBudget(
+    turnId: string,
+    usage: TokenUsage | undefined,
+    writes: number,
+    writePaths: string[],
+  ): Promise<"stop" | "continue"> {
+    if (!this.#budget) return "continue";
+    // accumulate cost (only when a price resolver is wired)
+    if (usage && this.#costOf) {
+      const cost = this.#costOf(usage);
+      if (cost > 0) this.#budget.addUsage(cost);
+    }
+    if (writes > 0) this.#budget.addWrites(writes);
+    // scope deny: check each written path against the deny list
+    for (const p of writePaths) {
+      const v = this.#budget.check({ writePath: p });
+      if (v.state === "hard") {
+        this.#escalateForBudget(turnId, v);
+        return "stop";
+      }
+    }
+    const v = this.#budget.check({});
+    if (v.state === "hard") {
+      this.#escalateForBudget(turnId, v);
+      return "stop";
+    }
+    if (v.state === "soft") {
+      if (!this.#tripwireFired) {
+        this.#tripwireFired = true;
+        this.#budget.latchTripwire();
+        this.#onTripwire?.(v);
+      }
+    }
+    return "continue";
+  }
+
+  /** PE#2/PE#4 — emit an escalate event for a hard budget verdict. */
+  #escalateForBudget(
+    turnId: string,
+    v: Extract<BudgetVerdict, { state: "hard" }>,
+  ): void {
+    this.escalate(
+      `budget ${v.kind} exceeded: ${v.reason}`,
+      [
+        "continue anyway (I accept the overage)",
+        "stop here and review the work so far",
+        "roll back to the last checkpoint and re-plan",
+      ],
+      "stop here and review the work so far",
+      turnId,
+    );
+  }
+
+  /**
+   * PE#1 — run computational sensors after a successful write. Returns "stop"
+   * when retries are exhausted (escalated); "continue" otherwise (feedback for
+   * a red-but-retryable verdict is injected for the model to fix).
+   */
+  async #runSensorsAfterWrite(
+    turnId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<"stop" | "continue"> {
+    if (!this.#sensors) return "continue";
+    const r = await this.#sensors.afterWrite(toolName, args, turnId);
+    if (r.passed) return "continue";
+    if (r.feedback) this.inject(r.feedback);
+    if (r.escalated) {
+      this.escalate(
+        `sensor red after retries: ${r.feedback}`,
+        [
+          "fix it myself and continue",
+          "stop and let a human decide",
+          "roll back the last write and re-approach",
+        ],
+        "stop and let a human decide",
+        turnId,
+      );
+      return "stop";
+    }
+    return "continue";
   }
 
   get log(): SessionLog {
@@ -314,6 +491,12 @@ export class AgentLoop {
     this.#activeAbort = ac;
     this.#log.append({ type: "turn/start", turnId });
     this.#log.append({ type: "user/message", turnId, text });
+    // FA#5 — notify observers of turn start.
+    const turnStartAbort = notifyObservers(this.#observers, (o) => o.onTurnStart?.(turnId));
+    if (turnStartAbort) {
+      this.#log.append({ type: "turn/end", turnId, stopReason: "observer_aborted" });
+      return { turnId, steps: 0, stopReason: "observer_aborted" };
+    }
     // Drain any context injected BEFORE this turn (e.g. a P1#4 skill
     // relevance nudge) so it is part of the very first model call.
     if (this.#inbox.length > 0) {
@@ -387,7 +570,7 @@ export class AgentLoop {
           signal: ac.signal,
         });
       };
-      let response;
+      let response: LLMResponse | undefined;
       try {
         response = await doComplete();
       } catch (err) {
@@ -525,6 +708,17 @@ export class AgentLoop {
         toolCalls: response.toolCalls,
       });
 
+      // FA#5 — notify observers of the model response.
+      const respText = response.text;
+      const respToolCalls = response.toolCalls.map((c) => ({ callId: c.id, name: c.name, args: c.args }));
+      const respAbort = notifyObservers(this.#observers, (o) =>
+        o.onModelResponse?.(turnId, respText, respToolCalls),
+      );
+      if (respAbort) {
+        ac.abort();
+        break;
+      }
+
       // P#36 (hybrid budget): prefer the REAL prompt size from the last
       // request over chars/4 estimates; trigger compaction at
       // tokens > window − reserve so it fires BEFORE the provider rejects
@@ -636,6 +830,20 @@ export class AgentLoop {
           for (const call of batch) {
             this.#log.append({ type: "tool/dispatch", turnId, callId: call.id, name: call.name });
           }
+          // FA#5 — notify observers of each tool call before execution.
+          // A LoopAbort here is honored by the existing "abort mid-batch"
+          // handler below, which records failure results for unexecuted calls
+          // (pairing preserved) — so we only set the abort flag and break.
+          for (const call of batch) {
+            const callAbort = notifyObservers(this.#observers, (o) =>
+              o.onToolCall?.(turnId, { callId: call.id, name: call.name, args: call.args }),
+            );
+            if (callAbort) {
+              ac.abort();
+              break;
+            }
+          }
+          if (ac.signal.aborted) break;
           const outcomes = isRead
             ? await mapConcurrent(batch, this.#readConcurrency, runOne)
             : [await runOne(batch[0])];
@@ -657,9 +865,59 @@ export class AgentLoop {
               result: outcome.result,
               error: outcome.error,
             });
+            // FA#5 — notify observers of the tool result.
+            const resultAbort = notifyObservers(this.#observers, (o) =>
+              o.onToolResult?.(turnId, {
+                callId: call.id, name: call.name, ok: outcome.ok,
+                result: outcome.result, error: outcome.error,
+              }),
+            );
+            if (resultAbort) {
+              ac.abort();
+              break;
+            }
           }
+          if (ac.signal.aborted) break;
           i = j;
         }
+
+        // PE#1/PE#2 — after the whole tool batch: run computational sensors on
+        // each successful write, then enforce the budget. A "stop" verdict
+        // (sensor red after retries / hard budget) escalates and ends the turn.
+        if (!ac.signal.aborted && (this.#sensors || this.#budget)) {
+          let writeCount = 0;
+          const writePaths: string[] = [];
+          for (const call of response.toolCalls) {
+            const def = this.#tools.get(call.name);
+            if (!def || def.kind !== "write") continue;
+            const res = this.#log
+              .all()
+              .find((e): e is Extract<SessionEvent, { type: "tool/result" }> =>
+                e.type === "tool/result" && e.callId === call.id,
+              );
+            if (res && !res.ok) continue; // only successful writes are verified
+            writeCount += 1;
+            const args = (call.args ?? {}) as Record<string, unknown>;
+            const p = args.path;
+            if (typeof p === "string") writePaths.push(p);
+            if (this.#sensors) {
+              const s = await this.#runSensorsAfterWrite(turnId, call.name, args);
+              if (s === "stop") {
+                stopReason = "escalated";
+                ac.abort();
+                break;
+              }
+            }
+          }
+          if (!ac.signal.aborted) {
+            const b = await this.#enforceBudget(turnId, response.usage, writeCount, writePaths);
+            if (b === "stop") {
+              stopReason = "escalated";
+              ac.abort();
+            }
+          }
+        }
+
         // Abort mid-batch: calls that were never executed still need results,
         // or the assistant's toolCalls go orphaned in the derived conversation
         // (invalid request on the next turn).
@@ -708,9 +966,16 @@ export class AgentLoop {
       }
     }
 
-    if (ac.signal.aborted) stopReason = "cancelled";
-    else if (steps >= this.#maxSteps) stopReason = "max_steps";
-    else if (truncated) stopReason = "max_tokens";
+    // PE#4 — an "escalated" stop (sensor red after retries / hard budget) is
+    // more specific than "cancelled": the loop aborted on purpose, not by user.
+    if (stopReason !== "escalated") {
+      if (ac.signal.aborted) stopReason = "cancelled";
+      else if (steps >= this.#maxSteps) stopReason = "max_steps";
+      else if (truncated) stopReason = "max_tokens";
+    }
+
+    // FA#5 — notify observers of turn end (before the turn/end event is logged).
+    notifyObservers(this.#observers, (o) => o.onTurnEnd?.(turnId, stopReason));
 
     this.#activeAbort = null;
     this.#log.append({
@@ -1132,6 +1397,8 @@ export class AgentLoop {
         upToSeq: coverage.upToSeq,
       }),
     });
+    // FA#5 — notify observers that the context was compacted.
+    notifyObservers(this.#observers, (o) => o.onCompaction?.(turnId, text.length));
     return { usage, applied: true };
   }
 }

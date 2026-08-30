@@ -189,6 +189,80 @@ aih workflow run example --format json # JSON 报告（CI 友好）
 doom-loop 判定不受影响。完成顺序不影响落盘：`tool/result` 事件始终按**原始
 调用顺序**写入会话日志，回放审计所见即模型所依。
 
+### shell 上下文感知（IT#1）
+
+agent 可以**主动取用**本会话最近的 shell 上下文，免去用户手动粘贴报错/输出
+（借鉴 Intelligent Terminal "agent has context on your shell output, no
+copy-pasting needed"）。纯 seam `cli/src/shell-context.ts`（无 I/O、无 LLM、
+可单测）在 session log 的 `run_cmd` `tool/call`+`tool/result` 之上抽取最近 N 条
+命令（命令 · 退出码 · cwd · 输出尾部；`keep_output` 时附全量输出文件路径），
+只读 `run_cmd` 的 `stdout` 字段、不泄漏其他工具输出；用 `result.code` 判成败
+（非零退出仍是 `ok:true`，故读 `code` 而非 `ok`）。三种用法：
+
+- **`shell_context` 工具**（read/allow）：agent 按需取用，`max_commands`（默认 3，
+  上限 10）/`max_output_chars`（默认 4000）可调；无 shell 历史 → `{ found:false }`
+  明确空态。
+- **TUI `/shell`**：展示最近 shell 上下文；`/shell --send` 把上下文块注入下一 turn。
+- **`AIH_SHELL_CONTEXT=auto`**：每个正常消息 turn 起始自动附带（空态 → no-op，
+  不注入噪声）。
+
+### 确定性 shell 失败检测 + 一键修复（IT#2）
+
+`run_cmd` 失败（非零退出码 / 超时）时，AIH **确定性**（非 LLM）检测并点亮状态栏
+错误指示，一键把失败上下文送 agent 求修复（借鉴 Intelligent Terminal "auto-detect
+command failures, send to agent for fix suggestions"）。纯 seam
+`cli/src/error-detect.ts`（无 I/O、无 LLM、可单测）复用 IT#1 `extractShellContext`：
+
+- **失败判定**：非零退出码或超时（`isFailed`）。**退出码 0 永不误报为失败**——
+  分类只是**标注**种类（固定正则集 `crash/network/js/test/fs/build/unknown`），
+  不决定成败，故绿色命令不会被误判、失败命令无已知模式时仍报 `unknown`。
+- **状态栏指示**：红色 `⚠ N failed`（`tui.ts` `shellErrorBadge?()`，全绿 → 隐藏）。
+  在 `tool/result`/`turn/end` 时重算并缓存，启动时按 session 回填（resume 也点亮）。
+- **TUI `/fix`**：检测失败 → 展示摘要 → 组装修复请求块（命令 + 退出码 + 分类 +
+  输出尾部 + full-output 路径）走 `evalTurn` 送 agent 求修复。`/fix --show`/`--dry`
+  只展示不发送；`busy` 时拒绝。
+- **`AIH_ERROR_DETECT=0`**：关闭自动指示（显式 `/fix` 始终可用）。
+
+### `?` 前缀快捷任务 + 上下文注入（IT#3）
+
+TUI 输入行以 **`?`** 开头即启动一个 agent 任务，**自动注入当前上下文**（借鉴
+Intelligent Terminal "type `?` + prompt, injects active pane context"）。纯 seam
+`cli/src/question.ts`（无 I/O、无 LLM、可单测）：
+
+- **`classifyQuestionPrefix`**：`?` + 空格 + 文本 / `?` + CJK（无空格）→ 任务；
+  裸 `?`、`?foo`（`?` 紧贴 ascii）、句尾 `?`、无 `?` → **不**误判（literal）。
+- **`buildQuestionContext`**：复用 IT#1 shell-context 组装上下文块（最近 shell 输出 +
+  cwd + 活动 session）；空 log → 仅 cwd，不注入噪声。
+- **`composeQuestionPrompt`**：上下文块 + `Task: <prompt>` 合成单条 prompt 送 agent。
+
+### 多 agent 会话管理面板（IT#4）
+
+TUI **`/sessions`** 常驻会话管理面：列出活跃 agent 会话 + 状态 + token 用量与成本
+（借鉴 Intelligent Terminal "track active agent sessions and their status"）。纯 seam
+`cli/src/sessions.ts`（无 I/O、无 LLM、可单测）：
+
+- **dashboard**：active（job-backed，newest-first）+ saved（非 job，idle）双区，
+  聚合 `totalTokens` + `totalCost`（有价目表时）。
+- **`/sessions kill <id>`**：取消运行中的后台 job。
+- **`/sessions view <name>`**：单 session 的 token/cost 摘要。
+- 状态映射 running / done / failed / cancelled；空态 → `(no sessions yet)`。
+
+### 命令批准 run-or-copy（IT#5）
+
+agent 建议一条 **write 类** `run_cmd` 命令时，批准提示不再是笼统的
+`[y]es/[n]o/[a]lways`，而是显式 **`[R]un / [C]opy / [N]o`**（借鉴 Intelligent
+Terminal "gives you the option to run or copy it rather than running it
+automatically"）——**默认不自动执行**：
+
+- **`R`（run）**：批准执行该命令。
+- **`C`（copy）**：把命令**复制到剪贴板**（`pbcopy`/`wl-copy`/`xclip`/`xsel`/`clip`
+  探测，`cli/src/clipboard.ts`），**不执行**；无剪贴板时降级为**打印命令**供手动粘贴。
+- **`N`（no）**：拒绝。
+- **读类命令**仍走 CC#54 auto-allow 白名单（`ls`/`cat`/`grep`… 自动放行，不弹
+  run-or-copy）；非 `run_cmd` 的 write ask 保持通用 `[y]/[n]/[a]`。
+- 兼容性：未实现 `askRunOrCopy` 的 TUI（如测试 stub）自动回退 `askConfirm`，
+  CC#54 契约不破（`gate.ts` 路由时探测）。
+
 ### 变更可视化（diff 渲染）
 
 编辑类工具（`write_file` / `edit` / `apply_patch`）执行后在 TUI 内渲染前后对比
@@ -249,8 +323,20 @@ runExperiment(tasks, models, reps, subject, { outDir, budget })
   `skippedCells`——诚实记账，绝不伪造结果；并发上限默认 `AIH_TOOL_CONCURRENCY`
 - **结果内核**：`{ status, durationMs, outputTail, failureReason, usage, costUsd }`；
   attempt 不可变，多 attempt 取最早有效者（反 Goodhart）
+- **CLI 面（FA#6 失败单题重跑）**：`aih experiment`（`aih eval` 已是仓库 QA 门禁，故实验
+  框架单列命令）——
+  ```sh
+  aih experiment run <spec.json> [--exp-id id] [--mock] [--reps N] [--concurrency N]
+  aih experiment retry <spec.json> --exp-id id   # == run --retry-failed：只重跑非 passed cell
+  aih experiment status <exp-id> [--json]         # passed/failed/error 分布
+  ```
+  spec：`{ "tasks": [{id, prompt, expect[]}], "models": [{model, provider?, baseUrl?}],
+  "repetitions": N }`。每 cell 的 `status` 持久化到 `.aih/eval/<exp-id>.results.json`；
+  `retry` 只重跑上次 `failed`/`error`/未跑的 cell 并合并回同一结果集（省 token/时间），
+  全绿时直接短路。
 - 冒烟测试覆盖：cell 展开、mock 全流程 4 cell、紧预算跳过记账、usage 聚合、成本上限
-  停机、外部 echo subject 判定
+  停机、外部 echo subject 判定、**FA#6 持久化 + 失败单题重跑（只跑失败 cell、passed 保留）
+  + status 分布检视**
 
 ### 成本与吞吐（cost / TPS）
 
@@ -286,6 +372,73 @@ append-only 会话日志 + `.aih/memory.md` 纯函数算出 6 项健康指标—
 （`turn/start`、`goal/judge`、`tool/result`、`escalate`、`turn/end.usage`）+ 项目记忆。
 无价目表 / mock 模式下成本项为 `—` / 0，其余指标照常。冒烟覆盖：6 指标数值、
 recovery 跨度、guide 增速（含短跨度不外推）、空会话全 0 不报错、bullet-dated 记忆行计数。
+
+### 安全缝（safety seam，PE#1 / PE#2 / PE#4）
+
+「让 harness 强制，而不是让模型自律」——Production Agent Engineering 的护栏层。
+三件套在**每步工具执行后**由内核统一裁决，模型不可见、不可绕过：
+
+- **PE#2 预算硬约束 + 熔断（budget）**：`BudgetTracker` 累积**成本 / 写次数 / 墙钟时间**，
+  并守住 **scope 拒绝清单**（`denyPaths` 命中的写立即硬违规）。
+  - **硬边界**（`maxCostUsd` / `maxWrites` / `timeoutMs` / `denyPaths`）任一越界 →
+    抛 `BudgetExceeded` → 内核发 `escalate` 事件、`turn/end stopReason="escalated"`，**停止本轮**。
+  - **软熔断（tripwire）**：单任务成本 ≥ 2× 会话均值 → 经 `onTripwire` 钩子**提示一次**（每任务
+    锁存一次），**不阻断**——把「异常贵」变成可见信号而非静默烧钱。
+- **PE#1 计算式传感器（sensors）**：写后验证。声明 `{name, command, onTools?, pathPrefix?, timeoutMs?}`，
+  在指定写工具成功后跑一条命令（`cwd`=项目根，`buildChildEnv` 保证子进程**拿不到密钥**）。
+  退出 0=绿；非 0=红→**有界重试**（`sensorRetries`，默认 1）→仍红则**升级**。
+  `onTools` 限定触发工具、`pathPrefix` 限定写入路径，避免无关写触发昂贵检查。
+- **PE#4 升级原语（escalate）**：harness 遇到「自己解决不了」的边界（传感器持续红、预算越界、
+  反复失败）时，发一条**模型不可见**的 `escalate` 事件（`reason` + `options[2-4]` + `safestDefault`），
+  把决策交还给人：
+  - **交互（TUI）**：渲染选项 + 最安全默认，等待人工选择；
+  - **非交互（`run`）**：打印选项与 safest default 后**以退出码 3 停止**（`ESCALATE_EXIT_CODE`），
+    让 CI / 脚本能区分「正常结束」与「需要人介入」。
+
+配置（`aih.json` `safety` 块，或 env 覆盖，后者胜）：
+
+```jsonc
+{
+  "safety": {
+    "budget": { "maxCostUsd": 1, "maxWrites": 5, "timeoutMs": 60000, "denyPaths": ["secrets/"] },
+    "sensors": [
+      { "name": "typecheck", "command": "npm run typecheck", "onTools": ["write_file", "edit"] }
+    ],
+    "sensorRetries": 1
+  }
+}
+```
+
+env 等价：`AIH_BUDGET`（JSON 或 `maxCostUsd=1|maxWrites=5|timeoutMs=60000|denyPaths=a|b`）、
+`AIH_SENSORS`（SensorConfig JSON 数组或单对象）、`AIH_SENSOR_RETRIES`（默认 1）、
+`AIH_SENSOR_TIMEOUT_MS`（默认 60000）。**未配置时整条缝 no-op**（零开销、零行为改变）。
+
+载体：状态机在 `core/src/budget.ts`（`BudgetTracker` / `SensorLoop` / `parseBudget` / `isDenied`，
+纯函数可单测），裁决在 `core/src/agent-loop.ts`（`escalate()` + 每步后 sensor/budget 检查），
+CLI 接线在 `cli/src/safety.ts`（config→core 对象 + 传感器执行器 + `onEscalate` 行为）。
+冒烟覆盖：预算 cost/writes/timeout/scope/tripwire/parse、传感器绿/红/重试/升级/pathPrefix、
+AgentLoop 集成（传感器红→escalate、预算硬→escalate、tripwire→继续）。
+**恢复测试**：`test/recovery.sh`（escalate 落盘可回放 + 非交互退出码 3 + 崩溃后续跑不重复派发）。
+
+### 距离尺（`aih measure`，PR#2）
+
+scorecard 回答「现在有多好」（单点），`aih measure` 回答「变了多少、怎么变的」——
+Proteus「measurement instrument, not just a score」的距离尺。纯函数（`cli/src/measure.ts`，
+同 cost.ts/scorecard.ts 纪律，无 LLM 可单测），**只读声明的 surface + 归一化 trace，从不读
+agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化结果：
+
+- **`aih measure distance <a.json> <b.json>`** —— 每 surface 的结构距离：`added`/`dropped`/
+  `revised` + `pathLength`；`--revised surface=entry,entry` 声明「同在但已变」的条目。
+  **缺快照→明确 degraded（exit 1）而非虚构大距离**。
+- **`aih measure stream <traces.json> [--perms N] [--seed N]`** —— 行为距离：工具流频率 L1 +
+  转移 bigram Jaccard，配 **seeded 置换检验**（between/within 比 R + p；同 seed 完全可复现；
+  arm<2 时 degraded 不硬算）。
+- **`aih measure crystallize <evolved.json> <neutral.json>`** —— 进化态挂中性条件读回是否等于
+  自身端点（disposition 稳定判定）；drift → **exit 1 有信号**、`DRIFTED` 标记。
+
+输入 schema：`{ "surfaces": [ { "surface": "skills", "entries": ["a","b"] } ] }` 与
+`{ "traces": [ { "label": "arm", "events": [...] } ] }`。冒烟覆盖结构距离精确 diff、置换检验
+可复现、缺快照降级、CLI 端到端 —— 见 `cli/src/smoke.ts` PR#2 块。
 
 ### Persistent Memory（持久记忆）
 
@@ -391,6 +544,9 @@ npm run cli -- session distill-branch branch-a default --from 7  # 废弃分支�
 npm run cli -- session rm work                    # 删除
 npm run cli -- stats                              # 所有会话 token 用量汇总
 npm run cli -- scorecard [--format json]          # harness 健康记分卡（6 指标，PE#3）
+npm run cli -- measure distance <a.json> <b.json> # 结构距离（added/dropped/revised+len，PR#2）
+npm run cli -- measure stream <traces.json>       # 行为距离 + 置换检验 R（seeded，PR#2）
+npm run cli -- measure crystallize <e> <n>        # 进化态中性读回 vs 端点（drift→exit 1）
 ```
 
 会话文件为 append-only JSONL（每行一个 SessionEvent），可直接审计或程序化回放。
@@ -501,10 +657,19 @@ opencode / MiMo-Code 风格全屏 TUI：
 - **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；`exit`（或 `/quit`，
   `ctrl-c` 清空输入再按退出）还原终端；忙碌中 `ctrl-c` 取消当前轮不退出
 - 斜杠命令：`/mode` `/goal` `/tools` `/model <id>`（热切换）`/usage` `/compact [focus]` `/clear`
-  `/inject <text>` `/events` `/skills` `/vivid` `/bg <prompt>` `/find <text>` `/ <技能名>`
+  `/inject <text>` `/events` `/skills` `/vivid` `/bg <prompt>` `/find <text>` `/shell [--send]` `/fix [--show]` `/ <技能名>`
 - **`/find <text>`**：跨所有工具输出逐行检索（含 32KB 内带上限的展开内容），
   命中工具自动展开并滚动到首个命中，列出最近 12 条命中（`tool · line · 片段`）；
   超出内带上限的全量输出用 `run_cmd keep_output=true` 落盘 `.aih/outputs/*.log`
+- **`/shell [--send]`**（IT#1 shell 上下文感知）：展示本会话最近的 `run_cmd` 上下文
+  （命令 · 退出码 · cwd · 输出尾部，`keep_output` 时附全量输出文件路径）；
+  `--send` 把该上下文块注入下一 turn。agent 侧另有 `shell_context` 工具可主动取用
+  （`max_commands`/`max_output_chars` 可调），或设 `AIH_SHELL_CONTEXT=auto` 在每个
+  正常消息 turn 起始自动附带——免去手动粘贴 shell 报错/输出
+- **`/fix [--show]`**（IT#2 确定性 error-detection）：检测本会话失败的 `run_cmd`
+  （非零退出码 / 超时），展示摘要（命令 · 退出码 · 分类），组装修复请求块送 agent
+  求修复；`--show`/`--dry` 只展示不发送。状态栏在失败后亮红色 `⚠ N failed`
+  （全绿隐藏；`AIH_ERROR_DETECT=0` 关闭自动指示）
 - **`/vivid` 简洁渲染**：切换 plain 模式——去掉边框/底色/侧栏/状态提示等 chrome，
   只留正文（适合低带宽/远程/日志回放）；再按一次还原完整主题
 - 会话标题：首轮后自动 LLM 生成 2–6 词标题（`<name>.jsonl.meta.json`），状态栏与
@@ -651,6 +816,10 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_TOOL_CONCURRENCY` (4) | 单步内连续只读工具调用的并发上限（写类恒串行） |
 | `AIH_FORMAT_TIMEOUT_MS` (15000) | 写后自动格式化超时（失败不阻断写入） |
 | `AIH_MOCK_AUX_TEXT` | mock 模式下无工具辅助调用（goal 裁判 / 分支蒸馏）的回复文本（测试钩子） |
+| `AIH_BUDGET` | PE#2 预算硬约束：JSON 或 `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b`（越界→escalate 退出码 3） |
+| `AIH_SENSORS` | PE#1 计算式传感器：SensorConfig JSON 数组或单对象（写后验证命令，红→有界重试→升级） |
+| `AIH_SENSOR_RETRIES` (1) | PE#1 传感器红→升级前的重试次数 |
+| `AIH_SENSOR_TIMEOUT_MS` (60000) | PE#1 单条传感器命令超时 |
 
 ### 会话标题（隐藏系统 agent）
 
@@ -787,6 +956,8 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
 | 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ 审计 + **脱敏/计时 + 技能驱动 `secretPatterns`**（D#11） |
 | 工具输出搜索 / 全量落盘 | — | ◐ | ◐ | — | ✅ `/find` + `run_cmd keep_output`（T#22） |
+| shell 上下文感知（agent 主动取用 shell 输出/退出码） | — | — | — | — | ✅ `/shell` + `shell_context` 工具 + `AIH_SHELL_CONTEXT=auto`（IT#1） |
+| 确定性 shell 失败检测 + 一键修复（状态栏红标 + `/fix` 送 agent） | — | — | — | — | ✅ `error-detect.ts` + 状态栏 `⚠ N failed` + `/fix`（IT#2） |
 | 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
 | curl\|bash 一键安装 | ✅ | ◐ | ✅ | — | ✅ |
 | CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
@@ -797,6 +968,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 项目信任门（防克隆仓库投毒） | — | ◐ trust | ◐ | — | ✅ `--trust`/trust.json（P#40，fail-closed） |
 | 工具结果修剪 + archive_read 惰性取回 | — | ✅ prune | ◐ | — | ✅ `.aih/archives` + 占位符投影（MK#43） |
 | 崩溃恢复（T1 dispatch 事实 + park 不猜） | — | ✅ Runtime Resume | ◐ | — | ✅ tool/dispatch + scanRecovery + PARK 码（MK#44/45） |
+| 安全缝（预算硬约束 + 传感器 + escalate 原语） | — | ◐ | — | — | ✅ PE#1 传感器 + PE#2 预算/tripwire + PE#4 escalate（退出码 3，`test/recovery.sh`） |
 | 工作区身份 UUID / 覆盖校验压缩摘要 | — | ✅ | — | — | ✅ `.aih/workspace.json` + coverage digest（MK#47/#42） |
 | Extension API（代码级插件） | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on（P#39，信任门约束）+ 结果承载事件（before 否决 / after 改写 / turn:end）+ `init` 自扩展示例 |
 | Steering 中途改向 / Follow-up 排队 + Alt+Up 取回 | — | ✅ | ◐→✅ | ✅ Pi | ✅ busy 输入自动 steer；follow-up 自动续跑；Alt+Up 取回排队消息可改后重发（P#35） |
@@ -814,6 +986,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **Apache Maka**（apache/maka，local-first agent workspace）→ 借 **事实层纪律**：append-only 事件即唯一事实源、UI/模型调用只是投影。已落地：compaction coverage digest（✅ MK#42，摘要必须证明覆盖范围，否则 fail-open）、tool/dispatch T1 事实 + RecoveryResolver 四态分类 + park 稳定码（✅ MK#44/45）、工具结果修剪 + archive_read 惰性归档（✅ MK#43）、工作区身份 UUID（✅ MK#47）、models.dev 快照 fail-closed 同步（✅ P#48）、steering/follow-up 双队列（✅ P#35）；明确不借 SQLite/Electron、Phase3/4 文件级 reconcile、provider-native 远程压缩。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
+- **Intelligent Terminal**（终端 UX 参考）→ 借 **shell 上下文感知**（agent 主动取用 shell 输出/退出码，✅ IT#1：`/shell` + `shell_context` 工具 + `AIH_SHELL_CONTEXT=auto`）+ **确定性 error-detect→一键送 agent**（✅ IT#2：`error-detect.ts` + 状态栏 `⚠ N failed` + `/fix`）+ **`?` 前缀快捷任务 + 上下文注入**（✅ IT#3：`question.ts` + TUI 输入行识别）+ **多 agent 会话管理面板**（✅ IT#4：`sessions.ts` + TUI `/sessions` dashboard/kill/view）+ **run-or-copy 命令批准**（✅ IT#5：`clipboard.ts` + `askRunOrCopy`）。
 
 **差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore` + worktree 摘要；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
 

@@ -79,6 +79,12 @@ export interface ParseOptions {
    * The caller (llm-openai) resets its inter-frame stall timer on this.
    */
   onActivity?: () => void;
+  /**
+   * FA#3 — reasoning-runaway watchdog. When set, a reasoning-only stream
+   * (no text, no tool call yet) that exceeds `maxChars` of reasoning or
+   * `timeoutMs` of elapsed time throws ReasoningRunawayError. Omit to disable.
+   */
+  reasoningWatchdog?: { maxChars: number; timeoutMs: number };
 }
 
 /**
@@ -87,6 +93,49 @@ export interface ParseOptions {
  * honestly ("[stream interrupted] continue from where you left off") instead
  * of losing the partial answer or presenting it as complete.
  */
+/**
+ * FA#3 — the stream produced ONLY reasoning (no text, no tool call) past the
+ * reasoning-only budget. Carries what was received so the caller can decide
+ * whether to resume honestly or fold into the retry budget (mirrors StallError).
+ */
+export class ReasoningRunawayError extends Error {
+  constructor(
+    public readonly reasoningChars: number,
+    public readonly elapsedMs: number,
+    public readonly limitChars: number,
+  ) {
+    super(
+      `reasoning-only stream exceeded budget (${reasoningChars} reasoning chars, ` +
+        `${elapsedMs}ms > limit ${limitChars} chars) — no content produced`,
+    );
+    this.name = "ReasoningRunawayError";
+  }
+}
+
+/**
+ * FA#3 — pure decision: has a reasoning-only stream run away?
+ *
+ * A reasoning model that "thinks" forever without ever emitting content or a
+ * tool call burns budget and stalls the turn. This fires when ALL of:
+ *   - no text content yet AND no tool call yet (the stream is reasoning-only),
+ *   - reasoning chars exceed `limitChars` (token-ish cap), OR
+ *   - the reasoning-only phase has lasted longer than `timeoutMs`.
+ *
+ * Pure (no I/O, no Date.now) so it is unit-testable: callers pass `elapsedMs`.
+ * Returns false when reasoning is not the only thing being produced (text or
+ * a tool call has arrived) — that is a healthy stream, not a runaway.
+ */
+export function isReasoningRunaway(
+  state: { reasoningChars: number; hasText: boolean; hasToolCall: boolean; elapsedMs: number },
+  limit: { maxChars: number; timeoutMs: number },
+): boolean {
+  if (state.hasText || state.hasToolCall) return false; // healthy: content is flowing
+  if (state.reasoningChars === 0) return false; // nothing yet — not a runaway
+  if (state.reasoningChars > limit.maxChars) return true; // token-ish cap exceeded
+  if (limit.timeoutMs > 0 && state.elapsedMs > limit.timeoutMs) return true; // time cap exceeded
+  return false;
+}
+
 export class StallError extends Error {
   /** Text received before the stall (may be empty). */
   partialText: string;
@@ -209,6 +258,9 @@ export async function consumeSSEStream(
   const decoder = new TextDecoder();
   let buffer = "";
   const firstFrameFired = { value: false };
+  // FA#3 — reasoning-runaway watchdog (only when the caller opted in).
+  const wd = opts.reasoningWatchdog;
+  const startedAt = wd ? Date.now() : 0;
 
   for await (const chunk of body) {
     // CC#49 — every network chunk is activity; reset the caller's stall timer.
@@ -222,6 +274,25 @@ export async function consumeSSEStream(
       const data = line.slice(5).trim();
       if (!data) continue;
       parseFrame(data, acc, opts, firstFrameFired);
+      // FA#3 — check the watchdog after each frame (cheap pure check).
+      if (wd) {
+        const runaway = isReasoningRunaway(
+          {
+            reasoningChars: acc.reasoning.length,
+            hasText: acc.text.length > 0,
+            hasToolCall: acc.toolFrames.size > 0,
+            elapsedMs: Date.now() - startedAt,
+          },
+          wd,
+        );
+        if (runaway) {
+          throw new ReasoningRunawayError(
+            acc.reasoning.length,
+            Date.now() - startedAt,
+            wd.maxChars,
+          );
+        }
+      }
     }
   }
 

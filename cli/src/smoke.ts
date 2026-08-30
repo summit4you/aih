@@ -1977,6 +1977,247 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // IT#2 — deterministic shell-failure detection → one-click fix (pure, no LLM).
+  const { SessionLog } = await import("@aih/core");
+  const {
+    detectShellErrors,
+    formatFixBlock,
+    errorBadge,
+    summarizeErrors,
+    isFailed,
+  } = await import("./error-detect.js");
+
+  // empty state: no events → no failures, null badge, empty block/summary.
+  const emptyLog = new SessionLog();
+  assert(detectShellErrors(emptyLog.all()).length === 0, "IT#2 empty state → no failures");
+  assert(errorBadge(detectShellErrors(emptyLog.all())) === null, "IT#2 all green → null badge");
+  assert(formatFixBlock([]) === "", "IT#2 empty block → ''");
+  assert(summarizeErrors([]) === "", "IT#2 empty summary → ''");
+
+  // one failing run_cmd (non-zero exit) → detected, classified, badge lit.
+  const log = new SessionLog();
+  log.append({ type: "tool/call", turnId: "t1", callId: "c1", name: "run_cmd", args: { command: "npm test", cwd: "/w" } });
+  log.append({ type: "tool/result", turnId: "t1", callId: "c1", ok: true, result: { code: 1, timed_out: false, stdout: "FAIL: 3 tests failed\n  at suite\n" } });
+  const errs = detectShellErrors(log.all());
+  assert(errs.length === 1, "IT#2 one failure detected");
+  assert(errs[0].command === "npm test", "IT#2 failing command captured");
+  assert(errs[0].code === 1, "IT#2 exit code captured");
+  assert(errs[0].kind === "test", "IT#2 classified as test failure");
+  assert(errs[0].matched.length > 0, "IT#2 matched pattern recorded");
+  const badge = errorBadge(errs);
+  assert(badge !== null && badge.ok === false && /1 failed/.test(badge.label), "IT#2 badge lit (1 failed)");
+  const block = formatFixBlock(errs);
+  assert(block.includes("npm test") && block.includes("exit 1"), "IT#2 block has command + exit code");
+  assert(block.includes("class: test"), "IT#2 block has classification");
+  assert(summarizeErrors(errs).includes("npm test"), "IT#2 summary has command");
+
+  // a GREEN run_cmd (exit 0) → NOT detected (a green exit is never a failure).
+  const green = new SessionLog();
+  green.append({ type: "tool/call", turnId: "t1", callId: "g1", name: "run_cmd", args: { command: "ls -la" } });
+  green.append({ type: "tool/result", turnId: "t1", callId: "g1", ok: true, result: { code: 0, stdout: "total 8\nfile.txt\n" } });
+  assert(detectShellErrors(green.all()).length === 0, "IT#2 exit-0 command → not a failure");
+  assert(errorBadge(detectShellErrors(green.all())) === null, "IT#2 all green → no indicator");
+
+  // a TIMEOUT (no exit code) → still a failure (timedOut flag).
+  const to = new SessionLog();
+  to.append({ type: "tool/call", turnId: "t1", callId: "x1", name: "run_cmd", args: { command: "sleep 999" } });
+  to.append({ type: "tool/result", turnId: "t1", callId: "x1", ok: true, result: { code: 0, timed_out: true, stdout: "" } });
+  const toErrs = detectShellErrors(to.all());
+  assert(toErrs.length === 1 && toErrs[0].timedOut === true, "IT#2 timeout → failure (timedOut)");
+  assert(isFailed({ callId: "x", ts: 0, command: "x", code: 0, timedOut: true, ok: true, output: "", outputTruncated: false }), "IT#2 isFailed: timeout → true");
+
+  // network error pattern → classified network.
+  const net = new SessionLog();
+  net.append({ type: "tool/call", turnId: "t1", callId: "n1", name: "run_cmd", args: { command: "curl http://x" } });
+  net.append({ type: "tool/result", turnId: "t1", callId: "n1", ok: true, result: { code: 7, timed_out: false, stdout: "curl: (7) Failed to connect: ECONNREFUSED" } });
+  assert(detectShellErrors(net.all())[0].kind === "network", "IT#2 ECONNREFUSED → network");
+
+  // fs error pattern → classified fs.
+  const fs = new SessionLog();
+  fs.append({ type: "tool/call", turnId: "t1", callId: "f1", name: "run_cmd", args: { command: "cat /nope" } });
+  fs.append({ type: "tool/result", turnId: "t1", callId: "f1", ok: true, result: { code: 1, timed_out: false, stdout: "cat: /nope: No such file or directory" } });
+  assert(detectShellErrors(fs.all())[0].kind === "fs", "IT#2 ENOENT → fs");
+
+  // non-run_cmd tools must NOT leak into failure detection.
+  const leak = new SessionLog();
+  leak.append({ type: "tool/call", turnId: "t1", callId: "l1", name: "read_file", args: { path: "s.txt" } });
+  leak.append({ type: "tool/result", turnId: "t1", callId: "l1", ok: false, result: { error: "ENOENT" } });
+  assert(detectShellErrors(leak.all()).length === 0, "IT#2 non-run_cmd tool → excluded");
+
+  // newest-first ordering: 2 failures → most recent reported first.
+  const two = new SessionLog();
+  two.append({ type: "tool/call", turnId: "t1", callId: "a", name: "run_cmd", args: { command: "first-fail" } });
+  two.append({ type: "tool/result", turnId: "t1", callId: "a", ok: true, result: { code: 1, stdout: "boom" } });
+  two.append({ type: "tool/call", turnId: "t1", callId: "b", name: "run_cmd", args: { command: "second-fail" } });
+  two.append({ type: "tool/result", turnId: "t1", callId: "b", ok: true, result: { code: 2, stdout: "boom2" } });
+  const twoErrs = detectShellErrors(two.all());
+  assert(twoErrs.length === 2, "IT#2 two failures detected");
+  assert(twoErrs[0].command === "second-fail", "IT#2 newest failure reported first");
+  assert(errorBadge(twoErrs)?.label === "2 failed", "IT#2 badge count = 2");
+
+  // maxErrors cap: 5 failures, maxErrors=2 → only 2 (most recent).
+  const five = new SessionLog();
+  for (let i = 1; i <= 5; i++) {
+    five.append({ type: "tool/call", turnId: "t1", callId: `e${i}`, name: "run_cmd", args: { command: `fail-${i}` } });
+    five.append({ type: "tool/result", turnId: "t1", callId: `e${i}`, ok: true, result: { code: 1, stdout: "x" } });
+  }
+  const capped = detectShellErrors(five.all(), { maxErrors: 2 });
+  assert(capped.length === 2, "IT#2 maxErrors cap honored");
+  assert(capped[0].command === "fail-5" && capped[1].command === "fail-4", "IT#2 cap keeps most recent");
+
+  // output tail is bounded (huge stdout → capped, flagged truncated).
+  const big = new SessionLog();
+  big.append({ type: "tool/call", turnId: "t1", callId: "b", name: "run_cmd", args: { command: "verbose" } });
+  big.append({ type: "tool/result", turnId: "t1", callId: "b", ok: true, result: { code: 1, stdout: "E".repeat(5000) } });
+  const bigErr = detectShellErrors(big.all(), { maxOutputChars: 500 })[0];
+  assert(bigErr.outputTail.length <= 500, "IT#2 output tail bounded");
+  assert(bigErr.outputTruncated === true, "IT#2 truncation flagged");
+
+  // deterministic: same log → same detection (stable kind + order).
+  const d1 = detectShellErrors(log.all());
+  const d2 = detectShellErrors(log.all());
+  assert(JSON.stringify(d1) === JSON.stringify(d2), "IT#2 deterministic (stable output)");
+
+  console.log("ok: IT#2 deterministic error-detection + /fix block");
+}
+
+{
+  // IT#5 — run-or-copy approval UX (write commands: run / copy / no, never auto-run).
+  const { detectClipboardCmd, copyToClipboard, CLIPBOARD_CANDIDATES } =
+    await import("./clipboard.js");
+  const { SessionGate, DenyGate } = await import("./gate.js");
+
+  // detectClipboardCmd is pure: first candidate whose binary resolves wins.
+  const cands = [
+    { bin: "nope1", args: [], label: "nope1" },
+    { bin: "yesbin", args: [], label: "yesbin" },
+    { bin: "nope2", args: [], label: "nope2" },
+  ];
+  assert(
+    detectClipboardCmd(cands, (b) => b === "yesbin")?.bin === "yesbin",
+    "IT#5 detect: first resolving candidate wins",
+  );
+  assert(
+    detectClipboardCmd(cands, () => false) === null,
+    "IT#5 detect: none resolving → null (degrade to print)",
+  );
+  assert(CLIPBOARD_CANDIDATES.some((c) => c.bin === "pbcopy"), "IT#5 candidates include pbcopy");
+
+  // copyToClipboard: no binary available → print fallback, never throws.
+  const noClip = copyToClipboard("echo hi", cands, () => false);
+  assert(noClip.ok === false && noClip.mode === "print" && noClip.print === true, "IT#5 copy: no binary → print fallback");
+  // copyToClipboard: binary "resolves" but spawn fails → still print fallback.
+  const failClip = copyToClipboard("echo hi", [{ bin: "/nonexistent-clip-bin", args: [], label: "fake" }], () => true);
+  assert(failClip.ok === false && failClip.mode === "print" && failClip.print === true, "IT#5 copy: spawn failure → print fallback (no throw)");
+
+  // Gate integration: a TUI WITH askRunOrCopy gets the run-or-copy prompt for
+  // run_cmd write asks. Each stub records what it saw and returns a choice.
+  const mkRocStub = (choice: "run" | "copy" | "no") => {
+    const calls: { command: string; scope: string }[] = [];
+    const sys: string[] = [];
+    return {
+      calls,
+      sys,
+      tui: {
+        askRunOrCopy: async (command: string, scope: string) => {
+          calls.push({ command, scope });
+          return choice;
+        },
+        askConfirm: async () => "deny" as const,
+        pushSystem: (s: string) => { sys.push(s); },
+      },
+    };
+  };
+  const attach = (gate: unknown, stub: { tui: unknown }): void =>
+    (gate as { attachTui(t: unknown): void }).attachTui(stub.tui);
+
+  // "run" → approved (true), run-or-copy prompt used (not askConfirm).
+  const runStub = mkRocStub("run");
+  const runGate = new SessionGate(new DenyGate(), [], undefined, false);
+  attach(runGate, runStub);
+  const runOk = await runGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm publish" } });
+  assert(runOk === true, "IT#5 run → approved (executes)");
+  assert(runStub.calls.length === 1 && runStub.calls[0].command === "npm publish", "IT#5 run: run-or-copy prompt received the command");
+  assert(runStub.sys.some((s) => /approved/.test(s)), "IT#5 run: approval reported");
+
+  // "copy" → NOT executed (false), command surfaced for manual paste (clipboard
+  // or the print fallback — either way the user gets the command text).
+  const copyStub = mkRocStub("copy");
+  const copyGate = new SessionGate(new DenyGate(), [], undefined, false);
+  attach(copyGate, copyStub);
+  const copyOk = await copyGate.request({ tool: "run_cmd", kind: "write", args: { command: "rm -rf dist" } });
+  assert(copyOk === false, "IT#5 copy → NOT executed");
+  assert(copyStub.calls.length === 1 && copyStub.calls[0].command === "rm -rf dist", "IT#5 copy: prompt received the command");
+  assert(copyStub.sys.some((s) => s.includes("rm -rf dist")), "IT#5 copy: command surfaced (clipboard or print fallback)");
+
+  // "no" → denied (false).
+  const noStub = mkRocStub("no");
+  const noGate = new SessionGate(new DenyGate(), [], undefined, false);
+  attach(noGate, noStub);
+  const noOk = await noGate.request({ tool: "run_cmd", kind: "write", args: { command: "git push origin main" } });
+  assert(noOk === false, "IT#5 no → denied");
+  assert(noStub.sys.some((s) => /denied/.test(s)), "IT#5 no: denial reported");
+
+  // Fallback: a TUI WITHOUT askRunOrCopy (e.g. the CC#54 stub) still works via
+  // askConfirm — IT#5 must not break the existing gate contract.
+  const legacyStub = { prompts: [] as string[], tui: { askConfirm: async (d: string) => { (legacyStub.prompts as string[]).push(d); return "deny" as const; }, pushSystem: () => {} } };
+  const legacyGate = new SessionGate(new DenyGate(), [], undefined, false);
+  attach(legacyGate, legacyStub);
+  const legacyOk = await legacyGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm test" } });
+  assert(legacyOk === false && legacyStub.prompts.length === 1, "IT#5 fallback: TUI without askRunOrCopy → askConfirm path (CC#54 intact)");
+
+  // Non-run_cmd write asks never take the run-or-copy path (they have no
+  // command to copy) — they keep the generic askConfirm prompt.
+  const nonRunStub = mkRocStub("run");
+  const nonRunGate = new SessionGate(new DenyGate(), [], undefined, false);
+  attach(nonRunGate, nonRunStub);
+  const nonRunOk = await nonRunGate.request({ tool: "write_file", kind: "write", args: { path: "/tmp/x", content: "y" } });
+  assert(nonRunOk === false && nonRunStub.calls.length === 0, "IT#5 non-run_cmd write → generic askConfirm (no run-or-copy)");
+
+  console.log("ok: IT#5 run-or-copy approval UX + clipboard fallback");
+}
+
+{
+  // IT#3 — `?` prefix: classify + context composition (pure, no LLM).
+  const {
+    classifyQuestionPrefix,
+    buildQuestionContext,
+    composeQuestionPrompt,
+  } = await import("./question.js");
+  const { SessionLog } = await import("@aih/core");
+
+  // classify: ASCII task needs a separating space; CJK may attach directly.
+  assert(classifyQuestionPrefix("? fix the failing test").isQuestion === true, "IT#3 ? + space + ascii → task");
+  assert(classifyQuestionPrefix("? fix the failing test").prompt === "fix the failing test", "IT#3 prompt extracted (ascii)");
+  assert(classifyQuestionPrefix("?修一下刚才那个报错").isQuestion === true, "IT#3 ? + CJK (no space) → task");
+  assert(classifyQuestionPrefix("? 修一下刚才那个报错").prompt === "修一下刚才那个报错", "IT#3 prompt extracted (CJK)");
+  // conservative: a lone "?" or "?<ascii>" is NOT a task (literal question).
+  assert(classifyQuestionPrefix("?").isQuestion === false, "IT#3 lone ? → not a task");
+  assert(classifyQuestionPrefix("?foo").isQuestion === false, "IT#3 ?<ascii> → not a task (literal)");
+  assert(classifyQuestionPrefix("what is this?").isQuestion === false, "IT#3 trailing ? → not a task");
+  assert(classifyQuestionPrefix("hello").isQuestion === false, "IT#3 no ? → not a task");
+
+  // context: cwd + session + shell history (reuses IT#1 extractShellContext).
+  const log = new SessionLog();
+  log.append({ type: "tool/call", turnId: "t", callId: "c1", name: "run_cmd", args: { command: "npm test", cwd: "/w" } });
+  log.append({ type: "tool/result", turnId: "t", callId: "c1", ok: true, result: { code: 1, stdout: "FAIL 1 test" } });
+  const ctx = buildQuestionContext({ events: log.all(), cwd: "/work", sessionName: "s-123" });
+  assert(ctx.includes("cwd: /work"), "IT#3 context has cwd");
+  assert(ctx.includes("active session: s-123"), "IT#3 context has active session");
+  assert(ctx.includes("npm test") && ctx.includes("exit 1"), "IT#3 context has shell history (command + exit code)");
+  // empty log → still has cwd/session, no shell section.
+  const ctxEmpty = buildQuestionContext({ events: [], cwd: "/work" });
+  assert(ctxEmpty.includes("cwd: /work") && !ctxEmpty.includes("npm test"), "IT#3 empty log → cwd only, no shell");
+
+  // compose: context + task joined, task labelled last.
+  const composed = composeQuestionPrompt(ctx, "fix the failing test");
+  assert(composed.includes(ctx) && composed.endsWith("Task: fix the failing test"), "IT#3 compose: context + labelled task");
+  assert(composeQuestionPrompt("", "do it") === "Task: do it", "IT#3 compose: empty context → task only");
+
+  console.log("ok: IT#3 ?-prefix classify + context composition");
+}
+
+{
   // D#12: sandbox seam — pluggable run_cmd backend (local default, registry, env/override)
   const {
     localBackend,
@@ -2051,6 +2292,38 @@ await srv.connect(new StdioServerTransport());
     lines.length === 1 && lines[0] === "one two three",
     "pasted newlines become spaces; real Enter submits once",
   );
+}
+
+{
+  // Question prompt + scroll keys — a pending `question` must not swallow
+  // escape sequences (PageUp/PageDown/arrows/mouse) as answer text, so the
+  // user can still scroll the transcript while answering. Regression: before
+  // the fix, `\x1b[5~` leaked its bytes into the answer buffer.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => lines.push(l),
+  });
+  const lines: string[] = [];
+  const p = tui.askQuestion("pick one?");
+  tui.feed("\x1b[5~"); // PageUp — must scroll, not become answer text
+  tui.feed("option-b");
+  tui.feed("\r"); // submit
+  const answer = await p;
+  assert(answer === "option-b", `question answer excludes scroll-key bytes (got "${answer}")`);
+  // Mouse scroll (SGR) while answering also must not pollute the answer.
+  const p2 = tui.askQuestion("scroll test?");
+  tui.feed("\x1b[<65;1;1M"); // wheel-up
+  tui.feed("ok");
+  tui.feed("\r");
+  const answer2 = await p2;
+  assert(answer2 === "ok", `question answer excludes mouse-scroll bytes (got "${answer2}")`);
+  console.log("ok: question prompt allows scrolling without polluting the answer");
 }
 
 {
@@ -4195,6 +4468,30 @@ import {
 }
 
 {
+  // TP#3.6b — session-close turn closure (saveSession parity): a turn whose
+  // tools all completed but which never got its turn/end is mis-reported as
+  // "interrupted" on every resume. Closing it with a session_closed end event
+  // makes the next scan clean — this asserts that closure behaviour.
+  const events: { type: string; turnId?: string; callId?: string; stopReason?: string; [k: string]: unknown }[] = [
+    { seq: 0, type: "turn/start", turnId: "t" },
+    { seq: 1, type: "user/message", turnId: "t", text: "继续" },
+    { seq: 2, type: "assistant/message", turnId: "t", text: "", toolCalls: [] },
+    { seq: 3, type: "tool/call", callId: "c9", name: "run_cmd", turnId: "t", args: {} },
+    { seq: 4, type: "tool/dispatch", callId: "c9", name: "run_cmd", turnId: "t" },
+    { seq: 5, type: "tool/result", callId: "c9", ok: true, turnId: "t", result: "ok" },
+  ];
+  const before = scanRecovery(events as any);
+  assert(before.openTurn === "t" && before.facts[0].state === "completed", "TP#3.6b before closure: completed-but-open turn is detected");
+  // saveSession appends one session_closed turn/end for the open turn.
+  if (before.openTurn) {
+    events.push({ seq: events.length, type: "turn/end", turnId: before.openTurn, stopReason: "session_closed" });
+  }
+  const after = scanRecovery(events as any);
+  assert(after.openTurn === undefined && after.lastClosedTurn === "t", "TP#3.6b after closure: no false interrupted turn on resume");
+  console.log("ok: TP#3.6b session-close turn closure");
+}
+
+{
   // TP#3.7 — Recovery: describeFact
   const fact = { callId: "c7", name: "run_cmd", turnId: "t1", state: "completed" as const };
   const desc = describeFact(fact);
@@ -4680,6 +4977,214 @@ import { width } from "./tui.js";
 
 console.log("ok: TP#7 all stress/chaos tests passed (10 cases)");
 
+{
+  // PR#2 — `aih measure`: structural / behavioral distance instrument.
+  // Pure functions over declared surfaces + normalized traces (no LLM).
+  const {
+    surfaceDistance,
+    distance,
+    toolFlow,
+    behaviorDistance,
+    permutationTest,
+    crystallize,
+    formatDistance,
+    formatPermutationTest,
+  } = await import("./measure.js");
+
+  // ---- structural distance: exact diff on a known pair ---------------------
+  const sd = surfaceDistance(
+    { surface: "skills", entries: ["a", "b", "c"] },
+    { surface: "skills", entries: ["b", "c", "d"] },
+    ["c"], // c present in both and reported changed
+  );
+  assert(JSON.stringify(sd.added) === '["d"]', "PR#2 surfaceDistance added = [d] (sorted unique)");
+  assert(JSON.stringify(sd.dropped) === '["a"]', "PR#2 surfaceDistance dropped = [a]");
+  assert(JSON.stringify(sd.revised) === '["c"]', "PR#2 surfaceDistance revised = [c]");
+  assert(sd.pathLength === 3, "PR#2 surfaceDistance pathLength = added+dropped+revised = 3");
+
+  // multi-surface with revisedBySurface = exact total.
+  const dr = distance(
+    [
+      { surface: "skills", entries: ["a", "b"] },
+      { surface: "memory", entries: ["m1"] },
+    ],
+    [
+      { surface: "skills", entries: ["a", "c"] },
+      { surface: "memory", entries: ["m1"] },
+    ],
+    { skills: ["a"] },
+  );
+  assert(dr.totalPathLength === 3, "PR#2 multi-surface total path length = 3 (skills: +c,-b,~a; memory 0)");
+  assert(dr.degraded === false, "PR#2 no missing surface -> not degraded");
+  assert(dr.surfaces.length === 2, "PR#2 two surfaces reported");
+
+  // ---- degradation: missing surface is NOT fabricated as a big distance -----
+  const deg = distance(
+    [{ surface: "skills", entries: ["s1"] }],
+    [{ surface: "memory", entries: ["m1"] }],
+  );
+  assert(deg.degraded === true, "PR#2 missing surface -> degraded");
+  assert(deg.surfaces.length === 0, "PR#2 missing surfaces are skipped, not fabricated");
+  assert(deg.totalPathLength === 0, "PR#2 degraded distance does not invent path length");
+  assert(
+    deg.missing.some((m) => m.surface === "skills" && m.side === "b"),
+    "PR#2 missing reports skills on side b",
+  );
+
+  // ---- toolFlow: frequency / transitions / procedure ----------------------
+  const flow = toolFlow([
+    { type: "tool/call", name: "run_cmd" },
+    { type: "tool/call", name: "read_file" },
+    { type: "tool/call", name: "run_cmd" },
+    { type: "turn/start" }, // not a tool/call -> ignored
+  ]);
+  assert(flow.totalCalls === 3, "PR#2 toolFlow counts only tool/call with name");
+  assert(flow.frequency["run_cmd"] === 2, "PR#2 toolFlow frequency run_cmd = 2");
+  assert(flow.transitions["run_cmd→read_file"] === 1, "PR#2 toolFlow transition run_cmd→read_file");
+  assert(flow.transitions["read_file→run_cmd"] === 1, "PR#2 toolFlow transition read_file→run_cmd");
+
+  // ---- behaviorDistance: identical -> 0; disjoint -> >0; empty -> 0 ---------
+  const ev = (names: string[]) =>
+    names.map((n) => ({ type: "tool/call" as const, name: n }));
+  const same = behaviorDistance(ev(["a", "b"]), ev(["a", "b"]));
+  assert(same.score === 0 && same.mix === 0 && same.order === 0, "PR#2 identical traces -> distance 0");
+  const disjoint = behaviorDistance(ev(["a"]), ev(["b"]));
+  assert(disjoint.mix === 1, "PR#2 disjoint tool sets -> mix = 1 (L1/maxTotal)");
+  assert(behaviorDistance([], []).score === 0, "PR#2 empty traces -> distance 0");
+
+  // ---- permutationTest: seeded reproducible + degraded on < 2 arms ----------
+  const mkTrace = (label: string, first: string, second: string) => ({
+    label,
+    events: [
+      { type: "tool/call", name: first },
+      { type: "tool/call", name: second },
+      { type: "tool/call", name: first },
+    ],
+  });
+  // Two arms with clearly separated tool usage -> between >> within -> R > 1.
+  const traces = [
+    mkTrace("a", "alpha", "alpha2"),
+    mkTrace("a", "alpha", "alpha2"),
+    mkTrace("b", "beta", "beta2"),
+    mkTrace("b", "beta", "beta2"),
+  ];
+  const t1 = permutationTest(traces, { permutations: 100, seed: 42 });
+  const t2 = permutationTest(traces, { permutations: 100, seed: 42 });
+  assert(t1.R === t2.R && t1.p === t2.p, "PR#2 permutation test seeded -> reproducible (same seed)");
+  assert(t1.R > 1, `PR#2 separated arms -> R > 1 (got ${t1.R})`);
+  assert(t1.degraded === false, "PR#2 enough arms/traces -> not degraded");
+  assert(t1.permutations === 100, "PR#2 permutation count honored");
+  assert(t1.p >= 0 && t1.p <= 1, "PR#2 p in [0,1]");
+
+  const tooFew = permutationTest([mkTrace("a", "x", "y")], { permutations: 100 });
+  assert(tooFew.degraded === true, "PR#2 < 2 arms -> degraded, not a number");
+  assert(typeof tooFew.reason === "string" && tooFew.reason.includes("2 arms"), "PR#2 degraded reason explains need for arms");
+  assert(formatPermutationTest(tooFew).startsWith("permutation  DEGRADED"), "PR#2 formatPermutationTest renders degraded");
+
+  // ---- crystallize: evolved == neutral -> stable; different -> not ----------
+  const stable = crystallize(
+    [{ surface: "memory", entries: ["g1", "g2"] }],
+    [{ surface: "memory", entries: ["g1", "g2"] }],
+  );
+  assert(stable.stable === true && stable.distance === 0 && stable.degraded === false, "PR#2 crystallize equal endpoints -> stable, distance 0");
+  const changed = crystallize(
+    [{ surface: "memory", entries: ["g1"] }],
+    [{ surface: "memory", entries: ["g2"] }],
+  );
+  assert(changed.stable === false && changed.distance === 2, "PR#2 crystallize drift -> not stable, distance 2");
+  const missing = crystallize([], [{ surface: "memory", entries: ["g1"] }]);
+  assert(missing.degraded === true, "PR#2 crystallize missing endpoint -> degraded, no fabricated 0");
+
+  // ---- formatter smoke ------------------------------------------------------
+  assert(
+    formatDistance({ surfaces: [], totalPathLength: 0, degraded: true, missing: [{ surface: "skills", side: "b" }] }).includes("DEGRADED"),
+    "PR#2 formatDistance renders DEGRADED marker",
+  );
+
+  console.log("ok: PR#2 (aih measure) pure distance/permutation/crystallize tests passed");
+}
+
+{
+  // PR#2 — CLI wiring: `aih measure distance` / `stream` / `crystallize` read
+  // declared surfaces from JSON inputs and emit a report (no LLM, off-line).
+  const { writeFileSync, mkdtempSync } = await import("node:fs");
+  const { join: jn } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(jn(tmpdir(), "aih-measure-"));
+  const snapA = jn(dir, "a.json");
+  const snapB = jn(dir, "b.json");
+  writeFileSync(snapA, JSON.stringify({ surfaces: [{ surface: "skills", entries: ["a", "b"] }] }));
+  writeFileSync(snapB, JSON.stringify({ surfaces: [{ surface: "skills", entries: ["a", "c"] }] }));
+
+  const d = aih(["measure", "distance", snapA, snapB], { AIH_API_KEY: "mock", AIH_MODEL: "mock" });
+  assert(d.status === 0, "PR#2 aih measure distance exits 0");
+  assert(d.stdout.includes("+c") && d.stdout.includes("-b"), "PR#2 distance report shows +c and -b");
+
+  const c = aih(["measure", "crystallize", snapA, snapB], { AIH_API_KEY: "mock", AIH_MODEL: "mock" });
+  // crystallize exits 1 when the endpoints have drifted (by design): a drift
+  // signal. Assert we detect the drift, not a clean exit.
+  assert(c.status === 1, "PR#2 aih measure crystallize exits 1 on drift (signal, not a bug)");
+  assert(/DRIFTED/.test(c.stdout), `PR#2 crystallize drift rendered as DRIFTED (got: ${c.stdout.trim().slice(0, 80)})`);
+  assert(/distance=2/.test(c.stdout), `PR#2 crystallize drift distance=2 rendered (got: ${c.stdout.trim().slice(0, 80)})`);
+
+  console.log("ok: PR#2 (aih measure) CLI distance/crystallize wiring passed");
+}
+
+{
+  // IT#4 — multi-agent session management panel (pure sessions.ts + /sessions).
+  const {
+    jobStatus,
+    usageCost,
+    buildDashboard,
+    formatDashboard,
+  } = await import("./sessions.js");
+  const { isKnownSlashCommand } = await import("./slash.js");
+
+  // jobStatus maps the job-board vocabulary onto the dashboard's statuses.
+  assert(jobStatus({ status: "running" } as never) === "running", "IT#4 running job -> running");
+  assert(jobStatus({ status: "done" } as never) === "done", "IT#4 done job -> done");
+  assert(jobStatus({ status: "failed" } as never) === "failed", "IT#4 failed job -> failed");
+  assert(jobStatus({ status: "cancelled" } as never) === "cancelled", "IT#4 cancelled job -> cancelled");
+
+  // usageCost is price-scaled, 0 without a price.
+  assert(usageCost(1_000_000, { input: 1, output: 1 }) === 1, "IT#4 1M tokens @ $1/M in -> $1");
+  assert(usageCost(1000, undefined) === 0, "IT#4 no price -> cost 0");
+
+  // buildDashboard: active (jobs) + idle (saved, non-job) sessions, aggregates.
+  const price = { input: 1, output: 1 };
+  const jobs = [
+    { id: "j1", session: "bg-1", label: "fix the build", status: "running" },
+    { id: "j2", session: "bg-2", label: "write tests", status: "done" },
+  ] as never as import("./jobs.js").Job[];
+  const usage = new Map<string, number>([
+    ["bg-1", 5000],
+    ["bg-2", 7000],
+    ["main", 1000],
+  ]);
+  const dash = buildDashboard(jobs, usage, price, ["bg-1", "bg-2", "main"]);
+  assert(dash.active.length === 2, "IT#4 two active (job) sessions listed");
+  // buildDashboard lists jobs newest-first (reversed), so active[0] is j2.
+  assert(dash.active[0].status === "done" && dash.active[1].status === "running", "IT#4 active statuses mapped (newest first)");
+  // "main" is saved but not a job -> idle session.
+  assert(dash.saved.length === 1 && dash.saved[0].name === "main" && dash.saved[0].status === "idle", "IT#4 non-job saved session -> idle");
+  assert(dash.saved[0].tokens === 1000, "IT#4 idle session picks up its tokens");
+  assert(dash.totalTokens === 13000, "IT#4 aggregate tokens = 5000+7000+1000");
+  assert(dash.totalCost > 0, "IT#4 total cost computed when a price is present");
+
+  // formatDashboard renders each row and the total, and the empty case.
+  const fmt = formatDashboard(dash);
+  assert(fmt.includes("bg-1") && fmt.includes("[running") && fmt.includes("fix the build"), "IT#4 format shows running job + label");
+  assert(fmt.includes("· $"), "IT#4 format shows cost line");
+  assert(formatDashboard({ active: [], saved: [], totalTokens: 0, totalCost: 0 }) === "(no sessions yet)", "IT#4 empty dashboard degrades cleanly");
+
+  // /sessions is a recognized builtin slash-command head (so busy-steering
+  // treats it as a command, not a stray steer message).
+  assert(isKnownSlashCommand("/sessions", []) === true, "IT#4 /sessions recognized as known slash command");
+  assert(isKnownSlashCommand("/sessions kill j1", []) === true, "IT#4 /sessions <arg> recognized");
+
+  console.log("ok: IT#4 (sessions dashboard) pure status/usage/cost + slash-recognition passed");
+}
+
 console.log("\n═══════════════════════════════════════════════");
 console.log("TP#3-7 batch complete");
 console.log("  TP#3 compaction/recovery: 15 cases");
@@ -4688,4 +5193,93 @@ console.log("  TP#5 parity-matrix:       1 case (doc)");
 console.log("  TP#6 bench extension:     1 case (skip:key)");
 console.log("  TP#7 stress/chaos:        10 cases");
 console.log("═══════════════════════════════════════════════");
+
+// ════════════════════════════════════════════════════════════════════════
+// PE#1/PE#2/PE#4 — safety seam (config parsing + sensor executor + hooks)
+// ════════════════════════════════════════════════════════════════════════
+{
+  const {
+    loadEnvSafety,
+    mergeSafety,
+    runSensorCommand,
+    buildSensorLoop,
+    buildBudget,
+    buildSafetyHooks,
+    ESCALATE_EXIT_CODE,
+  } = await import("./safety.js");
+
+  // env parsing: AIH_BUDGET (JSON + key=value) and AIH_SENSORS.
+  const prevBudget = process.env.AIH_BUDGET;
+  const prevSensors = process.env.AIH_SENSORS;
+  const prevRetries = process.env.AIH_SENSOR_RETRIES;
+  try {
+    process.env.AIH_BUDGET = JSON.stringify({ maxCostUsd: 2, maxWrites: 5, denyPaths: ["node_modules"] });
+    let cfg = loadEnvSafety();
+    assert(cfg.budget?.maxCostUsd === 2 && cfg.budget?.maxWrites === 5 && cfg.budget?.denyPaths?.length === 1, "PE#2 AIH_BUDGET JSON parsed");
+
+    process.env.AIH_BUDGET = "maxCostUsd=1,maxWrites=3,denyPaths=a|b";
+    cfg = loadEnvSafety();
+    assert(cfg.budget?.maxCostUsd === 1 && cfg.budget?.maxWrites === 3 && cfg.budget?.denyPaths?.length === 2, "PE#2 AIH_BUDGET key=value parsed");
+
+    process.env.AIH_SENSORS = JSON.stringify([{ name: "tsc", command: "npx tsc -b" }]);
+    process.env.AIH_SENSOR_RETRIES = "2";
+    cfg = loadEnvSafety();
+    assert(cfg.sensors?.length === 1 && cfg.sensors?.[0].command === "npx tsc -b", "PE#1 AIH_SENSORS parsed");
+    assert(cfg.sensorRetries === 2, "PE#1 AIH_SENSOR_RETRIES parsed");
+
+    // malformed JSON must not crash (degrades to no sensors).
+    process.env.AIH_SENSORS = "{not json";
+    assert(loadEnvSafety().sensors === undefined, "PE#1 malformed AIH_SENSORS → no sensors (no crash)");
+  } finally {
+    if (prevBudget === undefined) delete process.env.AIH_BUDGET;
+    else process.env.AIH_BUDGET = prevBudget;
+    if (prevSensors === undefined) delete process.env.AIH_SENSORS;
+    else process.env.AIH_SENSORS = prevSensors;
+    if (prevRetries === undefined) delete process.env.AIH_SENSOR_RETRIES;
+    else process.env.AIH_SENSOR_RETRIES = prevRetries;
+  }
+
+  // mergeSafety: file layer, then env layer (env wins).
+  const base = { budget: { maxCostUsd: 1, maxWrites: 10 }, sensors: [{ name: "a", command: "true" }] };
+  const merged = mergeSafety(base, { budget: { maxCostUsd: 5 }, sensors: [{ name: "b", command: "false" }] });
+  assert(merged.budget?.maxCostUsd === 5 && merged.budget?.maxWrites === 10, "PE#2 mergeSafety budget per-key (env wins, file fills)");
+  assert(merged.sensors?.length === 1 && merged.sensors?.[0].name === "b", "PE#1 mergeSafety sensors replaced by env");
+
+  // runSensorCommand: green (exit 0), red (non-zero + detail), timeout.
+  const g = await runSensorCommand("true", process.cwd(), 5000);
+  assert(g.ok === true, "PE#1 sensor exit 0 → green");
+  const r = await runSensorCommand("echo boom; exit 7", process.cwd(), 5000);
+  assert(r.ok === false && r.detail.includes("exit 7") && r.detail.includes("boom"), "PE#1 sensor non-zero → red with exit code + output tail");
+  const t = await runSensorCommand("sleep 3", process.cwd(), 300);
+  assert(t.ok === false && t.detail.includes("timed out"), "PE#1 sensor timeout → red (killed)");
+
+  // buildSensorLoop / buildBudget from a config.
+  const loop = buildSensorLoop({ sensors: [{ name: "tsc", command: "true" }] }, process.cwd());
+  assert(loop !== undefined, "PE#1 buildSensorLoop produces a SensorLoop");
+  const noLoop = buildSensorLoop({}, process.cwd());
+  assert(noLoop === undefined, "PE#1 no sensors → undefined loop");
+  const budget = buildBudget({ budget: { maxCostUsd: 1 } });
+  assert(budget !== undefined, "PE#2 buildBudget produces a BudgetTracker");
+  assert(buildBudget({}) === undefined, "PE#2 no budget → undefined tracker");
+
+  // buildSafetyHooks: interactive vs non-interactive surfaces.
+  const hooks = buildSafetyHooks({ budget: { maxCostUsd: 1 } }, { cwd: process.cwd(), interactive: false, line: () => {} });
+  assert(
+    hooks !== undefined && hooks.budget !== undefined && typeof hooks.onEscalate === "function" && typeof hooks.onTripwire === "function",
+    "PE#4 buildSafetyHooks wires budget + hooks",
+  );
+  assert(ESCALATE_EXIT_CODE === 3, "PE#4 non-interactive escalate exit code is 3");
+
+  // onEscalate (non-interactive) prints options + safest default + exit note.
+  const lines: string[] = [];
+  const h2 = buildSafetyHooks({ budget: { maxCostUsd: 1 } }, { cwd: process.cwd(), interactive: false, line: (t) => lines.push(t) });
+  h2?.onEscalate({ reason: "budget cost exceeded", options: ["a", "b"], safestDefault: "b" });
+  assert(lines.some((l) => l.includes("budget cost exceeded")), "PE#4 onEscalate prints the reason");
+  assert(lines.some((l) => l.includes("1. a")) && lines.some((l) => l.includes("2. b")), "PE#4 onEscalate prints numbered options");
+  assert(lines.some((l) => l.includes("safest default: b")), "PE#4 onEscalate prints the safest default");
+  assert(lines.some((l) => l.includes("exit code 3")), "PE#4 non-interactive onEscalate notes the exit code");
+
+  console.log("ok: PE#1/PE#2/PE#4 CLI safety seam (env/merge/sensor-exec/hooks)");
+}
+
 

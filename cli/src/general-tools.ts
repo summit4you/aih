@@ -16,6 +16,7 @@ import { lineDiff } from "./diff.js";
 import { formatAfterWrite } from "./formatter.js";
 import { bestOfN } from "./maxmode.js";
 import { userAihDir } from "./paths.js";
+import { extractShellContext } from "./shell-context.js";
 
 export interface GeneralToolsOptions {
   cwd?: string;
@@ -24,6 +25,13 @@ export interface GeneralToolsOptions {
   toolsProvider?: () => ToolRegistry | undefined;
   ask?: (question: string, options?: string[]) => Promise<string>;
   hooks?: ToolHooks;
+  /**
+   * IT#1 — a provider for the live session log, so the `shell_context` tool
+   * can read the recent `run_cmd` history on demand. Passed as a provider
+   * (not a value) because the log is created after the registry is built;
+   * the closure resolves at call time. Absent → `shell_context` is a no-op.
+   */
+  logProvider?: () => { all: () => readonly import("@aih/core").SessionEvent[] } | undefined;
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn", "dist", "build"]);
@@ -758,6 +766,57 @@ export function registerGeneralTools(
       );
       if (result.best < 0) throw new Error(`best_of_n: ${result.judgeReason}`);
       return result;
+    },
+  });
+
+  // IT#1 — shell context awareness: the agent can reach for the recent shell
+  // (run_cmd) output + exit codes on demand, so the user doesn't have to
+  // paste them. Read-only, allow. No-op (empty) when there is no shell
+  // history or the log is not wired in.
+  reg({
+    name: "shell_context",
+    description:
+      "IT#1: fetch the recent shell (run_cmd) context from this session — the most recent " +
+      "commands with their exit codes, a bounded tail of each command's output, and the " +
+      "full-output file path when keep_output was used. Use this to reason about the user's " +
+      "shell (e.g. a failing command) without asking them to paste it. Returns { found: false } " +
+      "when there is no shell history yet.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        max_commands: { type: "number", description: "how many most-recent commands to include (default 3, max 10)" },
+        max_output_chars: { type: "number", description: "max output-tail chars per command (default 4000)" },
+      },
+      required: [],
+    },
+    execute: async (args) => {
+      const a = args as { max_commands?: unknown; max_output_chars?: unknown };
+      const log = opts.logProvider?.();
+      if (!log) return { found: false, commands: [], note: "shell_context is not wired in this context" };
+      const commands = extractShellContext(log.all(), {
+        maxCommands: Math.max(1, Math.min(10, Math.floor(Number(a.max_commands ?? "") || 3))),
+        maxOutputChars: Math.max(200, Math.floor(Number(a.max_output_chars ?? "") || 4000)),
+      });
+      if (commands.length === 0) {
+        return { found: false, commands: [], note: "no shell history yet — run a command with run_cmd first" };
+      }
+      return {
+        found: true,
+        count: commands.length,
+        commands: commands.map((c) => ({
+          command: c.command,
+          ...(c.cwd ? { cwd: c.cwd } : {}),
+          code: c.code,
+          ok: c.ok,
+          timed_out: c.timedOut,
+          output: c.output,
+          output_truncated: c.outputTruncated,
+          ...(c.outputFile ? { output_file: c.outputFile } : {}),
+          ...(c.outputBytes !== undefined ? { output_bytes: c.outputBytes } : {}),
+        })),
+      };
     },
   });
 }

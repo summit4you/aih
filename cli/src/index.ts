@@ -29,6 +29,7 @@ import {
   GOAL_CONTRACT_TEMPLATE,
   TASK_CONTRACT_RULES,
   DECISION_QUESTION_RULE,
+  TOOL_OUTPUT_NOTES,
   buildGoalJudgePrompt,
   buildBranchDistillPrompt,
   toolCall,
@@ -57,12 +58,15 @@ import {
   normalizeModelEntries,
   providerEntry,
   loadPrices,
+  loadSafety,
   resolveLlm,
   resolveServers,
   savePermissionRule,
   saveSkillRegistry,
   type ModelCatalogEntry,
 } from "./config.js";
+import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
+import type { SafetyHooks } from "./safety.js";
 import { projectTrustState, setProjectTrustState } from "./config.js";
 import {
   ensureProjectTrust,
@@ -77,6 +81,7 @@ import {
 } from "./prune.js";
 import {
   aggregateUsage,
+  costForUsage,
   fmtCost,
   fmtTps,
   cacheHitRate,
@@ -96,6 +101,7 @@ import { peekWorkspaceIdentity, compareIdentity } from "./workspace-identity.js"
 import { extractDreamMaterial, formatDreamMaterial } from "./dream.js";
 import { builtinHooks, composeHooks } from "./hooks.js";
 import { loadBoard, spawnJob, cancelJob, jobById, summarize } from "./jobs.js";
+import { buildDashboard, formatDashboard } from "./sessions.js";
 import {
   addAgent,
   addTask,
@@ -133,6 +139,8 @@ import { isKnownSlashCommand } from "./slash.js";
 import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
 import { registerDevTools } from "./dev-tools.js";
 import { extractShellContext, formatShellContext, describeCommand } from "./shell-context.js";
+import { detectShellErrors, formatFixBlock, errorBadge, summarizeErrors, type ShellError } from "./error-detect.js";
+import { classifyQuestionPrefix, buildQuestionContext, composeQuestionPrompt } from "./question.js";
 import { registerGeneralTools, todoStateFromLog, applyTodoState } from "./general-tools.js";
 import {
   T_AGENTS_MD,
@@ -304,6 +312,8 @@ Chat commands (inside the TUI):
   /model <p/m>        direct switch: "<provider>/<model>" or bare model id
   /compact [focus]    summarize earlier context now (optionally steer the summary)
   /usage              token totals + current context fill
+  /shell              recent run_cmd output + exit codes (IT#1) · /shell --send
+  /fix                detect failed run_cmd + send to agent for a fix (IT#2) · /fix --show
   /mode, /goal, /tools, /skills, /inject, /memory, /events, /bg, /clear
 `;
 
@@ -465,6 +475,44 @@ async function probeWindow(flags: Record<string, string | boolean>): Promise<voi
   }
 }
 
+/**
+ * PE#2 — cost resolver for the budget seam: price the current model (config
+ * `prices` → built-in table → models.dev snapshot) and convert a usage chunk
+ * to USD. Returns `undefined` when no price is known (mock / unknown model) —
+ * the tracker then bounds on writes/timeout/scope only, which is the honest
+ * behavior (no invented price).
+ */
+function buildCostOf(flags: Record<string, string | boolean>): ((u: import("@aih/core").TokenUsage) => number) | undefined {
+  const modelId =
+    (str(flags, "model") as string | undefined) ??
+    process.env.AIH_MODEL ??
+    resolveLlm({}).model.value ??
+    "";
+  const price = modelId ? resolvePrice(modelId, loadPrices()) : undefined;
+  if (!price) return undefined;
+  return (usage) => costForUsage(usage, price);
+}
+
+/**
+ * PE#1/PE#2/PE#4 — assemble the safety hook set for a loop from the merged
+ * config (file `safety` block + AIH_BUDGET/AIH_SENSORS env). `interactive`
+ * selects the escalate surface (TUI rows vs stderr + exit-code-3). Returns
+ * `undefined` when nothing is configured (the loop no-ops the seam).
+ */
+function wireSafety(
+  flags: Record<string, string | boolean>,
+  opts: { interactive?: boolean; line?: (t: string) => void },
+): (SafetyHooks & { costOf?: (u: import("@aih/core").TokenUsage) => number }) | undefined {
+  const cfg = loadSafety();
+  const hooks = buildSafetyHooks(cfg, {
+    cwd: process.cwd(),
+    interactive: opts.interactive,
+    line: opts.line,
+  });
+  if (!hooks) return undefined;
+  return { ...hooks, costOf: buildCostOf(flags) };
+}
+
 async function readPipedStdin(): Promise<string> {
   if (process.stdin.isTTY) return "";
   const chunks: Buffer[] = [];
@@ -604,7 +652,10 @@ export function loadMemoryBlock(cwd = process.cwd()): string {
 
 export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}`;
+  // MiMo-Code parity: reply in the user's language instead of defaulting to
+  // English (the surrounding system prompt is English, which biases the model).
+  const LANGUAGE_RULE = `\n\n# Language\nIMPORTANT: Your response must ALWAYS strictly follow the same major language as the user.`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}${LANGUAGE_RULE}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [
@@ -922,6 +973,18 @@ function loadSession(path?: string): SessionLog {
 
 function saveSession(path: string | undefined, log: SessionLog): void {
   if (!path) return;
+  // MK#45 — close any turn that is still open at save time. A turn/end is
+  // normally written when send() returns, but if the process exits mid-turn
+  // (TUI close, Ctrl+C, crash) the last turn never gets its turn/end, so the
+  // next `-c` resume sees an eternal "interrupted turn" and re-surfaces it
+  // every launch even when every tool completed harmlessly. Marking it closed
+  // here makes the log self-consistent: the next resume scans clean. Only the
+  // newest unended turn is closed; tool facts are untouched (recovery still
+  // tells the truth about each call).
+  const rep = scanRecovery(log.all());
+  if (rep.openTurn) {
+    log.append({ type: "turn/end", turnId: rep.openTurn, stopReason: "session_closed" });
+  }
   mkdirSync(SESSIONS_DIR, { recursive: true });
   new SessionStore(path).save(log);
 }
@@ -1081,6 +1144,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       process.exit(1);
     }
     await probeWindow(flags);
+    const safety = wireSafety(flags, { interactive: false });
     const loop = new AgentLoop({
       llm,
       tools: registry,
@@ -1092,6 +1156,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       ...(bool(flags, "debug-prompt")
         ? {
             onPromptInput: (messages) => {
@@ -1142,6 +1207,13 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
             : undefined,
         ])}\n`,
       );
+    }
+
+    // PE#4 — a turn that ended in an escalation (hard budget / sensor red after
+    // retries) is a hard stop: surface the exit code so scripts/CI can branch
+    // on it (the onEscalate hook already printed the options + safest default).
+    if (result.stopReason === "escalated") {
+      process.exit(ESCALATE_EXIT_CODE);
     }
 
     // --goal: judge-verified auto-continuation (bounded by AIH_GOAL_ROUNDS).
@@ -1272,6 +1344,7 @@ async function cmdWorkflow(
       logRef.current = log; // IT#1 — shell_context now resolves the live log
       const llm = buildLlm(flags);
       await probeWindow(flags);
+      const safety = wireSafety(flags, { interactive: false });
       const loop = new AgentLoop({
         llm,
         tools: registry,
@@ -1280,6 +1353,7 @@ async function cmdWorkflow(
         maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
         contextWindow: resolveContextWindow(flags),
         compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+        ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
       const send = async (prompt: string): Promise<string> => {
         const result = await loop.send(prompt);
@@ -1397,6 +1471,12 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     "mode. Investigate with the available tools, then present a concrete step-by-step " +
     "implementation plan. Do not attempt to change any state.";
   const maxSteps = Number(str(flags, "max-steps") ?? Infinity) || Infinity;
+  // PE#1/PE#2/PE#4 — interactive safety seam: escalate surfaces as TUI rows
+  // (options + safest default); tripwire as a non-silent notice. `tuiSafety`
+  // is assigned once `tui` exists (below) — makeLoop is only invoked after that.
+  let tuiSafety:
+    | (SafetyHooks & { costOf?: (u: import("@aih/core").TokenUsage) => number })
+    | undefined;
   function makeLoop(): AgentLoop {
     return new AgentLoop({
       llm: buildLlm(flags),
@@ -1410,6 +1490,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       maxStepsPerTurn: maxSteps,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      ...(tuiSafety
+        ? {
+            budget: tuiSafety.budget,
+            costOf: tuiSafety.costOf,
+            sensors: tuiSafety.sensors,
+            onTripwire: tuiSafety.onTripwire,
+            onEscalate: tuiSafety.onEscalate,
+          }
+        : {}),
     });
   }
   await probeWindow(flags);
@@ -1447,6 +1536,16 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // provider sample from an old turn would pin the panel instead.
   let usedTokens = estimateContextTokens(log.all());
   let peakTokens = usedTokens;
+  // IT#2 — cached shell-failure detection (recomputed on tool/result, not per
+  // paint). `undefined` = not yet computed; `[]` = all green (no indicator).
+  let shellErrors: ShellError[] | undefined;
+  if (process.env.AIH_ERROR_DETECT !== "0") {
+    try {
+      shellErrors = detectShellErrors(log.all());
+    } catch {
+      shellErrors = undefined;
+    }
+  }
 
   const sessionName = sessionPath
     ? `${existsSync(sessionPath) ? "" : "new "}${basename(sessionPath)}`
@@ -1559,8 +1658,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "help", hint: "? /help — keybindings & shortcuts", run: () => tui.openHelp() },
       { name: "vivid (concise render)", hint: "/vivid — toggle plain render (no borders/panel)", run: () => handleLine("/vivid") },
       { name: "background jobs", hint: "/bg <prompt> — dispatch a background agent turn (list/cancel)", run: () => handleLine("/bg") },
+      { name: "sessions panel", hint: "/sessions — multi-agent session dashboard (kill/view)", run: () => handleLine("/sessions") },
       { name: "search tool output", hint: "/find <text> — search across tool outputs (T#22)", run: () => handleLine("/find") },
       { name: "shell context", hint: "/shell — recent run_cmd output + exit codes (IT#1) · /shell --send", run: () => handleLine("/shell") },
+      { name: "fix shell errors", hint: "/fix — detect failed run_cmd + send to agent (IT#2) · /fix --show", run: () => handleLine("/fix") },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
@@ -1613,6 +1714,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       const n = registry.schemas().length;
       return { glyph: "⊙", ok: n > 0, label: `${n} MCP` };
     },
+    // IT#2 — shell-failure indicator (red ⚠ when a run_cmd failed; hidden when green).
+    shellErrorBadge: () =>
+      process.env.AIH_ERROR_DETECT !== "0"
+        ? errorBadge(shellErrors ?? [])
+        : null,
     jobStatus: () => {
       const s = summarize(loadBoard(process.cwd()));
       return s.running + s.done + s.failed > 0 ? s : null;
@@ -1654,8 +1760,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/tidy",
       "/find",
       "/shell",
+      "/fix",
       "/vivid",
       "/bg",
+      "/sessions",
       "/clear",
       "/inject",
       "/events",
@@ -1705,6 +1813,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   void echoEvents;
   gate.attachTui(tui);
   tuiRef.current = tui;
+
+  // PE#1/PE#2/PE#4 — interactive safety seam (assigned now that `tui` exists,
+  // so escalate/tripwire rows land in the TUI instead of stderr).
+  tuiSafety = wireSafety(flags, {
+    interactive: true,
+    line: (t) => tui.pushSystem(t),
+  });
 
   // P2#7 helpers — dream/distill over recent session logs (bounded).
   function collectSessionEventsForDream(): SessionEvent[][] {
@@ -1810,6 +1925,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   const refreshContextGauge = (): void => {
     usedTokens = estimateContextTokens(log.all());
     if (usedTokens > peakTokens) peakTokens = usedTokens;
+    // IT#2 — recompute the shell-failure indicator (deterministic, cheap:
+    // reuses IT#1's extractShellContext over the bounded recent window).
+    if (process.env.AIH_ERROR_DETECT !== "0") {
+      try {
+        shellErrors = detectShellErrors(log.all());
+      } catch {
+        shellErrors = undefined; // best-effort — never break the gauge
+      }
+    }
     tui.requestPaint();
   };
 
@@ -1860,6 +1984,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       } else if (event.type === "turn/end") {
         // P#39① — extension turn:end subscribers fire on every finished turn.
         extensionEvents.emit("turn:end", { stopReason: event.stopReason, usage: event.usage });
+      } else if (event.type === "escalate") {
+        // PE#4 — model-invisible escalation (hard budget / sensor red after
+        // retries). The onEscalate hook already printed the options live; this
+        // branch covers resume/replay so the decision point is never lost.
+        tui.pushSystem(
+          `⛔ escalated: ${event.reason}\n` +
+            event.options.map((o, i) => `   ${i + 1}. ${o}`).join("\n") +
+            `\n   (safest default: ${event.safestDefault})`,
+        );
       }
     });
 
@@ -2100,6 +2233,51 @@ async function cmdChat(flags: Record<string, string | boolean>) {
 
     tui.push({ role: "user", text: line });
 
+    // IT#3: `?` prefix — type `?` + a natural-language task to start an agent
+    // in a BACKGROUND session with the active context auto-injected (recent
+    // shell output / cwd / active session). The foreground TUI is never
+    // interrupted; the job's result is surfaced when it completes (D#13 board).
+    // Recognized BEFORE the busy-steering check so it works even mid-turn.
+    {
+      const q = classifyQuestionPrefix(input);
+      if (q.isQuestion) {
+        // AIH_QUESTION_CONTEXT=0 disables auto-injection (task only).
+        const context =
+          process.env.AIH_QUESTION_CONTEXT === "0"
+            ? ""
+            : buildQuestionContext({
+                events: log.all(),
+                cwd: process.cwd(),
+                sessionName: sessionName || undefined,
+              });
+        const prompt = composeQuestionPrompt(context, q.prompt);
+        const cliPath = fileURLToPath(new URL("./index.js", import.meta.url));
+        const session = `bg-${Date.now().toString(36)}`;
+        const argv = [cliPath, "run", prompt, "--session", session, "--no-audit", "--no-stream", "--format", "text"];
+        const { job, child } = spawnJob(process.cwd(), q.prompt, { cli: cliPath, argv });
+        bgChildren.set(job.id, child);
+        child.on("close", () => {
+          bgChildren.delete(job.id);
+          const finished = jobById(process.cwd(), job.id);
+          if (finished) {
+            const icon = finished.status === "done" ? "✓" : finished.status === "failed" ? "✗" : "⊘";
+            tui.pushSystem(
+              `${icon} ? background task ${job.id} ${finished.status}: ${finished.label}` +
+                (finished.preview ? `\n${finished.preview}` : "") +
+                `\nfull output: ${finished.out} · session: ${finished.session}`,
+            );
+          }
+          tui.requestPaint();
+        });
+        tui.pushSystem(
+          `▶ dispatched background task ${job.id}: ${job.label}\n` +
+            `  (context injected: cwd${context ? " + shell history" : ""}; TUI stays responsive; /bg list to track)`,
+        );
+        tui.requestPaint();
+        return;
+      }
+    }
+
     // P#35 — steering: while a turn is running, plain text input is queued
     // into the running loop (lands after the current tool batch) instead of
     // being rejected; slash commands that need a quiet session still refuse.
@@ -2175,6 +2353,54 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
       return;
     }
+    // IT#2: /fix — deterministic shell-failure detection → one-click fix.
+    // Detects the recent failed run_cmd calls (non-zero exit / timeout),
+    // frames them as a fix request, and sends them to the agent as a turn.
+    // `--show` only lists the failures (no turn); `--dry` shows the block.
+    if (input === "/fix" || input.startsWith("/fix ")) {
+      const arg = input === "/fix" ? "" : input.slice("/fix ".length).trim();
+      if (busy) {
+        tui.pushSystem("a turn is already running — wait for it to finish, then /fix");
+        return;
+      }
+      const errors = detectShellErrors(log.all());
+      if (errors.length === 0) {
+        tui.pushSystem(
+          "no shell failures detected — the recent run_cmd calls all exited 0 (or there is no shell history yet).",
+        );
+        return;
+      }
+      const block = formatFixBlock(errors);
+      tui.pushSystem(
+        `⚠ detected ${errors.length} shell failure(s):\n${summarizeErrors(errors)}`,
+      );
+      if (arg === "--show" || arg === "--dry") {
+        tui.pushSystem(`fix block (not sent):\n${block}`);
+        return;
+      }
+      tui.pushSystem("→ sending the failures to the agent for a fix…");
+      try {
+        const started = Date.now();
+        await evalTurn(block);
+        for (;;) {
+          const queued = loop.drainQueued("followUp");
+          if (queued.length === 0) break;
+          for (const q of queued) {
+            tui.pushSystem(`→ follow-up: ${q}`);
+            await evalTurn(q);
+            store?.save(log);
+          }
+        }
+        store?.save(log);
+        const dur = Date.now() - started;
+        tui.push({ role: "footer", text: `▣ fix · ${((dur / 1000)).toFixed(1)}s` });
+      } catch (err) {
+        tui.pushError(err instanceof Error ? err.message : String(err));
+      } finally {
+        tui.turnSettled();
+      }
+      return;
+    }
     // D#13: /bg — background tasks (dispatch + status + cancel)
     if (input === "/bg" || input.startsWith("/bg ")) {
       const arg = input === "/bg" ? "" : input.slice("/bg ".length).trim();
@@ -2237,6 +2463,62 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       });
       tui.pushSystem(`▶ dispatched background job ${job.id}: ${job.label}\n  (TUI stays responsive; /bg list to track, /bg cancel ${job.id} to stop)`);
       tui.requestPaint();
+      return;
+    }
+    // IT#4: /sessions — multi-agent session management panel.
+    // Lists active background agent sessions + every saved session with token
+    // usage + model cost, in one control surface. Subcommands:
+    //   /sessions            — dashboard
+    //   /sessions kill <id>  — cancel a running background job
+    //   /sessions view <name>— per-session token/cost summary
+    if (input === "/sessions" || input.startsWith("/sessions ")) {
+      const arg = input === "/sessions" ? "" : input.slice("/sessions ".length).trim();
+      if (arg.startsWith("kill ")) {
+        const id = arg.slice("kill ".length).trim();
+        const child = bgChildren.get(id);
+        const ok = cancelJob(process.cwd(), id, child);
+        if (ok) {
+          bgChildren.delete(id);
+          tui.pushSystem(`killed job ${id}`);
+        } else {
+          tui.pushSystem(`no running job ${id} to kill`);
+        }
+        tui.requestPaint();
+        return;
+      }
+      if (arg.startsWith("view ")) {
+        const name = arg.slice("view ".length).trim();
+        if (!name || !name.match(/^[\w-]+$/)) {
+          tui.pushSystem("usage: /sessions view <session-name>");
+          return;
+        }
+        const events = readSessionEvents(name);
+        if (events.length === 0) {
+          tui.pushSystem(`no saved session named "${name}"`);
+          return;
+        }
+        const usage = aggregateUsage(events);
+        const modelId = process.env.AIH_MODEL ?? resolveLlm({}).model.value ?? "";
+        const price = modelId ? resolvePrice(modelId, loadPrices()) : undefined;
+        const cost = price ? (usage.totalTokens / 1e6) * price.input : 0;
+        tui.pushSystem(
+          `session ${name}: ${usage.totalTokens} tokens (${usage.promptTokens} prompt / ${usage.completionTokens} completion)` +
+            (price ? ` · cost ${fmtCost(cost)}` : ""),
+        );
+        return;
+      }
+      // Dashboard: job board + saved session usage.
+      const board = loadBoard(process.cwd());
+      const usageMap = new Map<string, number>();
+      for (const f of sessionFiles()) {
+        const u = aggregateUsage(readSessionEvents(f.name));
+        usageMap.set(f.name, u.totalTokens);
+      }
+      const savedNames = sessionFiles().map((f) => f.name);
+      const modelId = process.env.AIH_MODEL ?? resolveLlm({}).model.value ?? "";
+      const price = modelId ? resolvePrice(modelId, loadPrices()) : undefined;
+      const dash = buildDashboard(board.jobs, usageMap, price, savedNames);
+      tui.pushSystem(`sessions dashboard:\n${formatDashboard(dash)}`);
       return;
     }
     // P2#9: /vivid toggles the concise (plain) render mode — no borders/surface/panel.

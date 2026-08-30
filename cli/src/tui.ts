@@ -36,6 +36,8 @@ export interface TuiOptions {
   statusLeft: string;
   statusRight: string;
   statusBadge?(): { glyph: string; ok: boolean; label: string } | null;
+  /** IT#2 — shell-failure indicator (null/absent = all green, hide). */
+  shellErrorBadge?(): { glyph: string; ok: boolean; label: string } | null;
   /** D#13: background-job counts for the status line (null/absent = hide). */
   jobStatus?(): { running: number; done: number; failed: number } | null;
   busy(): boolean;
@@ -492,6 +494,8 @@ export class Tui {
   #lastLines: string[] = [];
   #confirm: ((ans: "once" | "always" | "deny") => void) | null = null;
   #confirmText = "";
+  /** IT#5 — "confirm" = [y]/[n]/[a]; "runorcopy" = [R]un/[C]opy/[N]o. */
+  #confirmMode: "confirm" | "runorcopy" = "confirm";
   #question: { resolve: (answer: string) => void; reject: (err: Error) => void } | null = null;
   #qbuf = "";
   #queue: string[] = [];
@@ -790,6 +794,30 @@ constructor(opts: TuiOptions) {
         this.pushSystem(ans === "deny" ? "denied" : "approved");
         this.requestPaint();
         resolve(ans);
+      };
+    });
+  }
+
+  /**
+   * IT#5 — run-or-copy approval for a WRITE shell command. Renders
+   * `[R]un / [C]opy / [N]o` and resolves with the choice. The gate owns the
+   * side-effects + outcome reporting (it does the clipboard copy for "copy");
+   * this method only captures the keyboard choice, so a stub TUI without it
+   * falls back to the generic askConfirm. "run" approves execution; "copy"
+   * means "put it on the clipboard, don't run it"; "no" denies.
+   */
+  askRunOrCopy(command: string, scope: string): Promise<"run" | "copy" | "no"> {
+    this.pushSystem(`⚠ write command needs approval: ${command}`);
+    this.#confirmMode = "runorcopy";
+    this.#confirmText = `[R]un   [C]opy   [N]o   ${scope}`;
+    this.requestPaint();
+    return new Promise((resolve) => {
+      this.#confirm = (ans) => {
+        this.#confirm = null;
+        this.#confirmMode = "confirm";
+        this.#confirmText = "";
+        this.requestPaint();
+        resolve(ans === "once" ? "run" : ans === "always" ? "copy" : "no");
       };
     });
   }
@@ -1115,38 +1143,53 @@ constructor(opts: TuiOptions) {
     if (this.#question) {
       if (this.#inPaste && (ch === "\x1b" || this.#held)) {
         // let the paste terminator sequence complete via the escape machine
-      } else {
-        const done = this.#question;
-        if (ch === "\r" || ch === "\n") {
-          this.#question = null;
-          const answer = this.#qbuf;
-          this.#qbuf = "";
-          this.requestPaint();
-          done.resolve(answer);
-        } else if (ch === "\x03") {
-          this.#question = null;
-          this.#qbuf = "";
-          this.requestPaint();
-          done.reject(new Error("user cancelled the question"));
-        } else if (ch === "\x7f") {
-          this.#qbuf = this.#qbuf.slice(0, -1);
-          this.requestPaint();
-        } else if (ch >= " ") {
-          this.#qbuf += ch;
-          this.requestPaint();
-        }
+      } else if (ch === "\x1b" || this.#held) {
+        // Escape sequence (scroll keys, arrows, mouse) — do NOT swallow its
+        // bytes as answer text; run the escape machine so the user can still
+        // scroll the transcript while a `question` prompt is open. Swallow
+        // the byte regardless: a completed sequence (e.g. PageUp scrolls)
+        // must not leak its final byte into the answer buffer.
+        this.#escapeSeq(ch);
         return;
       }
+      const done = this.#question;
+      if (ch === "\r" || ch === "\n") {
+        this.#question = null;
+        const answer = this.#qbuf;
+        this.#qbuf = "";
+        this.requestPaint();
+        done.resolve(answer);
+      } else if (ch === "\x03") {
+        this.#question = null;
+        this.#qbuf = "";
+        this.requestPaint();
+        done.reject(new Error("user cancelled the question"));
+      } else if (ch === "\x7f") {
+        this.#qbuf = this.#qbuf.slice(0, -1);
+        this.requestPaint();
+      } else if (ch >= " ") {
+        this.#qbuf += ch;
+        this.requestPaint();
+      }
+      return;
     }
     if (this.#confirm) {
       if (!(this.#inPaste && (ch === "\x1b" || this.#held))) {
         const done = this.#confirm;
-        this.#confirm = null;
-        if (ch === "y" || ch === "Y") {
+        const roc = this.#confirmMode === "runorcopy";
+        // IT#5 — run-or-copy keys: r=run(once), c=copy(always), n/no.
+        // confirm keys (unchanged): y=once, a=always, n/deny.
+        const accept = roc
+          ? ch === "r" || ch === "R"
+          : ch === "y" || ch === "Y";
+        const secondary = roc ? ch === "c" || ch === "C" : ch === "a" || ch === "A";
+        const refuse =
+          ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03";
+        if (accept) {
           done("once");
-        } else if (ch === "a" || ch === "A") {
+        } else if (secondary) {
           done("always");
-        } else if (ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03") {
+        } else if (refuse) {
           done("deny");
         } else {
           this.#confirm = done;
@@ -1154,40 +1197,9 @@ constructor(opts: TuiOptions) {
         return;
       }
     }
-    if (ch === "\x1b") {
-      const now = Date.now();
-      if (this.#escAt > 0 && this.#held === "\x1b" && now - this.#escAt < 500) {
-        this.#escAt = 0;
-        this.#lastBareEscAt = 0;
-        this.#held = "";
-        this.#doubleEsc();
-        return;
-      }
-      this.#escAt = now;
-      this.#held = "\x1b";
+    if (ch === "\x1b" || this.#held) {
+      this.#escapeSeq(ch);
       return;
-    }
-    if (this.#held) {
-      if (this.#held === "\x1b") {
-        if (ch === "[" || ch === "O") {
-          this.#escAt = 0;
-          this.#held += ch;
-          return;
-        }
-        const now = Date.now();
-        if (this.#lastBareEscAt > 0 && now - this.#lastBareEscAt < 500) {
-          this.#lastBareEscAt = 0;
-          this.#doubleEsc();
-        } else {
-          this.#lastBareEscAt = now;
-        }
-        this.#held = "";
-      } else {
-        this.#held += ch;
-        const final = /[A-Za-z~]/.test(ch);
-        if (this.#held.length >= 2 && final) this.#escape(this.#held);
-        return;
-      }
     }
     switch (ch) {
       case "\r":
@@ -1274,6 +1286,41 @@ constructor(opts: TuiOptions) {
           this.#cursor += 1;
           this.requestPaint();
         }
+    }
+  }
+
+  #escapeSeq(ch: string): void {
+    if (ch === "\x1b") {
+      const now = Date.now();
+      if (this.#escAt > 0 && this.#held === "\x1b" && now - this.#escAt < 500) {
+        this.#escAt = 0;
+        this.#lastBareEscAt = 0;
+        this.#held = "";
+        this.#doubleEsc();
+        return;
+      }
+      this.#escAt = now;
+      this.#held = "\x1b";
+      return;
+    }
+    if (this.#held === "\x1b") {
+      if (ch === "[" || ch === "O") {
+        this.#escAt = 0;
+        this.#held += ch;
+        return;
+      }
+      const now = Date.now();
+      if (this.#lastBareEscAt > 0 && now - this.#lastBareEscAt < 500) {
+        this.#lastBareEscAt = 0;
+        this.#doubleEsc();
+      } else {
+        this.#lastBareEscAt = now;
+      }
+      this.#held = "";
+    } else {
+      this.#held += ch;
+      const final = /[A-Za-z~]/.test(ch);
+      if (this.#held.length >= 2 && final) this.#escape(this.#held);
     }
   }
 
@@ -2118,6 +2165,11 @@ constructor(opts: TuiOptions) {
   #statusRow(width: number): string {
     const b = this.#opts.statusBadge?.() ?? null;
     const badge = b ? `${b.ok ? success(b.glyph) : danger(b.glyph)} ${muted(b.label)}` : "";
+    // IT#2 — shell-failure indicator (red when a run_cmd failed; hidden when green).
+    const se = this.#opts.shellErrorBadge?.() ?? null;
+    const shellBadge = se
+      ? `${se.ok ? success(se.glyph) : danger(se.glyph)} ${danger(se.label)}`
+      : "";
     const pending = this.#confirmText
       ? `${danger(bold("⚠ APPROVAL PENDING"))}  `
       : this.#question
@@ -2137,6 +2189,7 @@ constructor(opts: TuiOptions) {
     const l =
       pending +
       (badge ? `${badge}${muted("  ")}` : "") +
+      (shellBadge ? `${shellBadge}${muted("  ")}` : "") +
       jobSeg +
       (this.#opts.statusLeft ? muted(this.#opts.statusLeft) : "");
     const r = this.#opts.statusRight ? muted(this.#opts.statusRight) : "";

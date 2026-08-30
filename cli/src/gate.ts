@@ -2,6 +2,7 @@ import { AutoApprove } from "@aih/core";
 import type { ApprovalGate, ApprovalRequest, PermissionRule } from "@aih/core";
 import { RulesetGate, deriveScope } from "@aih/core";
 import { createInterface } from "node:readline";
+import { copyToClipboard } from "./clipboard.js";
 import { isReadonlyCommand } from "./readonly-allow.js";
 import type { Tui } from "./tui.js";
 
@@ -79,6 +80,42 @@ export class SessionGate implements ApprovalGate {
     }
     const detail = `${req.tool} ${JSON.stringify(req.args) ?? ""}`.slice(0, 120);
     const scope = deriveScope(req);
+
+    // IT#5 — run-or-copy for WRITE shell commands: the agent proposes a
+    // command; the human picks run / copy / no instead of it auto-running.
+    // "copy" puts the command on the clipboard (degrades to printing) and does
+    // NOT execute it. Only fires for run_cmd write asks that reach a prompt;
+    // read-class + readonly-whitelisted commands already auto-allowed above.
+    if (
+      req.tool === "run_cmd" &&
+      req.kind === "write" &&
+      this.#tui &&
+      typeof (this.#tui as unknown as { askRunOrCopy?: unknown }).askRunOrCopy === "function"
+    ) {
+      const command =
+        typeof (req.args as { command?: unknown })?.command === "string"
+          ? (req.args as { command: string }).command
+          : detail;
+      const choice = await (this.#tui as unknown as { askRunOrCopy(c: string, s: string): Promise<"run" | "copy" | "no"> }).askRunOrCopy(command, scope);
+      if (choice === "run") {
+        this.#tui.pushSystem("▶ approved — running");
+        return true;
+      }
+      if (choice === "copy") {
+        const res = copyToClipboard(command);
+        if (res.ok) {
+          this.#tui.pushSystem(`⧉ copied to clipboard (${res.via}): ${command}`);
+        } else {
+          // No clipboard available — degrade to printing so the user can paste
+          // it manually (the spec's fallback path).
+          this.#tui.pushSystem(`no clipboard — command to copy:\n  ${command}`);
+        }
+        return false; // copy never runs the command
+      }
+      this.#tui.pushSystem("denied");
+      return false; // "no"
+    }
+
     let answer: ConfirmAnswer;
     if (this.#tui) {
       answer = await this.#tui.askConfirm(detail, scope);

@@ -22,7 +22,7 @@
  *    experiment semantics only; execution reuses each subject's own runtime.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { costForUsage, resolvePrice } from "./cost.js";
 
@@ -321,19 +321,137 @@ export function attemptUsage(sessionFile?: string): Usage | undefined {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FA#6 — result persistence, failed-cell retry, progress inspection
+// ---------------------------------------------------------------------------
+
+/**
+ * FA#6 — a persisted experiment result set. One file per experiment id:
+ * `<resultsDir>/<expId>.results.json`. The per-cell `status` is the contract
+ * for `--retry-failed` (re-run only `status !== "passed"` cells) and `--status`
+ * (print the passed/failed/error distribution).
+ */
+export interface ExperimentResults {
+  expId: string;
+  updatedAt: string;
+  /** Latest result per cellId (a retry overwrites the prior outcome). */
+  cells: Record<string, CellResult>;
+  /** Cells present in the spec but never run (budget-skipped, etc.). */
+  skipped: string[];
+}
+
+/** Canonical results-file location for an experiment id. */
+export function resultsPath(resultsDir: string, expId: string): string {
+  return join(resultsDir, `${expId}.results.json`);
+}
+
+/** Load a persisted result set; undefined if the file is absent/invalid. */
+export function loadResults(resultsDir: string, expId: string): ExperimentResults | undefined {
+  const p = resultsPath(resultsDir, expId);
+  if (!existsSync(p)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(p, "utf8")) as ExperimentResults;
+    if (!raw || typeof raw !== "object" || !raw.cells) return undefined;
+    return raw;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Atomically-ish persist a result set (write to temp, rename). */
+export function saveResults(
+  resultsDir: string,
+  results: ExperimentResults,
+): string {
+  mkdirSync(resultsDir, { recursive: true });
+  const p = resultsPath(resultsDir, results.expId);
+  writeFileSync(p, JSON.stringify(results, null, 2) + "\n");
+  return p;
+}
+
+/**
+ * FA#6 — fold a fresh run's results into the persisted set: a re-run cell
+ * overwrites its prior outcome (that IS the retry), new cells are added, and
+ * cells that were previously run but are absent from this run are kept (a
+ * retry only touches the failed subset — the passed cells' last-known status
+ * stays visible). `skipped` reflects this run.
+ */
+export function mergeResults(
+  prev: ExperimentResults | undefined,
+  fresh: { cells: Record<string, CellResult>; skipped: string[] },
+  expId: string,
+): ExperimentResults {
+  const cells: Record<string, CellResult> = { ...(prev?.cells ?? {}) };
+  for (const [id, r] of Object.entries(fresh.cells)) cells[id] = r;
+  return {
+    expId,
+    updatedAt: new Date().toISOString(),
+    cells,
+    skipped: [...new Set([...(prev?.skipped ?? []), ...fresh.skipped])],
+  };
+}
+
+/** passed/failed/error distribution over a set of results (pure). */
+export function statusSummary(
+  cells: Record<string, CellResult> | CellResult[],
+): { passed: number; failed: number; error: number; total: number } {
+  const list = Array.isArray(cells) ? cells : Object.values(cells);
+  return {
+    passed: list.filter((r) => r.status === "passed").length,
+    failed: list.filter((r) => r.status === "failed").length,
+    error: list.filter((r) => r.status === "error").length,
+    total: list.length,
+  };
+}
+
+/**
+ * FA#6 — the cellIds to (re)run for a retry: every cell whose last-known
+ * status is not "passed" (failed/error) plus cells never run (skipped/unknown).
+ * Returns the full spec when there is no prior result set (first run).
+ */
+export function retryCellIds(
+  spec: { taskId: string; model: string; repetition: number }[],
+  prev: ExperimentResults | undefined,
+): string[] {
+  if (!prev) return spec.map((c) => `${c.taskId}__${c.model}__r${c.repetition}`);
+  return spec
+    .filter((c) => {
+      const id = `${c.taskId}__${c.model}__r${c.repetition}`;
+      const r = prev.cells[id];
+      return !r || r.status !== "passed";
+    })
+    .map((c) => `${c.taskId}__${c.model}__r${c.repetition}`);
+}
+
 /**
  * Run the full cell matrix against a subject adapter with bounded
  * concurrency and time/cost budgets. Results are returned in input order;
  * cells not started because a budget ran out land in `skippedCells`.
+ *
+ * FA#6 — `opts.expId` + `opts.resultsDir` persist the result set
+ * (`.aih/eval/<expId>.results.json` by convention); `opts.onlyCells` restricts
+ * the run to a subset of cellIds (used by `--retry-failed`).
  */
 export async function runExperiment(
   tasks: EvalTask[],
   models: EvalModelSpec[],
   repetitions: number,
   subject: SubjectAdapter,
-  opts: { outDir: string; budget?: ExperimentBudget; timeoutMs?: number },
+  opts: {
+    outDir: string;
+    budget?: ExperimentBudget;
+    timeoutMs?: number;
+    expId?: string;
+    resultsDir?: string;
+    onlyCells?: string[];
+  },
 ): Promise<ExperimentReport> {
-  const cells = expandCells(tasks, models, repetitions);
+  let cells = expandCells(tasks, models, repetitions);
+  // FA#6 — restrict to a subset of cellIds (used by `--retry-failed`).
+  if (opts.onlyCells && opts.onlyCells.length > 0) {
+    const wanted = new Set(opts.onlyCells);
+    cells = cells.filter((c) => wanted.has(`${c.taskId}__${c.model}__r${c.repetition}`));
+  }
   const limit = Math.max(
     1,
     opts.budget?.concurrency ?? (Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4),
@@ -423,5 +541,17 @@ export async function runExperiment(
     durationMs: Date.now() - startedAt,
     stopReason: stop ?? "completed",
   };
+  // FA#6 — persist the result set so `--retry-failed` / `--status` can read it
+  // across processes. A re-run cell overwrites its prior outcome (the retry);
+  // previously-passed cells not in this run keep their last-known status.
+  if (opts.expId && opts.resultsDir) {
+    const freshCells: Record<string, CellResult> = {};
+    for (const r of done) freshCells[r.cellId] = r;
+    const prev = loadResults(opts.resultsDir, opts.expId);
+    saveResults(
+      opts.resultsDir,
+      mergeResults(prev, { cells: freshCells, skipped: [...new Set(skipped)] }, opts.expId),
+    );
+  }
   return { results: done, skippedCells: [...new Set(skipped)], totals };
 }

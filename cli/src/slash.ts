@@ -18,7 +18,7 @@ export function slashHeadOf(text: string): string {
 export const BUILTIN_SLASH_HEADS: ReadonlySet<string> = new Set([
   "help", "commands", "tools", "mode", "goal", "memory", "model", "models",
   "usage", "compact", "checkpoint", "restore", "fork", "tree", "dream",
-  "distill", "tidy", "find", "vivid", "bg", "clear", "inject", "events",
+  "distill", "tidy", "find", "shell", "fix", "vivid", "bg", "sessions", "clear", "inject", "events",
   "skills", "exit", "quit",
 ]);
 

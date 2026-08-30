@@ -25,7 +25,22 @@ import {
   isQuotaExhaustion,
   QuotaError,
   StallError,
+  ReasoningRunawayError,
+  isReasoningRunaway,
+  capTurnToolBudget,
+  TURN_TOOL_BUDGET_CHARS,
+  TURN_BUDGET_STOP_DIRECTIVE,
+  LoopAbort,
+  notifyObservers,
+  stableStringify,
+  textSimilarity,
+  RepetitionObserver,
+  BudgetTracker,
+  SensorLoop,
+  isDenied,
+  parseBudget,
 } from "./index.js";
+import type { LoopObserver } from "./index.js";
 import type { ChatMessage, LLMRequest, LLMResponse, SessionEvent, ToolDefinition } from "./types.js";
 import type { LLMAdapter } from "./seams/llm.js";
 
@@ -226,6 +241,133 @@ assert(forked.all().length === events.length, "fork copies full history");
     derivedEligible.some((m) => m.role === "tool") && derivedEligible.every((m) => m.role !== "tool" || String(m.content).includes("r")),
     "tool/result still projected alongside its call",
   );
+}
+
+{
+  // FA#2 — per-turn aggregate budget on tool content (capTurnToolBudget).
+  const tool = (id: string, body: string): ChatMessage => ({
+    role: "tool",
+    toolCallId: id,
+    name: "echo",
+    content: body,
+  });
+  // under budget: unchanged (uses the real default budget).
+  {
+    const msgs = [tool("a", "x".repeat(100)), tool("b", "y".repeat(100))];
+    const out = capTurnToolBudget(msgs, () => "t", TURN_TOOL_BUDGET_CHARS);
+    assert(out === msgs, "FA#2 under budget → same array, untouched");
+  }
+  // over budget: earliest kept intact, later truncated, total bounded.
+  {
+    const msgs = [tool("a", "A".repeat(1000)), tool("b", "B".repeat(1000)), tool("c", "C".repeat(1000))];
+    const out = capTurnToolBudget(msgs, () => "t", 1500);
+    assert(out[0].content === "A".repeat(1000), "FA#2 earliest result kept intact");
+    assert(String(out[1].content).includes("[turn tool-output budget exhausted"), "FA#2 later result truncated with marker");
+    assert(String(out[2].content).startsWith("[turn tool-output budget exhausted") && out[2].content.length < 200, "FA#2 exhausted result → marker only");
+    assert(msgs[1].content === "B".repeat(1000), "FA#2 input array not mutated");
+  }
+  // independent turns: each gets its own budget (each fits its own 1500,
+  // though the combined 3000 would exceed a single shared budget of 1500).
+  {
+    const msgs = [tool("a", "A".repeat(1000)), tool("b", "B".repeat(1000))];
+    const out = capTurnToolBudget(msgs, (m) => (m.toolCallId === "a" ? "t1" : "t2"), 1500);
+    assert(out[0].content === "A".repeat(1000), "FA#2 turn t1 within its own budget → intact");
+    assert(out[1].content === "B".repeat(1000), "FA#2 turn t2 within its own budget → intact");
+    // Contrast: same two results in ONE turn, budget 1500 → the second is trimmed.
+    const oneTurn = capTurnToolBudget(msgs, () => "shared", 1500);
+    assert(String(oneTurn[1].content).includes("[turn tool-output budget exhausted"), "FA#2 same turn, shared budget → second trimmed");
+  }
+  // budget 0 → disabled (no-op).
+  {
+    const msgs = [tool("a", "A".repeat(5000))];
+    assert(capTurnToolBudget(msgs, () => "t", 0) === msgs, "FA#2 budget 0 → disabled");
+  }
+  // integration: deriveMessages caps a turn whose fan-out exceeds the budget.
+  {
+    const ilog = new SessionLog();
+    const big = "Z".repeat(3_000); // under the 8K per-result cap, so only the turn cap applies
+    ilog.append({ type: "user/message", turnId: "t", text: "q" });
+    ilog.append({ type: "assistant/message", turnId: "t", text: "", toolCalls: [] });
+    for (const id of ["r1", "r2", "r3", "r4"]) {
+      ilog.append({ type: "tool/call", turnId: "t", callId: id, name: "echo", args: {} });
+      ilog.append({ type: "tool/result", turnId: "t", callId: id, ok: true, result: big });
+    }
+    ilog.append({ type: "assistant/message", turnId: "t", text: "final", toolCalls: [] });
+    // With the default turn budget, 4 × 3K = 12K fits → all intact.
+    const d1 = ilog.deriveMessages("sys").filter((m) => m.role === "tool");
+    assert(d1.every((m) => String(m.content).includes("Z".repeat(500))), "FA#2 4×3K fits default turn budget → intact");
+    // Tighten the budget below the total via env → later results truncated.
+    process.env.AIH_TURN_TOOL_BUDGET = "4000";
+    try {
+      const d2 = ilog.deriveMessages("sys").filter((m) => m.role === "tool");
+      assert(
+        String(d2[0].content).includes("Z") && !String(d2[0].content).includes("[turn tool-output budget exhausted"),
+        "FA#2 env budget: earliest result kept (per-result cap only)",
+      );
+      assert(d2.some((m) => String(m.content).includes("[turn tool-output budget exhausted")), "FA#2 env budget: later results truncated");
+      // FA#2 supplement: when truncation happened, a trailing user directive
+      // is appended (FrontierAgent ContextSizeGuard parity) so the model is
+      // told to stop issuing tool calls instead of inferring it.
+      const d3 = ilog.deriveMessages("sys");
+      const tail = d3[d3.length - 1];
+      const hasDirective =
+        tail.role === "user" &&
+        String(tail.content).startsWith(TURN_BUDGET_STOP_DIRECTIVE);
+      assert(hasDirective, "FA#2 directive appended when truncation occurred");
+      const directiveCount = d3.filter(
+        (m) =>
+          m.role === "user" &&
+          String(m.content).startsWith(TURN_BUDGET_STOP_DIRECTIVE),
+      ).length;
+      assert(directiveCount === 1, "FA#2 directive appended exactly once");
+    } finally {
+      delete process.env.AIH_TURN_TOOL_BUDGET;
+    }
+  }
+  console.log("ok: FA#2 capTurnToolBudget (pure + deriveMessages integration)");
+}
+
+{
+  // FA#2 regression — a CLOSED historical turn that busts the per-turn budget
+  // must still truncate its oversized tool output (bounds context) but must
+  // NOT append the "stop running tools" directive. Before the fix, resuming
+  // any long session where one past turn read many big files re-armed the
+  // budget-exhausted directive, so a brand-new turn looked budget-exhausted
+  // from its very first message. (Budget is pinned via env so this stays
+  // meaningful regardless of the default TURN_TOOL_BUDGET_CHARS value.)
+  const ilog = new SessionLog();
+  const big = "Z".repeat(8_000); // each at the per-result cap; 20 busts 64K
+  ilog.append({ type: "user/message", turnId: "t1", text: "read a lot" });
+  ilog.append({ type: "assistant/message", turnId: "t1", text: "", toolCalls: [] });
+  for (let i = 0; i < 20; i += 1) {
+    ilog.append({ type: "tool/call", turnId: "t1", callId: `h${i}`, name: "echo", args: {} });
+    ilog.append({ type: "tool/result", turnId: "t1", callId: `h${i}`, ok: true, result: big });
+  }
+  ilog.append({ type: "assistant/message", turnId: "t1", text: "done", toolCalls: [] });
+  ilog.append({ type: "turn/end", turnId: "t1", stopReason: "end_turn" }); // t1 CLOSED
+  // Brand-new live turn, no tool output yet.
+  ilog.append({ type: "turn/start", turnId: "t2" });
+  ilog.append({ type: "user/message", turnId: "t2", text: "do the new task" });
+  process.env.AIH_TURN_TOOL_BUDGET = "64000"; // pin a tight budget for the assertion
+  let dm;
+  try {
+    dm = ilog.deriveMessages("sys");
+  } finally {
+    delete process.env.AIH_TURN_TOOL_BUDGET;
+  }
+  assert(
+    dm.some(
+      (m) => m.role === "tool" && String(m.content).includes("turn tool-output budget exhausted"),
+    ),
+    "FA#2 regression: historical over-budget turn still truncates (context bounded)",
+  );
+  assert(
+    !dm.some(
+      (m) => m.role === "user" && String(m.content).startsWith(TURN_BUDGET_STOP_DIRECTIVE),
+    ),
+    "FA#2 regression: no stop-directive on a fresh turn after a closed over-budget turn",
+  );
+  console.log("ok: FA#2 regression — closed over-budget turn truncates but does not re-arm the directive");
 }
 
 loop.inject("[app/event] todo.added #42");
@@ -677,6 +819,240 @@ assert(streamTurn.steps === 1, "streamed turn completes normally");
     if (prevStall === undefined) delete process.env.AIH_STALL_TIMEOUT_MS;
     else process.env.AIH_STALL_TIMEOUT_MS = prevStall;
   }
+}
+
+{
+  // FA#3 — reasoning-runaway watchdog.
+  // 1) pure decision (isReasoningRunaway): reasoning-only past the char cap →
+  //    runaway; with text or a tool call → healthy; under budget → not runaway.
+  assert(
+    isReasoningRunaway({ reasoningChars: 20_000, hasText: false, hasToolCall: false, elapsedMs: 100 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 reasoning-only past char cap → runaway",
+  );
+  assert(
+    !isReasoningRunaway({ reasoningChars: 20_000, hasText: true, hasToolCall: false, elapsedMs: 100 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 text present → healthy (not runaway)",
+  );
+  assert(
+    !isReasoningRunaway({ reasoningChars: 20_000, hasText: false, hasToolCall: true, elapsedMs: 100 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 tool call present → healthy (not runaway)",
+  );
+  assert(
+    isReasoningRunaway({ reasoningChars: 100, hasText: false, hasToolCall: false, elapsedMs: 200_000 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 reasoning-only past time cap → runaway",
+  );
+  assert(
+    !isReasoningRunaway({ reasoningChars: 1_000, hasText: false, hasToolCall: false, elapsedMs: 100 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 under both budgets → not runaway",
+  );
+  assert(
+    !isReasoningRunaway({ reasoningChars: 0, hasText: false, hasToolCall: false, elapsedMs: 200_000 }, { maxChars: 16_384, timeoutMs: 120_000 }),
+    "FA#3 no reasoning yet → not runaway",
+  );
+  console.log("ok: FA#3 isReasoningRunaway pure decision");
+
+  // 2) integration: a reasoning-only stream that exceeds the char cap throws
+  //    ReasoningRunawayError (folds into the retry budget).
+  const prevFirst = process.env.AIH_FIRST_TOKEN_TIMEOUT_MS;
+  const prevStall = process.env.AIH_STALL_TIMEOUT_MS;
+  const prevTo = process.env.AIH_REASONING_ONLY_TIMEOUT_MS;
+  const prevMax = process.env.AIH_REASONING_ONLY_MAX_CHARS;
+  process.env.AIH_FIRST_TOKEN_TIMEOUT_MS = "180000"; // no first-token fire
+  process.env.AIH_STALL_TIMEOUT_MS = "180000"; // no inter-frame fire
+  process.env.AIH_REASONING_ONLY_TIMEOUT_MS = "0"; // disable time guard
+  process.env.AIH_REASONING_ONLY_MAX_CHARS = "100"; // tiny char cap → fire fast
+  try {
+    const reasoningBody = (n: number) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let i = 0; i < n; i += 1) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "r".repeat(50) } }] })}\n\n`));
+          }
+          // no close — the stream would otherwise hang; the watchdog throws first
+        },
+      });
+    let calls = 0;
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "k",
+      model: "m",
+      retries: 1,
+      fetchImpl: (async () => {
+        calls += 1;
+        return new Response(reasoningBody(10), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }) as typeof fetch,
+    });
+    const err = (await llm.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      onDelta: () => {},
+    }).catch((e: unknown) => e)) as ReasoningRunawayError;
+    assert(err instanceof ReasoningRunawayError, "FA#3 reasoning-only runaway throws ReasoningRunawayError");
+    assert(err.reasoningChars > 100, "FA#3 error carries the reasoning char count");
+    assert(calls === 2, "FA#3 runaway folds into the retry budget (2 attempts)");
+  } finally {
+    if (prevFirst === undefined) delete process.env.AIH_FIRST_TOKEN_TIMEOUT_MS;
+    else process.env.AIH_FIRST_TOKEN_TIMEOUT_MS = prevFirst;
+    if (prevStall === undefined) delete process.env.AIH_STALL_TIMEOUT_MS;
+    else process.env.AIH_STALL_TIMEOUT_MS = prevStall;
+    if (prevTo === undefined) delete process.env.AIH_REASONING_ONLY_TIMEOUT_MS;
+    else process.env.AIH_REASONING_ONLY_TIMEOUT_MS = prevTo;
+    if (prevMax === undefined) delete process.env.AIH_REASONING_ONLY_MAX_CHARS;
+    else process.env.AIH_REASONING_ONLY_MAX_CHARS = prevMax;
+  }
+  console.log("ok: FA#3 reasoning-runaway watchdog (integration)");
+}
+
+{
+  // FA#5 — pluggable loop observers.
+  // 1) notifyObservers: fan-out, swallows non-LoopAbort, propagates first LoopAbort.
+  {
+    const seen: string[] = [];
+    notifyObservers(
+      [
+        { onTurnStart: (t) => seen.push(`A:${t}`) },
+        { onTurnStart: (t) => { seen.push("B-err"); throw new Error("boom"); } },
+        { onTurnStart: (t) => seen.push(`C:${t}`) },
+      ],
+      (o) => o.onTurnStart?.("t1"),
+    );
+    assert(seen.length === 3 && seen[1] === "B-err", "FA#5 non-LoopAbort observer error is swallowed (fan-out continues)");
+    const abort = notifyObservers(
+      [{ onTurnStart: () => { throw new LoopAbort("stop"); } }],
+      (o) => o.onTurnStart?.("t1"),
+    );
+    assert(abort instanceof LoopAbort && abort.reason === "stop", "FA#5 LoopAbort propagates");
+  }
+
+  // 2) boundary order: onTurnStart → onModelResponse → onToolCall → onToolResult → onTurnEnd.
+  {
+    const order: string[] = [];
+    const obs: LoopObserver = {
+      onTurnStart: (t) => order.push(`start:${t}`),
+      onModelResponse: (t, text, calls) => order.push(`model:${text}:${calls.length}`),
+      onToolCall: (t, c) => order.push(`call:${c.name}`),
+      onToolResult: (t, r) => order.push(`result:${r.name}:${r.ok}`),
+      onTurnEnd: (t, r) => order.push(`end:${r}`),
+    };
+    const reg = new ToolRegistry(new AutoApprove());
+    reg.register(echo);
+    const mllm = new MockLLM([
+      { text: "echoing", toolCalls: [toolCall("c1", "echo", { text: "hi" })], stopReason: "tool_use" },
+      { text: "done", stopReason: "end_turn" },
+    ]);
+    const olog = new SessionLog();
+    const oloop = new AgentLoop({ llm: mllm, tools: reg, log: olog, observers: [obs] });
+    const res = await oloop.send("echo hi");
+    assert(res.stopReason === "end_turn", "FA#5 observer turn ends normally");
+    assert(
+      order[0].startsWith("start:") &&
+        order[1].startsWith("model:") &&
+        order.includes("call:echo") &&
+        order.includes("result:echo:true") &&
+        order[order.length - 1].startsWith("end:"),
+      `FA#5 observer boundaries fire in order (got: ${order.join(", ")})`,
+    );
+    const startIdx = order.findIndex((s) => s.startsWith("start:"));
+    const modelIdx = order.findIndex((s) => s.startsWith("model:"));
+    const callIdx = order.findIndex((s) => s === "call:echo");
+    const resultIdx = order.findIndex((s) => s.startsWith("result:echo:"));
+    const endIdx = order.length - 1;
+    assert(startIdx < modelIdx && modelIdx < callIdx && callIdx < resultIdx && resultIdx < endIdx, "FA#5 strict boundary ordering");
+  }
+
+  // 3) LoopAbort from onToolCall stops the turn; the unexecuted call gets a failure result.
+  {
+    const reg = new ToolRegistry(new AutoApprove());
+    reg.register(echo);
+    const mllm = new MockLLM([
+      { text: "echoing", toolCalls: [toolCall("c1", "echo", { text: "hi" })], stopReason: "tool_use" },
+      { text: "done", stopReason: "end_turn" },
+    ]);
+    const olog = new SessionLog();
+    const obs: LoopObserver = {
+      onToolCall: () => { throw new LoopAbort("policy: no echo"); },
+    };
+    const oloop = new AgentLoop({ llm: mllm, tools: reg, log: olog, observers: [obs] });
+    const res = await oloop.send("echo hi");
+    assert(res.stopReason === "cancelled", "FA#5 LoopAbort stops the turn (cancelled)");
+    const evts = olog.all();
+    const echoCall = evts.find((e): e is Extract<SessionEvent, { type: "tool/call" }> => e.type === "tool/call" && e.name === "echo");
+    const echoResult = echoCall ? evts.find((e): e is Extract<SessionEvent, { type: "tool/result" }> => e.type === "tool/result" && e.callId === echoCall.callId) : undefined;
+    assert(!!echoCall, "FA#5 aborted call is still logged (tool/call)");
+    assert(!!echoResult && echoResult.ok === false, "FA#5 aborted call gets a failure result (pairing preserved)");
+  }
+  console.log("ok: FA#5 loop observers (fan-out, boundary order, LoopAbort)");
+}
+
+{
+  // FA#4 — repetition stop-loss observer.
+  // 1) pure helpers: stableStringify (key-order independent) + textSimilarity.
+  assert(
+    stableStringify({ a: 1, b: [2, 3] }) === stableStringify({ b: [2, 3], a: 1 }),
+    "FA#4 stableStringify is key-order independent",
+  );
+  assert(stableStringify(null) === "null" && stableStringify(undefined) === "undefined", "FA#4 stableStringify null/undefined");
+  assert(textSimilarity("the quick brown fox", "the quick brown fox") === 1, "FA#4 textSimilarity identical = 1");
+  assert(textSimilarity("the quick brown fox", "totally different text here") < 0.5, "FA#4 textSimilarity disjoint < 0.5");
+  assert(textSimilarity("", "x") === 0, "FA#4 textSimilarity empty = 0");
+  console.log("ok: FA#4 pure helpers (stableStringify, textSimilarity)");
+
+  // 2) RepetitionObserver — ② consecutive identical tool calls: hint@3, stop@6.
+  {
+    const obs = new RepetitionObserver({ hintAt: 3, stopAt: 6 });
+    const hints: string[] = [];
+    obs.bind({ inject: (t) => hints.push(t) });
+    const call = { callId: "c", name: "echo", args: { text: "hi" } };
+    let threw = false;
+    for (let i = 0; i < 5; i += 1) {
+      try { obs.onToolCall("t", call); } catch (e) { threw = e instanceof LoopAbort; }
+    }
+    assert(!threw, "FA#4 5 identical calls (< stopAt 6) does not stop");
+    assert(hints.length >= 1, "FA#4 hint fired at consecutive 3");
+    try { obs.onToolCall("t", call); } catch (e) { threw = e instanceof LoopAbort; }
+    assert(threw, "FA#4 6th identical call → LoopAbort (stop)");
+  }
+
+  // 3) RepetitionObserver — ① duplicate query (executed with content, re-requested).
+  {
+    const obs = new RepetitionObserver();
+    const hints: string[] = [];
+    obs.bind({ inject: (t) => hints.push(t) });
+    const call = { callId: "c1", name: "search", args: { q: "foo" } };
+    obs.onToolCall("t", call);
+    obs.onToolResult("t", { callId: "c1", name: "search", ok: true, result: "found 3 docs" });
+    obs.onToolCall("t", { callId: "c2", name: "search", args: { q: "foo" } });
+    assert(hints.some((h) => h.includes("duplicate query")), "FA#4 duplicate query (same args, had content) → hint");
+  }
+
+  // 4) RepetitionObserver — ③ near-verbatim text: hint@2, stop@3.
+  {
+    const obs = new RepetitionObserver({ textHintAt: 2, textStopAt: 3 });
+    const hints: string[] = [];
+    obs.bind({ inject: (t) => hints.push(t) });
+    const text = "I will now proceed to analyze the data carefully and report back the results soon";
+    obs.onModelResponse("t", text, []);
+    obs.onModelResponse("t", text, []); // near-verbatim 2nd → hint
+    let threw = false;
+    try { obs.onModelResponse("t", text, []); } catch (e) { threw = e instanceof LoopAbort; }
+    assert(threw, "FA#4 near-verbatim text 3× → LoopAbort (stop)");
+    assert(hints.length >= 1, "FA#4 text hint fired at repeat 2");
+  }
+
+  // 5) RepetitionObserver — distinct calls do NOT trip the repetition guard.
+  {
+    const obs = new RepetitionObserver({ hintAt: 3, stopAt: 6 });
+    obs.bind({ inject: () => {} });
+    obs.onToolCall("t", { callId: "1", name: "a", args: { x: 1 } });
+    obs.onToolCall("t", { callId: "2", name: "b", args: { x: 2 } });
+    obs.onToolCall("t", { callId: "3", name: "c", args: { x: 3 } });
+    obs.onToolCall("t", { callId: "4", name: "a", args: { x: 1 } }); // same as #1 but not consecutive
+    assert(true, "FA#4 non-consecutive / distinct calls do not trip the guard");
+  }
+  console.log("ok: FA#4 RepetitionObserver (repetition, duplicate-query, text-repetition, distinct)");
 }
 
 {
@@ -1780,6 +2156,179 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   }
   assert(noHookThrew, "no quotaWait hook → QuotaError propagates immediately");
   assert(noHookLog.all().filter((e) => e.type === "quota_wait").length === 0, "no quota_wait event in non-interactive mode");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// PE#2 — budget hard constraint + tripwire (pure state machine)
+// ────────────────────────────────────────────────────────────────────────────
+{
+  // cost hard bound
+  const bt = new BudgetTracker({ maxCostUsd: 1 });
+  assert(bt.check({ costUsd: 0.5 }).state === "ok", "PE#2 cost under bound → ok");
+  const hard = bt.check({ costUsd: 0.6 });
+  assert(hard.state === "hard" && hard.kind === "cost", "PE#2 cost ≥ bound → hard/cost");
+  if (hard.state === "hard") assert(hard.reason.includes("$"), "PE#2 cost verdict carries a reason");
+
+  // writes hard bound
+  const bw = new BudgetTracker({ maxWrites: 3 });
+  assert(bw.check({ writes: 2 }).state === "ok", "PE#2 writes under bound → ok");
+  const hw = bw.check({ writes: 2 });
+  assert(hw.state === "hard" && hw.kind === "writes", "PE#2 writes ≥ bound → hard/writes");
+
+  // timeout hard bound (injected clock)
+  let now = 1_000_000;
+  const bto = new BudgetTracker({ timeoutMs: 1000 }, { now: () => now });
+  assert(bto.check({}).state === "ok", "PE#2 timeout under bound → ok");
+  now += 1500;
+  const ht = bto.check({});
+  assert(ht.state === "hard" && ht.kind === "timeout", "PE#2 elapsed ≥ bound → hard/timeout");
+
+  // scope deny (a denied path is a hard violation regardless of budget)
+  const bsc = new BudgetTracker({ maxCostUsd: 100, denyPaths: ["node_modules", ".git"] });
+  assert(bsc.check({ writePath: "src/app.ts" }).state === "ok", "PE#2 allowed path → ok");
+  assert(bsc.check({ writePath: "node_modules/x.js" }).state === "hard", "PE#2 denied path → hard/scope");
+  assert(isDenied(".git/config", ".git"), "PE#2 isDenied matches a file under the denied dir");
+  assert(!isDenied("gitignore.txt", ".git"), "PE#2 isDenied is boundary-aware (no false prefix match)");
+
+  // tripwire: single-task cost > 2× session mean (latched, cost only)
+  const btw = new BudgetTracker({ maxCostUsd: 1000 });
+  btw.check({ costUsd: 1 }); // sample 1
+  btw.check({ costUsd: 1 }); // sample 2 → mean 1, cost 2 → not > 2×
+  const tw = btw.check({ costUsd: 10 }); // cost 12, mean 4 → 12 ≥ 8 → tripwire
+  assert(tw.state === "soft" && tw.kind === "tripwire", "PE#2 cost spike → soft tripwire");
+  btw.latchTripwire();
+  assert(btw.check({ costUsd: 1 }).state === "ok", "PE#2 tripwire latched → no re-fire");
+
+  // parseBudget: JSON + key=value
+  const p1 = parseBudget({ maxCostUsd: 2, maxWrites: 5, denyPaths: ["a", "b"] });
+  assert(p1.maxCostUsd === 2 && p1.maxWrites === 5 && p1.denyPaths?.length === 2, "PE#2 parseBudget JSON");
+  const p2 = parseBudget("maxCostUsd=1,maxWrites=3,denyPaths=x|y");
+  assert(p2.maxCostUsd === 1 && p2.maxWrites === 3 && p2.denyPaths?.length === 2, "PE#2 parseBudget key=value");
+  console.log("ok: PE#2 budget tracker (cost/writes/timeout/scope/tripwire/parse)");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// PE#1 — computational sensor loop (verdict → feedback → escalate)
+// ────────────────────────────────────────────────────────────────────────────
+{
+  // green sensor → pass
+  const green = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], run: async () => ({ ok: true, detail: "ok" }) },
+  ]);
+  const g = await green.afterWrite("write_file", { path: "a.ts" }, "t1");
+  assert(g.passed === true && g.escalated === false, "PE#1 green sensor → pass");
+
+  // red sensor, retries remain → feedback, not escalated
+  const red1 = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], run: async () => ({ ok: false, detail: "2 errors" }) },
+  ], { retries: 1 });
+  const r1 = await red1.afterWrite("write_file", { path: "a.ts" }, "t1");
+  assert(r1.passed === false && r1.escalated === false && (r1.feedback?.includes("retry") === true), "PE#1 red w/ retry left → feedback");
+
+  // red sensor, retries exhausted → escalated
+  const red2 = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], run: async () => ({ ok: false, detail: "2 errors" }) },
+  ], { retries: 0 });
+  const r2 = await red2.afterWrite("write_file", { path: "a.ts" }, "t1");
+  assert(r2.passed === false && r2.escalated === true, "PE#1 red w/ no retries → escalated");
+
+  // non-applicable tool → pass (no sensor runs)
+  const na = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], run: async () => ({ ok: false, detail: "x" }) },
+  ]);
+  const nr = await na.afterWrite("echo", {}, "t1");
+  assert(nr.passed === true, "PE#1 sensor not applicable to tool → pass");
+
+  // pathPrefix filter: sensor only fires for matching paths
+  const pf = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], pathPrefix: "src", run: async () => ({ ok: false, detail: "x" }) },
+  ], { retries: 0 });
+  const pfHit = await pf.afterWrite("write_file", { path: "src/a.ts" }, "t1");
+  const pfMiss = await pf.afterWrite("write_file", { path: "docs/a.md" }, "t1");
+  assert(pfHit.escalated === true, "PE#1 pathPrefix match → sensor ran");
+  assert(pfMiss.passed === true, "PE#1 pathPrefix mismatch → sensor skipped");
+  console.log("ok: PE#1 sensor loop (green/red/retry/escalate/pathPrefix)");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// PE#1/PE#2/PE#4 — AgentLoop integration: sensor red → escalate, budget hard → escalate
+// ────────────────────────────────────────────────────────────────────────────
+{
+  // A write tool that succeeds (so the sensor/budget path is exercised).
+  const writer: ToolDefinition = {
+    name: "write_file",
+    description: "write",
+    kind: "write",
+    permission: "allow",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    execute: async (a) => ({ ok: true, path: (a as { path: string }).path }),
+  };
+  const wTools = new ToolRegistry(new AutoApprove());
+  wTools.register(writer);
+
+  // (a) sensor red after retries → stopReason "escalated" + escalate event
+  let escalations: { reason: string; options: string[]; safestDefault: string }[] = [];
+  const sensorLlm = new MockLLM([
+    { text: "writing", toolCalls: [toolCall("w1", "write_file", { path: "a.ts" })], stopReason: "tool_use" },
+    { text: "done", stopReason: "end_turn" },
+  ]);
+  const redSensor = new SensorLoop([
+    { name: "tsc", onTools: ["write_file"], run: async () => ({ ok: false, detail: "type error" }) },
+  ], { retries: 0 });
+  const sLog = new SessionLog();
+  const sLoop = new AgentLoop({
+    llm: sensorLlm,
+    tools: wTools,
+    log: sLog,
+    sensors: redSensor,
+    onEscalate: (v) => escalations.push(v),
+  });
+  const sRes = await sLoop.send("write it");
+  assert(sRes.stopReason === "escalated", "PE#4 sensor red (retries 0) → stopReason escalated");
+  assert(escalations.length === 1 && escalations[0].safestDefault.length > 0, "PE#4 onEscalate hook fired with options + safestDefault");
+  assert(sLog.all().some((e) => e.type === "escalate"), "PE#4 escalate event recorded in the log (model-invisible)");
+
+  // (b) budget hard (writes) → stopReason "escalated"
+  const bEsc: { reason: string }[] = [];
+  const budgetLlm = new MockLLM([
+    { text: "writing", toolCalls: [toolCall("w1", "write_file", { path: "a.ts" })], stopReason: "tool_use" },
+    { text: "done", stopReason: "end_turn" },
+  ]);
+  const bTracker = new BudgetTracker({ maxWrites: 1 });
+  const bLog = new SessionLog();
+  const bLoop = new AgentLoop({
+    llm: budgetLlm,
+    tools: wTools,
+    log: bLog,
+    budget: bTracker,
+    onEscalate: (v) => bEsc.push(v),
+  });
+  const bRes = await bLoop.send("write it");
+  assert(bRes.stopReason === "escalated", "PE#4 budget hard (writes) → stopReason escalated");
+  assert(bEsc.length === 1 && bEsc[0].reason.includes("writes"), "PE#4 budget escalate reason names the writes bound");
+
+  // (c) budget soft tripwire → onTripwire fires once, turn continues
+  const trips: number[] = [];
+  const tripLlm = new MockLLM([
+    { text: "writing", toolCalls: [toolCall("w1", "write_file", { path: "a.ts" })], stopReason: "tool_use" },
+    { text: "done", stopReason: "end_turn" },
+  ]);
+  const tripTracker = new BudgetTracker({ maxCostUsd: 1000 });
+  tripTracker.addUsage(1);
+  tripTracker.addUsage(10); // spike → tripwire on the next check
+  const tLog = new SessionLog();
+  const tLoop = new AgentLoop({
+    llm: tripLlm,
+    tools: wTools,
+    log: tLog,
+    budget: tripTracker,
+    costOf: () => 0,
+    onTripwire: (v) => trips.push(v.currentCostUsd),
+  });
+  const tRes = await tLoop.send("write it");
+  assert(tRes.stopReason === "end_turn", "PE#2 soft tripwire does not stop the turn");
+  assert(trips.length >= 1, "PE#2 onTripwire surfaced the soft verdict");
+  console.log("ok: PE#1/PE#2/PE#4 AgentLoop integration (sensor/budget → escalate, tripwire → continue)");
 }
 
 console.log("\nAIH core smoke test passed.");

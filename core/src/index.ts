@@ -17,6 +17,33 @@ export type { ToolFact, ToolRecoveryState, RecoveryReport } from "./recovery.js"
 export { SessionStore } from "./session-store.js";
 export { AgentLoop, estimateTokensText } from "./agent-loop.js";
 export type { AgentLoopOptions } from "./agent-loop.js";
+export {
+  BudgetTracker,
+  BudgetExceeded,
+  SensorLoop,
+  isDenied,
+  parseBudget,
+} from "./budget.js";
+export type {
+  BudgetLimits,
+  BudgetVerdict,
+  BudgetCheck,
+  SensorSpec,
+  SensorRunResult,
+} from "./budget.js";
+export {
+  LoopAbort,
+  notifyObservers,
+  stableStringify,
+  textSimilarity,
+  RepetitionObserver,
+} from "./observers.js";
+export type {
+  LoopObserver,
+  ObserverToolCall,
+  ObserverToolResult,
+  RepetitionObserverOptions,
+} from "./observers.js";
 export { ToolRegistry } from "./tool-registry.js";
 export type {
   ToolHookInfo,
@@ -29,6 +56,7 @@ export {
   FINAL_STATE_GUARD,
   TASK_CONTRACT_RULES,
   DECISION_QUESTION_RULE,
+  TOOL_OUTPUT_NOTES,
   GOAL_CONTRACT_TEMPLATE,
   GOAL_VERDICT_SCHEMA,
   COMPACT_CONTINUE_PROMPT,
@@ -44,8 +72,10 @@ export {
   consumeSSEStream,
   classifyProviderError,
   isQuotaExhaustion,
+  isReasoningRunaway,
   parseFrame,
   QuotaError,
+  ReasoningRunawayError,
   StallError,
 } from "./seams/llm-sse.js";
 export type { StreamAccumulator, ParseOptions, ProviderErrorClass } from "./seams/llm-sse.js";

@@ -125,6 +125,7 @@ import {
   classifyProviderError,
   isQuotaExhaustion,
   QuotaError,
+  ReasoningRunawayError,
   StallError,
 } from "./llm-sse.js";
 
@@ -135,6 +136,13 @@ const FIRST_TOKEN_TIMEOUT_MS = () =>
   Number(process.env.AIH_FIRST_TOKEN_TIMEOUT_MS ?? "") || 180_000;
 const STALL_TIMEOUT_MS = () =>
   Number(process.env.AIH_STALL_TIMEOUT_MS ?? "") || 60_000;
+// FA#3 — reasoning-runaway watchdog. A reasoning-only stream (no content, no
+// tool call) that exceeds these budgets throws ReasoningRunawayError.
+// 0 disables a guard. Defaults: reasoning-only 120s, 16K reasoning chars.
+const REASONING_ONLY_TIMEOUT_MS = () =>
+  Number(process.env.AIH_REASONING_ONLY_TIMEOUT_MS ?? "") || 120_000;
+const REASONING_ONLY_MAX_CHARS = () =>
+  Number(process.env.AIH_REASONING_ONLY_MAX_CHARS ?? "") || 16_384;
 
 /** Arm a stall watchdog: fires `fire` after `ms` unless disarmed/reset. */
 function armStallTimer(ms: number, fire: () => void): { reset(): void; disarm(): void } {
@@ -312,6 +320,15 @@ export class OpenAICompatibleLLM implements LLMAdapter {
               onDelta: req.onDelta,
               onReasoning: (req as any).onReasoning,
               onActivity: activity,
+              // FA#3 — reasoning-runaway watchdog (disabled if either guard is 0).
+              ...(REASONING_ONLY_TIMEOUT_MS() > 0 || REASONING_ONLY_MAX_CHARS() > 0
+                ? {
+                    reasoningWatchdog: {
+                      maxChars: REASONING_ONLY_MAX_CHARS(),
+                      timeoutMs: REASONING_ONLY_TIMEOUT_MS(),
+                    },
+                  }
+                : {}),
             });
           } finally {
             firstTimer.disarm();
@@ -339,6 +356,14 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         // fold into the normal retry budget like any transient failure.
         if (err instanceof StallError) {
           if (err.partialText.trim() !== "") throw err;
+          if (attempt < maxAttempts - 1) {
+            lastError = err;
+            continue;
+          }
+        } else if (err instanceof ReasoningRunawayError) {
+          // FA#3 — the stream reasoned forever without producing content or a
+          // tool call. There is no partial text to resume from, so fold into
+          // the retry budget (a fresh attempt may produce content).
           if (attempt < maxAttempts - 1) {
             lastError = err;
             continue;
