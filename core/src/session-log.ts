@@ -11,6 +11,76 @@ export function truncateToolOutput(value: string): string {
     : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`;
 }
 
+// FA#2 — per-turn aggregate budget for tool messages. The per-result cap above
+// (2K) bounds a single result, but a turn that fans out N read tools still
+// dumps N × 2K into the next request. This is the coarser, turn-level cap:
+// the total tool content for one turn is bounded, with the EARLIEST results
+// kept intact (they carry the first context) and later ones truncated.
+export const TURN_TOOL_BUDGET_CHARS = 12_000;
+
+/**
+ * FA#2 — cap the total tool-message content for a single turn.
+ *
+ * Pure (operates on the projected ChatMessage[]), so it is unit-testable
+ * without a SessionLog. `turnOf` maps a tool message's `toolCallId` to its
+ * turn id; tool messages that share a turn are budgeted together, in order.
+ *
+ * Strategy: walk the turn's tool messages in order, keeping each intact while
+ * the running total fits `budget`; the first one that would exceed the budget
+ * (and every one after it) is truncated to the remaining room (min 0). This
+ * preserves the earliest results — the ones the model most needs to reason
+ * about — and trims the tail. Returns a new array (input is not mutated).
+ */
+export function capTurnToolBudget(
+  messages: ChatMessage[],
+  turnOf: (m: ChatMessage) => string | undefined,
+  budget: number = TURN_TOOL_BUDGET_CHARS,
+): ChatMessage[] {
+  if (budget <= 0) return messages;
+  // Group indices by turn, preserving first-seen order.
+  const byTurn = new Map<string, number[]>();
+  for (let i = 0; i < messages.length; i += 1) {
+    const m = messages[i];
+    if (m.role !== "tool") continue;
+    const t = turnOf(m);
+    if (t === undefined) continue;
+    const arr = byTurn.get(t);
+    if (arr) arr.push(i);
+    else byTurn.set(t, [i]);
+  }
+  if (byTurn.size === 0) return messages;
+  const out = messages.slice();
+  let changed = false;
+  for (const idxs of byTurn.values()) {
+    let remaining = budget;
+    for (const i of idxs) {
+      const m = out[i];
+      const content = typeof m.content === "string" ? m.content : "";
+      if (content.length <= remaining) {
+        remaining -= content.length;
+        continue;
+      }
+      // This result would exceed the remaining budget: truncate it to the
+      // room left (floor at 0 so the pairing is still answered). The marker
+      // is actionable, not cryptic: a model that sees it must STOP running
+      // read/debug tools (they'd be truncated too) and wrap up from what it
+      // already has, or end the turn so a fresh turn resets the budget.
+      const keep = Math.max(0, remaining);
+      out[i] = {
+        ...m,
+        content:
+          keep > 0
+            ? `${content.slice(0, keep)}\n[turn tool-output budget exhausted — STOP running read/debug tools and wrap up from what you have; sending another message will start a fresh turn with a reset budget]`
+            : "[turn tool-output budget exhausted — STOP running read/debug tools and wrap up from what you have; sending another message will start a fresh turn with a reset budget]",
+      };
+      remaining = 0;
+      changed = true;
+    }
+  }
+  // True no-op when nothing was truncated (returns the original reference).
+  return changed ? out : messages;
+}
+
 /**
  * MK#42 — stable digest over an ordered event prefix. Compaction summaries
  * carry this so consumers can verify that the projection still corresponds
@@ -270,6 +340,25 @@ export class SessionLog {
       // the model never sees them.
       if (event.type === "tool/dispatch") continue;
        pushMessage(event);
+     }
+     // FA#2 — per-turn aggregate budget on tool content. The per-result cap
+     // (truncateToolOutput, 2K) bounds a single result, but a turn that fans
+     // out N read tools still dumps N × 2K into the next request. Cap the
+     // total tool content per turn (earliest kept intact, later trimmed).
+     // Budget is configurable via AIH_TURN_TOOL_BUDGET (chars); 0 disables.
+     const budget =
+       Number(process.env.AIH_TURN_TOOL_BUDGET ?? "") || TURN_TOOL_BUDGET_CHARS;
+     if (budget > 0) {
+       const turnByCallId = new Map<string, string>();
+       for (const e of this.#events) {
+         if (e.type === "tool/call") turnByCallId.set(e.callId, e.turnId);
+       }
+       const capped = capTurnToolBudget(
+         messages,
+         (m) => (m.toolCallId ? turnByCallId.get(m.toolCallId) : undefined),
+         budget,
+       );
+       if (capped !== messages) messages.length = 0, messages.push(...capped);
      }
      // Invariant (opencode/MiMo-Code parity): the model-visible conversation
      // must contain at least one user message — strict chat templates (Qwen3:
