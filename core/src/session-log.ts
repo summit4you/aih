@@ -18,6 +18,15 @@ export function truncateToolOutput(value: string): string {
 // kept intact (they carry the first context) and later ones truncated.
 export const TURN_TOOL_BUDGET_CHARS = 12_000;
 
+// FA#2 (FrontierAgent ContextSizeGuard parity) — directive appended to the
+// model-visible conversation when a turn's tool-output budget is exhausted.
+// Unlike a bare truncation marker, it tells the model what to DO: stop
+// issuing tool calls and deliver an answer from verified information, since
+// continued tool calls are truncated anyway. Kept as a stable prefix so a
+// replayed/compacted tail is not re-appended (dedup check uses startsWith).
+export const TURN_BUDGET_STOP_DIRECTIVE =
+  "[Turn tool-output budget exhausted: stop issuing tool calls now and deliver your best answer from verified information already gathered. Every further tool call this turn is truncated, so keep it to a single, clean, honest wrap-up. Sending another message resumes normal tool output on a fresh turn.]";
+
 /**
  * FA#2 — cap the total tool-message content for a single turn.
  *
@@ -353,13 +362,36 @@ export class SessionLog {
        for (const e of this.#events) {
          if (e.type === "tool/call") turnByCallId.set(e.callId, e.turnId);
        }
-       const capped = capTurnToolBudget(
-         messages,
-         (m) => (m.toolCallId ? turnByCallId.get(m.toolCallId) : undefined),
-         budget,
-       );
-       if (capped !== messages) messages.length = 0, messages.push(...capped);
-     }
+        const capped = capTurnToolBudget(
+          messages,
+          (m) => (m.toolCallId ? turnByCallId.get(m.toolCallId) : undefined),
+          budget,
+        );
+        if (capped !== messages) {
+          messages.length = 0, messages.push(...capped);
+          // FA#2 supplement (FrontierAgent ContextSizeGuard parity): when a
+          // turn's tool-output budget is exhausted and results were truncated,
+          // append an explicit, actionable directive INSTEAD of leaving the
+          // model to infer it. Do this only if one isn't already present (a
+          // compacted/replayed tail could already carry one) — and never
+          // break tool pairing, which is why the directive is a trailing
+          // user message after all tool replies.
+          let hasDirective = false;
+          for (const m of messages) {
+            if (
+              m.role === "user" &&
+              typeof m.content === "string" &&
+              m.content.startsWith(TURN_BUDGET_STOP_DIRECTIVE)
+            ) {
+              hasDirective = true;
+              break;
+            }
+          }
+          if (!hasDirective) {
+            messages.push({ role: "user", content: TURN_BUDGET_STOP_DIRECTIVE });
+          }
+        }
+      }
      // Invariant (opencode/MiMo-Code parity): the model-visible conversation
      // must contain at least one user message — strict chat templates (Qwen3:
      // "No user query found in messages") 400 otherwise. If a compaction
