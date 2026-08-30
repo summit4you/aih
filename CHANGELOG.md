@@ -8,53 +8,6 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
-### Added
-- **Multi-strategy `best_of_n` (Freebuff FB#1, borrowed from CodebuffAI/freebuff
-  `editor-multi-prompt.ts`)**: pass `prompts` (an array of short strategy
-  prompts) and each candidate works the SHARED task context plus its own
-  strategy direction (candidate i follows `prompts[i % len]`) — wider
-  exploration than N samples of one prompt. The result carries `strategies`;
-  the judge labels each candidate with its strategy so it can weigh "right
-  approach" as well as "right answer". Omit `prompts` → unchanged
-  single-prompt behavior. `cli/src/maxmode.ts` + `cli/src/general-tools.ts`
-  + smoke coverage.
-- **Two-judge panel for `best_of_n` (Freebuff FB#2, borrowed from freebuff
-  BuffBench independent-judging)**: opt-in via `AIH_SECOND_JUDGE_MODEL`
-  (`buildJudge2Llm` reuses the primary model's provider/base-url/api-key,
-  only the model id differs). The two judges run in PARALLEL
-  (`Promise.allSettled`); the primary's pick is kept (median of two). A
-  disagreement or a failed judge is flagged (`judgeDegraded`) and warned on
-  stderr — a silently-dropped judge would turn the panel into one opinion.
-  Both judges failing → hard error. The panel is a generic `judgePanel<V>()`
-  helper so the `/goal` judge can share the same discipline (roadmap FB#6).
-  Absent → single-judge behavior (unchanged). `cli/src/maxmode.ts` +
-  `cli/src/index.ts` + smoke coverage (agreement / disagreement / second
-  failed / primary failed / both failed).
-- **Compaction "historical memory only" guard (Freebuff FB#3, borrowed from
-  freebuff `context-pruner.ts` summary positioning)**: the compaction
-  `SUMMARY_TEMPLATE` now tells the model the summary is HISTORICAL MEMORY
-  ONLY — not dialogue, not an output template, not a tool-call format;
-  continue from the live user message and use real tool calls when actions
-  are needed. Guards against the model copying the summary's structure into
-  its live output after compaction. `core/src/agent-loop.ts` + smoke
-  coverage.
-
-### Changed
-- **webfetch hardening (opencode/MiMo parity, zero new deps)**: the old
-  implementation was one-shot — a single 20s fetch with a bot UA, no Accept
-  header, body downloaded before the size check, and bare error text
-  ("webfetch failed: HTTP 403") that told the model nothing it could act on.
-  In flaky networks every transient blip became a visible failure. Now:
-  browser-grade UA + Accept/Accept-Language headers (bot-block resistance);
-  one bounded retry on network failures (connect/DNS/TLS/abort); Cloudflare
-  `403 + cf-mitigated: challenge` → honest-UA retry (opencode pattern);
-  configurable timeout — tool `timeout` arg (seconds) > `AIH_FETCH_TIMEOUT_MS`
-  > 30s default, hard cap 120s; `content-length` precheck before downloading;
-  actionable failure messages (FA#2: state what happened AND what to try next —
-  alternate endpoint / websearch).
-  `cli/src/general-tools.ts` + smoke coverage (timeout resolution, challenge
-  detection, retry bounds, honest-UA path, tool surface).
-
 ## [0.4.0] - 2026-08-29
 
 ### Added
@@ -164,6 +117,52 @@ the versions listed here (`scripts/package` derives the version from
   traversal still rejected, non-session names still error instead of a fake
   "removed"). Fixes `aih session rm *` where the shell expanded `*` into CWD
   files and the old per-file loop errored with no way to bulk-delete.
+
+- **Multi-strategy `best_of_n` (Freebuff FB#1, borrowed from CodebuffAI/freebuff
+  `editor-multi-prompt.ts`)**: pass `prompts` (an array of short strategy
+  prompts) and each candidate works the SHARED task context plus its own
+  strategy direction (candidate i follows `prompts[i % len]`) — wider
+  exploration than N samples of one prompt. The result carries `strategies`;
+  the judge labels each candidate with its strategy so it can weigh "right
+  approach" as well as "right answer". Omit `prompts` → unchanged
+  single-prompt behavior. `cli/src/maxmode.ts` + `cli/src/general-tools.ts`
+  + smoke coverage.
+- **Two-judge panel for `best_of_n` (Freebuff FB#2, borrowed from freebuff
+  BuffBench independent-judging)**: opt-in via `AIH_SECOND_JUDGE_MODEL`
+  (`buildJudge2Llm` reuses the primary model's provider/base-url/api-key,
+  only the model id differs). The two judges run in PARALLEL
+  (`Promise.allSettled`); the primary's pick is kept (median of two). A
+  disagreement or a failed judge is flagged (`judgeDegraded`) and warned on
+  stderr — a silently-dropped judge would turn the panel into one opinion.
+  Both judges failing → hard error. The panel is a generic `judgePanel<V>()`
+  helper so the `/goal` judge can share the same discipline (roadmap FB#6).
+  Absent → single-judge behavior (unchanged). `cli/src/maxmode.ts` +
+  `cli/src/index.ts` + smoke coverage (agreement / disagreement / second
+  failed / primary failed / both failed).
+- **Compaction "historical memory only" guard (Freebuff FB#3, borrowed from
+  freebuff `context-pruner.ts` summary positioning)**: the compaction
+  `SUMMARY_TEMPLATE` now tells the model the summary is HISTORICAL MEMORY
+  ONLY — not dialogue, not an output template, not a tool-call format;
+  continue from the live user message and use real tool calls when actions
+  are needed. Guards against the model copying the summary's structure into
+  its live output after compaction. `core/src/agent-loop.ts` + smoke
+  coverage.
+
+### Changed
+- **webfetch hardening (opencode/MiMo parity, zero new deps)**: the old
+  implementation was one-shot — a single 20s fetch with a bot UA, no Accept
+  header, body downloaded before the size check, and bare error text
+  ("webfetch failed: HTTP 403") that told the model nothing it could act on.
+  In flaky networks every transient blip became a visible failure. Now:
+  browser-grade UA + Accept/Accept-Language headers (bot-block resistance);
+  one bounded retry on network failures (connect/DNS/TLS/abort); Cloudflare
+  `403 + cf-mitigated: challenge` → honest-UA retry (opencode pattern);
+  configurable timeout — tool `timeout` arg (seconds) > `AIH_FETCH_TIMEOUT_MS`
+  > 30s default, hard cap 120s; `content-length` precheck before downloading;
+  actionable failure messages (FA#2: state what happened AND what to try next —
+  alternate endpoint / websearch).
+  `cli/src/general-tools.ts` + smoke coverage (timeout resolution, challenge
+  detection, retry bounds, honest-UA path, tool surface).
 
 ### Fixed
 - **Slash-command parsing**: pasted code whose comment starts with `//`
