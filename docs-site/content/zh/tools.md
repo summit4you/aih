@@ -16,11 +16,12 @@ AIH 的 agent 内核是**通用**的：工具来自外接应用（AppAdapter 的
 | `write_file` / `run_cmd` | 写文件 / 执行命令（默认 120s 超时，可传 `timeout_ms` 至 600s；后台子进程不阻塞） | ask |
 | `edit` | 精确字符串替换编辑（歧义时报错，`replace_all` 全替换） | ask |
 | `glob` / `grep` | 按模式找文件 / 正则搜内容 | allow |
-| `webfetch` / `websearch` | 抓 URL / 网页搜索 | allow |
+| `webfetch` / `websearch` | 抓 URL（浏览器级 UA、有界重试、Cloudflare 自愈、`timeout` 参数、可操作报错）/ 网页搜索 | allow |
 | `todo` | 会话任务清单（状态戳进 tool-result，随分支回退） | allow |
 | `remember` | 持久化知识到 memory.md（project / user 两级） | allow |
 | `load_skill` | 加载技能全文（去重，二次调用返回摘要） | allow |
-| `task` / `best_of_n` | 串行子代理 / 并行子代理 + 裁判（Max Mode） | ask |
+| `task` | 串行子代理（独立上下文、有界步数） | allow |
+| `best_of_n` | 并行子代理 + 裁判（Max Mode）；多策略 `prompts`（FB#1）+ 可选双裁判面板 `AIH_SECOND_JUDGE_MODEL`（FB#2） | allow |
 | `question` | 向用户提问并等待回答（交互式） | allow |
 
 ## 并行只读工具

@@ -1364,7 +1364,17 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
 
 {
   const { ToolRegistry, AutoApprove } = await import("@aih/core");
-  const { registerGeneralTools } = await import("./general-tools.js");
+  const {
+    registerGeneralTools,
+    resolveFetchTimeout,
+    isCloudflareChallenge,
+    fetchFailureMessage,
+    fetchWithRetry,
+    FETCH_UA_BROWSER,
+    FETCH_UA_HONEST,
+    FETCH_DEFAULT_TIMEOUT_MS,
+    FETCH_MAX_TIMEOUT_MS,
+  } = await import("./general-tools.js");
   const workdir = ".aih-smoke-general";
   rmSync(workdir, { recursive: true, force: true });
   mkdirSync(`${workdir}/src`, { recursive: true });
@@ -1580,6 +1590,77 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   );
   // read-only tools stay available in plan mode
   assert(planNames.has("glob") && planNames.has("grep"), "plan mode keeps read-only tools (glob, grep)");
+
+  // ── webfetch hardening (opencode/MiMo parity) ──────────────────────────────
+  // 1) timeout resolution: arg(s) > env(ms) > 30s default, hard cap 120s
+  assert(resolveFetchTimeout(undefined, undefined) === FETCH_DEFAULT_TIMEOUT_MS, "fetch timeout defaults to 30s");
+  assert(resolveFetchTimeout(undefined, "45000") === 45000, "fetch timeout honors AIH_FETCH_TIMEOUT_MS");
+  assert(resolveFetchTimeout(5, "45000") === 5000, "fetch timeout arg (seconds) wins over env");
+  assert(resolveFetchTimeout(999, undefined) === FETCH_MAX_TIMEOUT_MS, "fetch timeout capped at 120s");
+  assert(resolveFetchTimeout("garbage", undefined) === FETCH_DEFAULT_TIMEOUT_MS, "fetch timeout ignores bad arg");
+  assert(resolveFetchTimeout(10, "0") === 10000, "fetch timeout env 0 means 'unset'");
+
+  // 2) Cloudflare challenge detection
+  const cfRes = new Response(null, { status: 403, headers: { "cf-mitigated": "challenge" } });
+  assert(isCloudflareChallenge(cfRes), "cf-mitigated: challenge + 403 detected");
+  assert(!isCloudflareChallenge(new Response(null, { status: 403 })), "plain 403 is not a challenge");
+  assert(!isCloudflareChallenge(new Response(null, { status: 200, headers: { "cf-mitigated": "challenge" } })), "200 with header is not a challenge");
+
+  // 3) actionable failure messages (FA#2: tell the model what to DO)
+  const timeoutMsg = fetchFailureMessage(new DOMException("aborted", "AbortError"), "https://x.example", 30000);
+  assert(timeoutMsg.includes("timed out after 30s") && timeoutMsg.includes("websearch"), "timeout message is actionable");
+  const connMsg = fetchFailureMessage(new Error("fetch failed"), "https://x.example", 30000);
+  assert(connMsg.includes("connection failed") && connMsg.includes("alternate source"), "connection message is actionable");
+
+  // 4) one bounded retry on transient network failure (then success)
+  {
+    let calls = 0;
+    const flakyFetch: typeof fetch = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("fetch failed");
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    };
+    const res = await fetchWithRetry("https://flaky.example", { timeoutMs: 1000, fetchImpl: flakyFetch, delayMs: 0 });
+    assert(calls === 2 && res.status === 200, "transient failure is retried once and succeeds");
+  }
+  // 5) two failures → actionable error, no infinite retry
+  {
+    let calls = 0;
+    const deadFetch: typeof fetch = async () => {
+      calls += 1;
+      throw new Error("fetch failed");
+    };
+    let deadErr = "";
+    try {
+      await fetchWithRetry("https://dead.example", { timeoutMs: 1000, fetchImpl: deadFetch, delayMs: 0 });
+    } catch (e) {
+      deadErr = String((e as Error).message);
+    }
+    assert(calls === 2, "bounded: exactly one retry, no infinite loop");
+    assert(deadErr.includes("connection failed") && deadErr.includes("websearch"), "dead host yields actionable error");
+  }
+  // 6) Cloudflare challenge → honest-UA retry (opencode parity)
+  {
+    const seenUA: string[] = [];
+    const cfFetch: typeof fetch = async (_url, init) => {
+      const ua = String((init?.headers as Record<string, string>)?.["user-agent"] ?? "");
+      seenUA.push(ua);
+      if (ua === FETCH_UA_BROWSER) return new Response(null, { status: 403, headers: { "cf-mitigated": "challenge" } });
+      return new Response("passed", { status: 200, headers: { "content-type": "text/plain" } });
+    };
+    const res = await fetchWithRetry("https://cf.example", { timeoutMs: 1000, fetchImpl: cfFetch, delayMs: 0 });
+    assert(
+      res.status === 200 && seenUA.length === 2 && seenUA[0] === FETCH_UA_BROWSER && seenUA[1] === FETCH_UA_HONEST,
+      "challenge triggers exactly one honest-UA retry",
+    );
+  }
+  // 7) tool surface: timeout arg + hardened description
+  {
+    const wf = registry.get("webfetch")!;
+    const props = (wf.parameters as { properties: Record<string, unknown> }).properties;
+    assert("timeout" in props, "webfetch exposes a timeout argument");
+    assert(String(wf.description).includes("retry"), "webfetch description documents the retry behavior");
+  }
   rmSync(workdir, { recursive: true, force: true });
 }
 
@@ -3167,6 +3248,99 @@ await srv.connect(new StdioServerTransport());
     { turnId: "t", inject: () => {} },
   )) as { ok: boolean; error?: string };
   assert(!rf.ok && /all candidates failed/.test(rf.error ?? ""), "best_of_n reports all-candidates-failed when every subagent errors");
+
+  // --- Freebuff ① — multi-strategy best_of_n (one subagent per strategy) ----
+  {
+    const seen: string[] = [];
+    const stratLlm = {
+      complete: async (req: { tools: unknown[]; messages?: Array<{ content?: unknown }> }) => {
+        if (req.tools.length === 0) {
+          return { text: JSON.stringify({ best: 1, reason: "judge" }), toolCalls: [], stopReason: "end_turn" as const };
+        }
+        // messages[0] is the subagent system prompt; the task is a later user message.
+        const all = (req.messages ?? [])
+          .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+          .join("\n");
+        seen.push(all);
+        return { text: `s`, toolCalls: [], stopReason: "end_turn" as const };
+      },
+    };
+    const stratReg = new ToolRegistry(new AutoApprove());
+    registerGeneralTools(stratReg, { gate: new AutoApprove(), llm: stratLlm, toolsProvider: () => parent, cwd: "/tmp" });
+    const rstrat = (await stratReg.invoke(
+      "best_of_n",
+      { description: "strat", prompt: "answer this", n: 3, prompts: ["minimal change", "modularize", "cache it"] },
+      { turnId: "t", inject: () => {} },
+    )) as { ok: boolean; result?: { best: number; strategies?: string[] }; error?: string };
+    assert(rstrat.ok, `multi-strategy best_of_n runs (error: ${rstrat.error ?? "none"})`);
+    assert(
+      (rstrat.result?.strategies ?? []).join("|") === "minimal change|modularize|cache it",
+      "multi-strategy: strategies recorded on the result",
+    );
+    assert(seen.length === 3, "multi-strategy: every candidate got its own subagent call");
+    assert(seen.every((s) => s.includes("answer this")), "multi-strategy: shared task context present in every subagent");
+    assert(seen[0].includes("minimal change") && seen[1].includes("modularize") && seen[2].includes("cache it"), "multi-strategy: candidate i follows prompts[i]");
+    assert(seen[0].includes("Strategy for this run: minimal change"), "multi-strategy: strategy direction appended to the shared context");
+  }
+
+  // --- Freebuff ② — dual-judge panel (agreement / disagreement / fallback) ---
+  {
+    const mk = (judgeBest: number) => ({
+      complete: async (req: { tools: unknown[] }) => {
+        if (req.tools.length === 0) {
+          return { text: JSON.stringify({ best: judgeBest, reason: `judge-${judgeBest}` }), toolCalls: [], stopReason: "end_turn" as const };
+        }
+        return { text: "c", toolCalls: [], stopReason: "end_turn" as const };
+      },
+    });
+    const reg = (judge2: import("@aih/core").LLMAdapter) => {
+      const g = new AutoApprove();
+      const reg = new ToolRegistry(g);
+      registerGeneralTools(reg, { gate: g, llm: mk(1), toolsProvider: () => parent, cwd: "/tmp", judge2 });
+      return reg;
+    };
+    type BonResult = { ok: boolean; result?: { best: number; judgeDegraded?: boolean; judgeReason: string }; error?: string };
+
+    // both agree → clean, no degraded flag
+    const agree = (await reg(mk(1)).invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
+    assert(agree.ok && agree.result!.best === 1 && agree.result!.judgeDegraded !== true, "dual-judge: agreement keeps the pick, not degraded");
+    assert(/\[both judges agree\]/.test(agree.result!.judgeReason), "dual-judge: agreement is labelled in judgeReason");
+
+    // disagree → primary kept, FLAGGED
+    const dis = (await reg(mk(0)).invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
+    assert(dis.ok && dis.result!.best === 1, "dual-judge: disagreement keeps the PRIMARY's pick");
+    assert(dis.result!.judgeDegraded === true, "dual-judge: disagreement is flagged (judgeDegraded)");
+    assert(/\[judge panel degraded/.test(dis.result!.judgeReason), "dual-judge: disagreement labelled in judgeReason");
+
+    // second judge fails → primary kept, FLAGGED
+    const secFail = (await reg({ complete: async () => { throw new Error("2nd down"); } }).invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
+    assert(secFail.ok && secFail.result!.best === 1 && secFail.result!.judgeDegraded === true, "dual-judge: second judge failed → single-opinion verdict, flagged");
+
+    // primary fails → second decides, FLAGGED
+    const regPrimFail = new ToolRegistry(new AutoApprove());
+    registerGeneralTools(regPrimFail, {
+      gate: new AutoApprove(),
+      llm: { complete: async (req: { tools: unknown[] }) => { if (req.tools.length === 0) throw new Error("primary down"); return { text: "c", toolCalls: [], stopReason: "end_turn" as const }; } },
+      toolsProvider: () => parent,
+      cwd: "/tmp",
+      judge2: mk(0),
+    });
+    const primFail = (await regPrimFail.invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
+    assert(primFail.ok && primFail.result!.best === 0 && primFail.result!.judgeDegraded === true, "dual-judge: primary failed → secondary decides, flagged");
+
+    // both fail → hard error (subagent must SUCCEED so we reach the judge;
+    // only the no-tools judge calls throw)
+    const regBoth = new ToolRegistry(new AutoApprove());
+    const judgeDown = {
+      complete: async (req: { tools: unknown[] }) => {
+        if (req.tools.length === 0) throw new Error("judge down");
+        return { text: "c", toolCalls: [], stopReason: "end_turn" as const };
+      },
+    };
+    registerGeneralTools(regBoth, { gate: new AutoApprove(), llm: judgeDown, toolsProvider: () => parent, cwd: "/tmp", judge2: judgeDown });
+    const both = (await regBoth.invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
+    assert(both.ok === false && /both judges failed/.test(both.error ?? ""), "dual-judge: both judges failed → hard error");
+  }
 
   // CC#50 — subagent partial-results honesty marking.
   {

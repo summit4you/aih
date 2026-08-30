@@ -1082,6 +1082,7 @@ const compactLog = new SessionLog();
 const compactTools = new ToolRegistry(gate);
 compactTools.register(echo);
 let lastCompactReq: ChatMessage[] | undefined;
+const compactReqs: ChatMessage[][] = [];
 const compactScripted = new MockLLM([
   {
     text: "calling echo",
@@ -1093,7 +1094,7 @@ const compactScripted = new MockLLM([
   { text: "Done.", stopReason: "end_turn" },
 ]);
 const compactLoop = new AgentLoop({
-  llm: { complete: (req) => { lastCompactReq = req.messages; return compactScripted.complete(req); } },
+  llm: { complete: (req) => { lastCompactReq = req.messages; compactReqs.push(req.messages); return compactScripted.complete(req); } },
   tools: compactTools,
   log: compactLog,
   systemPrompt: "sys",
@@ -1119,6 +1120,14 @@ assert(orphaned === 0, "compaction mid tool-chain leaves no orphan tool messages
 assert(
   req.some((m) => typeof m.content === "string" && m.content.includes("SUMMARY")),
   "post-compaction request carries the summary",
+);
+// Freebuff ③ — the compaction prompt must tell the model the summary is
+// HISTORICAL MEMORY ONLY: not dialogue, not an output template, not a
+// tool-call format. Guards against the model copying the summary's
+// structure into its live output after compaction.
+assert(
+  compactReqs.some((r) => r.some((m) => typeof m.content === "string" && m.content.includes("Historical memory only"))),
+  "compaction summarization prompt carries the historical-memory-only guard",
 );
 assert(
   compactResult.contextNow != null && compactResult.contextNow < 900,

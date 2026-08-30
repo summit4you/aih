@@ -15,11 +15,12 @@ AIH's agent kernel is **general**: tools come from the connected app (AppAdapter
 | `write_file` / `run_cmd` | write file / run command (default 120s timeout, `timeout_ms` up to 600s; background children don't block) | ask |
 | `edit` | exact string-replace edit (errors on ambiguity, `replace_all` for all) | ask |
 | `glob` / `grep` | find files by pattern / regex content search | allow |
-| `webfetch` / `websearch` | fetch URL / web search | allow |
+| `webfetch` / `websearch` | fetch URL (browser UA, bounded retry, Cloudflare self-heal, `timeout` arg, actionable errors) / web search | allow |
 | `todo` | session task list (state stamped into tool-result, rolls back with branches) | allow |
 | `remember` | persist knowledge to memory.md (project / user tiers) | allow |
 | `load_skill` | load a skill's full text (dedup; second call returns the summary) | allow |
-| `task` / `best_of_n` | serial subagent / parallel subagents + judge (Max Mode) | ask |
+| `task` | serial subagent (own context, bounded steps) | allow |
+| `best_of_n` | parallel subagents + judge (Max Mode); multi-strategy `prompts` (FB#1) + optional two-judge panel via `AIH_SECOND_JUDGE_MODEL` (FB#2) | allow |
 | `question` | ask the user and wait for an answer (interactive) | allow |
 
 ## Parallel read-only tools

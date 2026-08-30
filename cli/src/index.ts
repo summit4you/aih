@@ -39,6 +39,7 @@ import {
 } from "@aih/core";
 import type {
   ApprovalGate,
+  LLMAdapter,
   SessionEvent,
   ToolDefinition,
   ToolHookInfo,
@@ -539,6 +540,24 @@ export function buildLlm(flags: Record<string, string | boolean>) {
 }
 
 /**
+ * LLM for the SECOND judge of the `best_of_n` two-judge panel (Freebuff
+ * BuffBench parity). Opt-in via `AIH_SECOND_JUDGE_MODEL` — unset/empty →
+ * `undefined` → `best_of_n` runs single-judge (unchanged). Reuses the
+ * provider/base-url/api-key resolution of the primary model, only the model id
+ * differs. In `--mock` mode it returns a MockLLM (so the panel is testable
+ * without a key).
+ */
+export function buildJudge2Llm(flags: Record<string, string | boolean>): LLMAdapter | undefined {
+  const model = process.env.AIH_SECOND_JUDGE_MODEL?.trim();
+  if (!model) return undefined;
+  if (bool(flags, "mock")) {
+    const aux = process.env.AIH_MOCK_AUX_TEXT;
+    return new MockLLM(aux ? [{ text: aux, stopReason: "end_turn" as const }] : [{ text: "", stopReason: "end_turn" as const }]);
+  }
+  return buildRealLlm({ ...flags, model });
+}
+
+/**
  * LLM for standalone AUXILIARY calls (branch distiller): one tool-less
  * completion. In mock mode the whole script IS the aux reply (AIH_MOCK_AUX_TEXT),
  * so a single-call consumer gets it on the first try.
@@ -910,6 +929,9 @@ export function registerLocalTools(
       // registry in every path); absent → shell_context reports "not wired".
       logProvider: logRef ? () => logRef.current ?? undefined : undefined,
       ask: (q) => (tuiRef.current ? tuiRef.current.askQuestion(q) : makeStdinAsk(q)),
+      // Two-judge panel for best_of_n (Freebuff BuffBench parity): opt-in via
+      // AIH_SECOND_JUDGE_MODEL; absent → single judge (unchanged).
+      judge2: () => buildJudge2Llm(flags),
       // D#11: builtin hooks (redaction+timing) first, then the audit consumer.
       // Compose the after-waterfall manually (spread would drop the builtin
       // `after` when audit is enabled).

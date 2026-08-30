@@ -32,6 +32,14 @@ export interface GeneralToolsOptions {
    * the closure resolves at call time. Absent → `shell_context` is a no-op.
    */
   logProvider?: () => { all: () => readonly import("@aih/core").SessionEvent[] } | undefined;
+  /**
+   * Optional SECOND judge for `best_of_n` (Freebuff BuffBench two-judge
+   * panel). Absent → single-judge mode (unchanged). Passed as a value or a
+   * factory (resolved at call time, like `llm`). When present the two judges
+   * run in parallel; a disagreement or a failed judge is flagged
+   * (`judgeDegraded`) and warned, never silently dropped.
+   */
+  judge2?: LLMAdapter | (() => LLMAdapter | undefined);
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn", "dist", "build"]);
@@ -145,6 +153,106 @@ function htmlToText(html: string): { title: string; text: string } {
   const main = /<main[\s\S]*?<\/main>/i.exec(html) ?? /<article[\s\S]*?<\/article>/i.exec(html);
   if (main) body = main[0];
   return { title: decodeEntities(title), text: stripTags(body).replace(/\n{3,}/g, "\n\n").trim() };
+}
+
+// ── webfetch hardening (opencode/MiMo `tool/webfetch.ts` parity) ─────────────
+// The old implementation was one-shot: a single 20s fetch with a bot UA, no
+// retries, no Accept header, body downloaded before the size check, and bare
+// error text ("webfetch failed: HTTP 403") that told the model nothing it
+// could act on. In flaky networks that turned every transient blip into a
+// visible failure. The seam below fixes that with zero new dependencies:
+//   1. browser-grade UA + Accept/Accept-Language headers (bot-block resistance)
+//   2. one bounded retry on network failures (connect/DNS/TLS/abort)
+//   3. Cloudflare 403 + `cf-mitigated: challenge` → honest-UA retry (opencode)
+//   4. configurable timeout: arg (s) > AIH_FETCH_TIMEOUT_MS > 30s, cap 120s
+//   5. content-length precheck before downloading the body
+//   6. actionable failure messages (FA#2 principle: tell the model what to DO)
+export const FETCH_UA_BROWSER =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+export const FETCH_UA_HONEST = "aih (+harness)";
+export const FETCH_ACCEPT_TEXT = "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1";
+export const FETCH_DEFAULT_TIMEOUT_MS = 30_000;
+export const FETCH_MAX_TIMEOUT_MS = 120_000;
+export const FETCH_RETRY_DELAY_MS = 500;
+
+/** arg (seconds) > AIH_FETCH_TIMEOUT_MS (ms) > 30s default; hard cap 120s. */
+export function resolveFetchTimeout(argSeconds: unknown, envMs?: string): number {
+  let ms = FETCH_DEFAULT_TIMEOUT_MS;
+  const env = Number(envMs ?? "");
+  if (Number.isFinite(env) && env > 0) ms = env;
+  const arg = Number(argSeconds);
+  if (Number.isFinite(arg) && arg > 0) ms = arg * 1000;
+  return Math.min(ms, FETCH_MAX_TIMEOUT_MS);
+}
+
+export function isCloudflareChallenge(res: Response): boolean {
+  return res.status === 403 && String(res.headers.get("cf-mitigated") ?? "").toLowerCase().includes("challenge");
+}
+
+/** Actionable failure text (FA#2): state what happened AND what to try next. */
+export function fetchFailureMessage(err: unknown, url: string, timeoutMs: number): string {
+  const name = err instanceof Error ? err.name : "";
+  const msg = err instanceof Error ? err.message : String(err);
+  if (name === "AbortError" || /abort/i.test(msg)) {
+    return `webfetch timed out after ${Math.round(timeoutMs / 1000)}s: ${url}. The site may be unreachable from this network or very slow. Try a different endpoint (e.g. api.github.com instead of github.com), use websearch for an alternate source, or retry later.`;
+  }
+  if (/fetch failed/i.test(msg)) {
+    return `webfetch connection failed for ${url} (DNS/TLS/network). This host may be blocked from the current network. Try a different endpoint, use websearch for an alternate source, or retry later.`;
+  }
+  return `webfetch failed: ${msg}`;
+}
+
+export interface FetchWithRetryOptions {
+  timeoutMs: number;
+  /** injectable for tests (default: global fetch) */
+  fetchImpl?: typeof fetch;
+  /** retry backoff in ms (default 500; pass 0 in tests) */
+  delayMs?: number;
+}
+
+/**
+ * One fetch with bounded self-healing: retry once on network failure, and on
+ * a Cloudflare TLS-fingerprint challenge retry with an honest UA (opencode
+ * parity). Returns the Response — the caller still checks `res.ok`.
+ */
+export async function fetchWithRetry(url: string, opts: FetchWithRetryOptions): Promise<Response> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const delayMs = opts.delayMs ?? FETCH_RETRY_DELAY_MS;
+  const headers: Record<string, string> = {
+    "user-agent": FETCH_UA_BROWSER,
+    accept: FETCH_ACCEPT_TEXT,
+    "accept-language": "en-US,en;q=0.9",
+  };
+  const attempt = async (h: Record<string, string>): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+    try {
+      return await fetchImpl(url, { signal: controller.signal, redirect: "follow", headers: h });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let res: Response;
+  try {
+    res = await attempt(headers);
+  } catch (first) {
+    // bounded single retry for transient network failures (connect/DNS/TLS/abort)
+    await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      res = await attempt(headers);
+    } catch (second) {
+      throw new Error(fetchFailureMessage(second, url, opts.timeoutMs));
+    }
+  }
+  if (isCloudflareChallenge(res)) {
+    try {
+      const alt = await attempt({ ...headers, "user-agent": FETCH_UA_HONEST });
+      if (alt.status !== 403) return alt;
+    } catch (e) {
+      throw new Error(fetchFailureMessage(e, url, opts.timeoutMs));
+    }
+  }
+  return res;
 }
 
 function readToolFile(cwd: string, p: unknown): { file: string; text: string } {
@@ -435,7 +543,10 @@ export function registerGeneralTools(
 
   reg({
     name: "webfetch",
-    description: "Fetch a URL and return its text content (HTML converted to plain text, max ~64KB).",
+    description:
+      "Fetch a URL and return its text content (HTML converted to plain text, max ~64KB). " +
+      "Hardened: browser UA + Accept headers, one bounded network retry, Cloudflare-challenge self-heal, " +
+      "configurable timeout. On failure the error says what to try next (alternate endpoint / websearch).",
     kind: "read",
     permission: "allow",
     parameters: {
@@ -443,25 +554,36 @@ export function registerGeneralTools(
       properties: {
         url: { type: "string", description: "absolute http(s) URL" },
         format: { type: "string", enum: ["text", "markdown"], description: "output format (default text)" },
+        timeout: {
+          type: "number",
+          description: "optional timeout in seconds (default 30, max 120; AIH_FETCH_TIMEOUT_MS overrides the default)",
+        },
       },
       required: ["url"],
     },
     execute: async (args) => {
-      const a = args as { url?: unknown };
+      const a = args as { url?: unknown; timeout?: unknown };
       const url = String(a.url ?? "");
       if (!/^https?:\/\//.test(url)) throw new Error("url must be absolute http(s)");
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20_000);
+      const timeoutMs = resolveFetchTimeout(a.timeout, process.env.AIH_FETCH_TIMEOUT_MS);
       let res: Response;
       try {
-        res = await fetch(url, { signal: controller.signal, redirect: "follow", headers: { "user-agent": "aih/0.2 (+harness)" } });
-      } finally {
-        clearTimeout(timer);
+        res = await fetchWithRetry(url, { timeoutMs });
+      } catch (e) {
+        throw e instanceof Error ? e : new Error(fetchFailureMessage(e, url, timeoutMs));
       }
-      if (!res.ok) throw new Error(`webfetch failed: HTTP ${res.status}`);
+      if (!res.ok) {
+        const cf = isCloudflareChallenge(res) ? " (Cloudflare bot challenge — the site is blocking non-browser clients)" : "";
+        throw new Error(`webfetch failed: HTTP ${res.status}${cf}. Try a different endpoint (e.g. api.github.com instead of github.com) or use websearch for an alternate source.`);
+      }
       const type = res.headers.get("content-type") ?? "";
+      // content-length precheck (opencode parity): refuse before downloading
+      const cl = Number(res.headers.get("content-length") ?? "");
+      if (Number.isFinite(cl) && cl > MAX_FETCH_BYTES) {
+        throw new Error(`content too large: ${cl} bytes (limit ${MAX_FETCH_BYTES}); fetch a more specific page or use websearch`);
+      }
       const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > MAX_FETCH_BYTES) throw new Error(`content too large: ${buf.byteLength} bytes`);
+      if (buf.byteLength > MAX_FETCH_BYTES) throw new Error(`content too large: ${buf.byteLength} bytes (limit ${MAX_FETCH_BYTES})`);
       const raw = buf.toString("utf8");
       if (type.includes("html")) {
         const { title, text } = htmlToText(raw);
@@ -735,8 +857,10 @@ export function registerGeneralTools(
   reg({
     name: "best_of_n",
     description:
-      "Max Mode: run N independent subagents in parallel on the same prompt and let a judge " +
-      "pick the best answer (bounded concurrency, AIH_TOOL_CONCURRENCY). " +
+      "Max Mode: run N independent subagents in parallel and let a judge pick the best answer " +
+      "(bounded concurrency, AIH_TOOL_CONCURRENCY). By default all N work on the same prompt; " +
+      "pass `prompts` (an array of short strategy prompts) to run one subagent PER STRATEGY " +
+      "(multi-strategy mode, wider exploration) — candidate i follows prompts[i % len]. " +
       "Use for high-stakes answers where one shot is not enough.",
     kind: "read",
     permission: "allow",
@@ -744,13 +868,20 @@ export function registerGeneralTools(
       type: "object",
       properties: {
         description: { type: "string", description: "short (3-8 word) task label" },
-        prompt: { type: "string", description: "full instructions for every subagent" },
+        prompt: { type: "string", description: "full instructions for every subagent (or the shared context when `prompts` is given)" },
+        prompts: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "optional: one short implementation-strategy prompt per candidate (e.g. \"minimal change\", \"modularize into new files\", \"use a cache\"). " +
+            "Candidate i follows prompts[i % length]; omit to run all N on the same `prompt`.",
+        },
         n: { type: "number", description: "number of parallel candidates (default 3, max 8)" },
       },
       required: ["description", "prompt"],
     },
     execute: async (args) => {
-      const a = args as { description?: unknown; prompt?: unknown; n?: unknown };
+      const a = args as { description?: unknown; prompt?: unknown; n?: unknown; prompts?: unknown };
       const prompt = String(a.prompt ?? "");
       if (!prompt) throw new Error("best_of_n requires a prompt");
       if (!opts.gate || !opts.llm || !opts.toolsProvider) {
@@ -758,11 +889,18 @@ export function registerGeneralTools(
       }
       const llm = typeof opts.llm === "function" ? opts.llm() : opts.llm;
       const n = Math.max(1, Math.min(8, Math.floor(Number(a.n ?? "") || 3)));
+      const strategies = Array.isArray(a.prompts)
+        ? a.prompts.map((p) => String(p).trim()).filter((p) => p.length > 0)
+        : undefined;
+      const judge2 =
+        typeof opts.judge2 === "function" ? opts.judge2() : opts.judge2;
       const result = await bestOfN(
         { gate: opts.gate, llm, toolsProvider: opts.toolsProvider, hooks: opts.hooks },
         prompt,
         n,
         String(a.description ?? ""),
+        strategies,
+        judge2,
       );
       if (result.best < 0) throw new Error(`best_of_n: ${result.judgeReason}`);
       return result;

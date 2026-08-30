@@ -569,6 +569,20 @@ LLM 裁判调用从候选答案里选出最佳（`{"best": <index>, "reason": ".
 `ToolRegistry`。冒烟覆盖：裁判解析/越界回退、`mapOrdered` 顺序与并发上限、
 N=3 全流程、n 钳制、全失败路径、子代理防递归（剔除 task/question/best_of_n）。
 
+两个可选增强（借鉴 CodebuffAI/freebuff，roadmap FB#1 / FB#2）：
+
+- **多策略模式（FB#1）**：传 `prompts`（一组短策略提示）后，候选 i 在**共享
+  任务上下文**之上叠加自己的策略方向（`prompts[i % len]`）——比 N 个同 prompt
+  采样探索面更广。结果带 `strategies` 字段，裁判给每个候选标注
+  `[strategy: …]`，可权衡"方法对不对"而非只看"答案对不对"。省略 `prompts`
+  → 单 prompt 行为不变。
+- **双裁判面板（FB#2）**：设 `AIH_SECOND_JUDGE_MODEL` 后启用第二裁判——两裁判
+  **并行**（`Promise.allSettled`），保留主裁判的选择（两个意见的中位）；**分歧**
+  或**任一裁判失败**都标记 `judgeDegraded` 并在 stderr 警告（绝不静默丢弃一个
+  裁判——丢弃 = 面板退化成单意见）；双裁判都失败 → 硬错误。缺省 → 单裁判
+  行为不变。面板是通用 `judgePanel<V>()`，`/goal` 裁判可共用同一套纪律
+  （roadmap FB#6）。
+
 ### Agent Teams（roster + 任务板 + mailbox）
 
 在子代理原语之上的协作层（roadmap D#15）：`.aih/team/` 下的纯文件团队工作区，
@@ -690,7 +704,7 @@ AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认
 | `todo` | 任务清单（`.aih/todos.json`，至多一个 in_progress） | allow |
 | `remember` | 项目记忆：追加/重写 `.aih/memory.md`，跨会话持久化知识 | allow |
 | `question` | 模型向用户提问并等待回答（TUI 内联问答行） | allow |
-| `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断） | allow |
+| `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断）。浏览器级 UA + Accept 头、网络失败有界重试 1 次、Cloudflare 403 challenge 自动换诚实 UA 重试、`timeout` 参数（秒，默认 30、上限 120）、下载前 content-length 预检、失败信息可操作（提示替代端点/websearch） | allow |
 | `websearch` | DuckDuckGo 搜索（标题/URL/摘要，免 key） | allow |
 | `task` | 派发子代理（独立上下文、≤8 步、不可再嵌套） | allow* |
 | `apply_patch` | 多文件补丁（Add/Update/Delete/Move，opencode 格式） | ask |
@@ -815,7 +829,9 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd 默认超时 |
 | `AIH_TOOL_CONCURRENCY` (4) | 单步内连续只读工具调用的并发上限（写类恒串行） |
 | `AIH_FORMAT_TIMEOUT_MS` (15000) | 写后自动格式化超时（失败不阻断写入） |
+| `AIH_FETCH_TIMEOUT_MS` (30000) | webfetch 默认超时（工具 `timeout` 参数优先；硬上限 120000） |
 | `AIH_MOCK_AUX_TEXT` | mock 模式下无工具辅助调用（goal 裁判 / 分支蒸馏）的回复文本（测试钩子） |
+| `AIH_SECOND_JUDGE_MODEL` | `best_of_n` 第二裁判的 model id（FB#2 双裁判面板；复用主模型的 provider/base-url/api-key，缺省 → 单裁判） |
 | `AIH_BUDGET` | PE#2 预算硬约束：JSON 或 `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b`（越界→escalate 退出码 3） |
 | `AIH_SENSORS` | PE#1 计算式传感器：SensorConfig JSON 数组或单对象（写后验证命令，红→有界重试→升级） |
 | `AIH_SENSOR_RETRIES` (1) | PE#1 传感器红→升级前的重试次数 |

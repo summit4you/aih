@@ -85,6 +85,8 @@ Besides `-s/--server` for a single MCP server, you can declare **multiple** MCP 
 | `AIH_BASE_URL` | OpenAI-compatible endpoint |
 | `AIH_TODO_STORE` | persist the example app's state across processes |
 | `AIH_TOOL_CONCURRENCY` | max parallel read-only tools (default 4) |
+| `AIH_FETCH_TIMEOUT_MS` | webfetch default timeout (tool `timeout` arg wins; hard cap 120000, default 30000) |
+| `AIH_SECOND_JUDGE_MODEL` | `best_of_n` second-judge model id (FB#2 two-judge panel; reuses the primary model's provider/base-url/api-key; unset → single judge) |
 | `AIH_SANDBOX` | `run_cmd` backend: local / bwrap / remote |
 | `AIH_BUDGET` | PE#2 budget hard bounds: JSON or `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b` (exceeded → escalate, exit 3) |
 | `AIH_SENSORS` | PE#1 post-write sensors: SensorConfig JSON array or object (red → bounded retry → escalate) |

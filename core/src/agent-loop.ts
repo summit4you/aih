@@ -240,7 +240,8 @@ Rules:
 - Keep every section, even when empty.
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
-- Do not mention the summary process or that context was compacted.`;
+- Do not mention the summary process or that context was compacted.
+- Historical memory only. The summary is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below; when actions are needed, use real tool calls.`;
 
 const SUMMARY_UPDATE_INSTRUCTIONS = `The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
 

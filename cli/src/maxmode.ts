@@ -110,25 +110,58 @@ export interface BestOfNResult {
   best: number;
   judgeReason: string;
   answer: string;
+  /** Per-candidate strategy prompts (multi-strategy mode; absent = all same prompt). */
+  strategies?: string[];
+  /**
+   * Set when the verdict did not come from a clean single-judge call: the
+   * primary judge failed and the fallback judge decided, or a second judge
+   * was consulted and disagreed (primary's pick kept). Never silent — the
+   * panel degrading to one opinion is a fact the caller should see.
+   */
+  judgeDegraded?: boolean;
 }
 
 /**
- * Run N parallel subagents on `prompt` and let a judge pick the best answer.
+ * Run N parallel subagents and let a judge pick the best answer.
  * Concurrency is capped by AIH_TOOL_CONCURRENCY (default 4) so a large N
  * never floods the provider.
+ *
+ * Multi-strategy mode (Freebuff `editor-multi-prompt` /
+ * `code-reviewer-multi-prompt` parity): pass `prompts` and candidate `i`
+ * works on `prompts[i % prompts.length]` — N different implementation
+ * strategies explore a wider solution space than N samples of one prompt.
+ * Without `prompts`, every candidate gets the same `prompt` (original
+ * best-of-N sampling behavior).
  */
 export async function bestOfN(
   opts: SubagentOptions,
   prompt: string,
   n = 3,
   description = "",
+  prompts?: string[],
+  /**
+   * Optional second judge (Freebuff BuffBench parity). Runs in PARALLEL with
+   * the primary (opts.llm); the primary's pick is kept (median of two). A
+   * disagreement or a failed judge is flagged (`judgeDegraded`) and warned —
+   * a silently-dropped judge would turn the panel into one opinion. Absent →
+   * single-judge behavior (unchanged).
+   */
+  judge2?: LLMAdapter,
 ): Promise<BestOfNResult> {
+  const strategies = prompts && prompts.length > 0 ? prompts : undefined;
+  // Multi-strategy mode: each candidate still gets the SHARED task context,
+  // plus its own strategy direction (the strategy refines, it does not
+  // replace the task). Single-prompt mode: the prompt as-is.
+  const strategyFor = (i: number): string =>
+    strategies
+      ? `${prompt}\n\nStrategy for this run: ${strategies[i % strategies.length] ?? ""}`
+      : prompt;
   const cap = Math.max(1, Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4);
   const limit = Math.min(n, cap);
   const candidates: Candidate[] = await mapOrdered(
     Array.from({ length: n }, (_, i) => async () => {
       try {
-        const r = await runSubagent(opts, prompt);
+        const r = await runSubagent(opts, strategyFor(i));
         return { index: i, ok: true, answer: r.answer, steps: r.steps, stopReason: r.stopReason };
       } catch (err) {
         return {
@@ -144,7 +177,7 @@ export async function bestOfN(
     limit,
   );
 
-  const base = { description, n, concurrency: limit, candidates };
+  const base = { description, n, concurrency: limit, candidates, ...(strategies ? { strategies } : {}) };
   const okIdx = candidates.filter((c) => c.ok).map((c) => c.index);
   if (okIdx.length === 0) {
     return { ...base, best: -1, judgeReason: "all candidates failed", answer: "" };
@@ -157,17 +190,21 @@ export async function bestOfN(
   // Judge: one no-tools LLM call picks the best index (same pattern as /goal).
   // CC#50 — annotate partial candidates so the judge does not prefer a
   // truncated-but-looks-complete answer over a genuinely finished one.
+  // Multi-strategy mode: label each candidate with the strategy it was asked
+  // to follow, so the judge can weigh "right approach" as well as "right answer".
+  const strategyLine = (i: number): string =>
+    strategies ? ` [strategy: ${strategies[i % strategies.length] ?? ""}]\n` : "\n";
   const body = okIdx
     .map((i) => {
       const c = candidates[i];
       const flag = c.stopReason === "end_turn" ? "" : "[PARTIAL — subagent did not finish; treat as incomplete]\n";
-      return `### Candidate ${i}\n${flag}${c.answer}`;
+      return `### Candidate ${i}${strategyLine(i)}${flag}${c.answer}`;
     })
     .join("\n\n");
-  const resp = await opts.llm.complete({
+  const judgeReq = {
     messages: [
       {
-        role: "user",
+        role: "user" as const,
         content:
           `You are the judge for a best-of-N run. The task was:\n\n${prompt}\n\n` +
           `Independent subagents produced these candidate answers:\n\n${body}\n\n` +
@@ -176,10 +213,74 @@ export async function bestOfN(
       },
     ],
     tools: [],
-  });
-  const { best, reason } = parseJudgeVerdict(resp.text, n);
+  };
+  // Two-judge panel (Freebuff BuffBench parity): primary = opts.llm, optional
+  // second judge cross-checks. A silently-dropped judge would turn the panel
+  // into one opinion — so every degraded path is flagged (judgeDegraded) and
+  // warned on stderr.
+  const panel = await judgePanel(
+    opts.llm,
+    judgeReq,
+    (text) => parseJudgeVerdict(text, n),
+    judge2,
+    "best_of_n",
+    (a, b) => a.best === b.best,
+  );
+  const primary = panel.verdict;
+  const second = panel.second;
   // The judge may name a failed/out-of-range candidate — fall back to the
   // first successful one.
-  const chosen = candidates[best] && candidates[best].ok ? best : okIdx[0];
-  return { ...base, best: chosen, judgeReason: reason, answer: candidates[chosen].answer };
+  const chosen = candidates[primary.best] && candidates[primary.best].ok ? primary.best : okIdx[0];
+  const judgeReason = panel.degraded
+    ? `[judge panel degraded — single opinion or disagreement, primary kept] ${primary.reason}`
+    : second
+      ? `[both judges agree] ${primary.reason}`
+      : primary.reason;
+  return { ...base, best: chosen, judgeReason, answer: candidates[chosen].answer, ...(panel.degraded ? { judgeDegraded: true } : {}) };
+}
+
+/**
+ * Two-judge panel (Freebuff BuffBench parity). Runs the primary and optional
+ * secondary judges in PARALLEL (Promise.allSettled), keeps the PRIMARY's
+ * verdict (the median of two), and never lets a judge silently drop out — a
+ * dropped judge turns the panel into a single opinion. Every degraded path
+ * (disagreement, one judge failed) is returned as `degraded: true` AND warned
+ * on stderr. `secondary === undefined` → single-judge mode (unchanged).
+ *
+ * Generic over the verdict shape so both `best_of_n` (`{best,reason}`) and the
+ * goal judge (`{met,reason,unmet}`) share the same panel discipline.
+ */
+export async function judgePanel<V>(
+  primary: LLMAdapter,
+  req: Parameters<LLMAdapter["complete"]>[0],
+  parse: (text: string) => V,
+  secondary?: LLMAdapter,
+  label = "judge",
+  same: (a: V, b: V) => boolean = (a, b) => JSON.stringify(a) === JSON.stringify(b),
+): Promise<{ verdict: V; second?: V; degraded: boolean }> {
+  if (!secondary) {
+    const resp = await primary.complete(req);
+    return { verdict: parse(resp.text), degraded: false };
+  }
+  const [p, s] = await Promise.allSettled([primary.complete(req), secondary.complete(req)]);
+  const reason = (r: PromiseSettledResult<unknown>) =>
+    r.status === "rejected" ? (r.reason instanceof Error ? r.reason.message : String(r.reason)) : "unknown";
+  if (p.status === "fulfilled" && s.status === "fulfilled") {
+    const verdict = parse(p.value.text);
+    const second = parse(s.value.text);
+    const degraded = !same(verdict, second);
+    if (degraded) {
+      process.stderr.write(`warning: ${label} panel — the two judges disagreed; keeping the primary's verdict\n`);
+    }
+    return { verdict, second, degraded };
+  }
+  if (p.status === "fulfilled") {
+    process.stderr.write(`warning: ${label} panel — secondary judge failed (${reason(s)}); verdict rests on a single judge\n`);
+    return { verdict: parse(p.value.text), degraded: true };
+  }
+  if (s.status === "fulfilled") {
+    process.stderr.write(`warning: ${label} panel — primary judge failed (${reason(p)}); verdict rests on the secondary judge\n`);
+    return { verdict: parse(s.value.text), degraded: true };
+  }
+  throw new Error(`${label} panel: both judges failed: ${reason(p)} / ${reason(s)}`);
 }

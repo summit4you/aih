@@ -100,6 +100,8 @@ AIH_HOME  >  $XDG_DATA_HOME/aih  >  ~/.local/share/aih
 | `AIH_CMD_TIMEOUT_MS` | `120000` | run_cmd 默认超时 |
 | `AIH_TOOL_CONCURRENCY` | `4` | 单步内连续只读工具调用的并发上限（写类恒串行） |
 | `AIH_FORMAT_TIMEOUT_MS` | `15000` | 写后自动格式化超时（失败不阻断写入） |
+| `AIH_FETCH_TIMEOUT_MS` | `30000` | webfetch 默认超时（工具 `timeout` 参数优先；硬上限 120000） |
+| `AIH_SECOND_JUDGE_MODEL` | — | `best_of_n` 第二裁判 model id（FB#2 双裁判面板；复用主模型的 provider/base-url/api-key；缺省 → 单裁判） |
 | `AIH_TODO_STORE` | — | 示例应用状态持久化路径（跨进程保留） |
 | `AIH_BUDGET` | — | PE#2 预算硬边界：JSON 或 `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b`（越界→escalate，退出码 3） |
 | `AIH_SENSORS` | — | PE#1 写后传感器：SensorConfig JSON 数组或对象（红→有界重试→升级） |
