@@ -101,6 +101,11 @@ AIH_HOME  >  $XDG_DATA_HOME/aih  >  ~/.local/share/aih
 | `AIH_TOOL_CONCURRENCY` | `4` | 单步内连续只读工具调用的并发上限（写类恒串行） |
 | `AIH_FORMAT_TIMEOUT_MS` | `15000` | 写后自动格式化超时（失败不阻断写入） |
 | `AIH_TODO_STORE` | — | 示例应用状态持久化路径（跨进程保留） |
+| `AIH_BUDGET` | — | PE#2 预算硬边界：JSON 或 `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b`（越界→escalate，退出码 3） |
+| `AIH_SENSORS` | — | PE#1 写后传感器：SensorConfig JSON 数组或对象（红→有界重试→升级） |
+| `AIH_SENSOR_RETRIES` | `1` | PE#1 传感器红重试次数（之后升级） |
+| `AIH_SENSOR_TIMEOUT_MS` | `60000` | PE#1 单传感器命令超时 |
+| `AIH_SHELL_CONTEXT` | — | IT#1 `auto` 每轮自动注入最近 shell 上下文 |
 | `NO_COLOR` | — | 关闭彩色输出 |
 
 > 完整清单以 `aih config` 输出与 `cli/schema/aih.schema.json` 为准。

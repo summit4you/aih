@@ -25,9 +25,12 @@ npm run cli -- run "..." --ephemeral              # 关闭持久化
 npm run cli -- session list                       # 列出
 npm run cli -- session show work                  # 人类可读回放
 npm run cli -- session export work > work.json    # 导出为 JSON
-npm run cli -- session rm work                    # 删除
+npm run cli -- session rm work                    # 删除单个（路径穿越安全）
+npm run cli -- session rm --all                   # 清空全部已存会话
 npm run cli -- stats                              # 所有会话 token 用量汇总
 ```
+
+- **`/sessions` TUI 面板（IT#4）**：交互式会话管理面——列出活跃 + 已存会话，含状态、token 用量与成本；`/sessions kill <id>` 取消运行中任务，`/sessions view <name>` 查看单会话摘要。
 
 ## 分叉与树结构
 

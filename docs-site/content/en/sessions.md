@@ -22,9 +22,12 @@ npm run cli -- run "..." --ephemeral              # disable persistence
 npm run cli -- session list                       # list
 npm run cli -- session show work                  # human-readable replay
 npm run cli -- session export work > work.json    # export to JSON
-npm run cli -- session rm work                    # delete
+npm run cli -- session rm work                    # delete one (path-traversal-safe)
+npm run cli -- session rm --all                   # clear every saved session
 npm run cli -- stats                              # token usage across all sessions
 ```
+
+- **`/sessions` TUI panel (IT#4)**: the interactive session-management surface — lists active + saved sessions with status, token usage and cost; `/sessions kill <id>` cancels a running job, `/sessions view <name>` shows a per-session summary.
 
 ## Fork & tree structure
 

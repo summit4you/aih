@@ -56,6 +56,67 @@ the versions listed here (`scripts/package` derives the version from
   "stop and hand a human a decision" primitive (distinct from `ask`), with
   `reason` / `options` / `safestDefault`. Gives the scorecard's escalation
   metric a real data source and sets up bounded sensor/budget escalation.
+- **Safety seam (PE#1 / PE#2 / PE#4)**: the harness enforces safety, not the
+  model. Three pieces, all pure-function seams (zero new dependencies),
+  adjudicated by the kernel after every tool batch:
+  - **PE#2 budget hard constraint + tripwire** — `BudgetTracker`
+    (`core/src/budget.ts`) accumulates cost / write-count / wall-clock and
+    guards a `denyPaths` scope list. A hard bound (`maxCostUsd` / `maxWrites`
+    / `timeoutMs` / `denyPaths`) → `escalate` + `stopReason="escalated"`,
+    stopping the turn. A soft **tripwire** (task cost ≥ 2× session mean) →
+    `onTripwire` hint once (latched per task), non-blocking. Configure via
+    `aih.json` `safety.budget` or `AIH_BUDGET`
+    (`maxCostUsd=1|maxWrites=5|timeoutMs=60000|denyPaths=a|b`).
+  - **PE#1 computational sensors** — `SensorLoop` (`core/src/budget.ts`) +
+    `cli/src/safety.ts` executor. After a write tool succeeds, run a declared
+    `{name, command, onTools?, pathPrefix?, timeoutMs?}` check (children get
+    `buildChildEnv`, so they inherit **no secrets**). Exit 0 = green; red →
+    bounded retry (`AIH_SENSOR_RETRIES`, default 1) → escalate. Configure via
+    `safety.sensors` / `AIH_SENSORS`.
+  - **PE#4 escalate primitive** — `AgentLoop.escalate()` emits a
+    **model-invisible** `escalate` event (`reason` + `options[2-4]` +
+    `safestDefault`; `deriveMessages` skips it). Non-interactive `run` prints
+    the options + safest default then **exits code 3** (`ESCALATE_EXIT_CODE`);
+    the TUI renders the options for a human to choose.
+  - **Recovery test** — `test/recovery.sh` drives the real CLI + mock LLM over a
+    real persisted session: escalate event persisted & replayable, exit code 3,
+    and a mid-turn crash (dispatch, no result) → resume reads the checkpoint,
+    parks the tool (indeterminate, outcome UNKNOWN) and does **not** re-dispatch
+    it. 10/10, stable.
+- **Intelligent Terminal UX group (IT#1–IT#5)**: context flow + deterministic
+  error-detection + session management, borrowed as pure seams:
+  - **IT#1 shell context** — `shell_context` tool + TUI `/shell` +
+    `AIH_SHELL_CONTEXT=auto`: the agent proactively reads recent shell
+    commands / exit codes / cwd / output tails (`cli/src/shell-context.ts`).
+  - **IT#2 error detection + one-click fix** — `cli/src/error-detect.ts`
+    deterministically (no LLM) detects `run_cmd` failures, lights a red
+    `⚠ N failed` status badge, and TUI `/fix` sends the failure context to the
+    agent for a fix suggestion.
+  - **IT#3 `?` prefix quick task** — `cli/src/question.ts`
+    (`classifyQuestionPrefix` / `buildQuestionContext` / `composeQuestionPrompt`):
+    a TUI input line starting with `?` starts an agent task with the current
+    shell context auto-injected.
+  - **IT#4 `/sessions` panel** — `cli/src/sessions.ts`
+    (`buildDashboard` / `formatDashboard`): a TUI session-management surface
+    listing active + saved agent sessions with status, token usage and cost;
+    `/sessions kill <id>` cancels a running job, `/sessions view <name>` shows
+    a per-session summary.
+  - **IT#5 run-or-copy approval** — `cli/src/clipboard.ts` + TUI `askRunOrCopy`:
+    a write-kind `run_cmd` approval is now explicit `[R]un / [C]opy / [N]o`
+    (copy degrades to printing the command when no clipboard is available),
+    never auto-running.
+- **`aih measure` distance ruler (PR#2)** — `cli/src/measure.ts` answers
+  "how much did it change, and how" (vs the scorecard's "how good is it
+  now"): `measure distance <a> <b>` (per-surface structural diff, missing
+  snapshot → explicit degraded, exit 1), `measure stream <traces>` (tool-flow
+  L1 + bigram Jaccard with a seeded permutation test), and
+  `measure crystallize <evolved> <neutral>` (disposition stability; drift →
+  exit 1 + `DRIFTED`). Pure functions, `--json` out.
+- **`aih session rm --all`**: a real `-a/--all` boolean flag removes every
+  saved session (the correct bulk-clear); per-name guards unchanged (path
+  traversal still rejected, non-session names still error instead of a fake
+  "removed"). Fixes `aih session rm *` where the shell expanded `*` into CWD
+  files and the old per-file loop errored with no way to bulk-delete.
 
 ### Fixed
 - **Slash-command parsing**: pasted code whose comment starts with `//`
@@ -69,6 +130,19 @@ the versions listed here (`scripts/package` derives the version from
 - **Permission ask for write tools (CC#53)**: write-kind tools that are
   marked `ask` now consistently prompt before executing (previously some
   paths bypassed the gate).
+- **Tool-output budget marker (FA#2)**: when a turn's total tool output
+  exceeds `TURN_TOOL_BUDGET_CHARS` (12K), later results are replaced by a
+  marker. The old cryptic `[turn budget: truncated]` made the model
+  blind-loop (30+ steps re-issuing tools, each also truncated, wrongly
+  inferring the environment had failed). The marker is now an explicit,
+  actionable directive — stop running read/debug tools, wrap up from what it
+  has, and that a new message resets the budget on a fresh turn — appended as
+  a trailing user message so tool-call pairing is preserved.
+- **Language rule covers progress notes**: the system-prompt language rule
+  now requires **every** user-facing text — the final answer *and* the short
+  progress notes written before/between tool calls — to match the user's
+  major language, so a Chinese user no longer sees a wall of English
+  tool-narration mid-task.
 
 ## [0.3.0] - 2026-08-26
 

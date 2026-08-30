@@ -61,3 +61,11 @@ Toggles plain mode — strips borders/background/sidebar/status hints and other 
 ## /find search
 
 Searches across all tool outputs line by line (including expanded content within the 32KB in-band cap); matched tools auto-expand and scroll the first hit into view, listing the last 12 hits (`tool · line · snippet`). Full output beyond the in-band cap is persisted via `run_cmd keep_output=true` to `.aih/outputs/*.log`.
+
+## Intelligent Terminal (IT#1–IT#5)
+
+- **`/sessions` (IT#4)** — session-management panel: lists active + saved agent sessions with status, token usage and cost. `/sessions kill <id>` cancels a running job; `/sessions view <name>` shows a per-session summary.
+- **`/shell` (IT#1)** — print the recent shell context (last commands, exit codes, cwd, output tails). With `AIH_SHELL_CONTEXT=auto` this context is auto-injected every turn.
+- **`/fix` (IT#2)** — deterministic (no LLM) failure detection lights a red `⚠ N failed` badge on `run_cmd` errors; `/fix` sends the failure context to the agent for a fix suggestion.
+- **`?` prefix (IT#3)** — a TUI input line starting with `?` starts an agent task with the current shell context auto-injected (a quick way to ask about the recent shell).
+- **run-or-copy approval (IT#5)** — a write-kind `run_cmd` approval is an explicit `[R]un / [C]opy / [N]o` choice (copy degrades to printing the command when no clipboard is available); it never auto-runs.

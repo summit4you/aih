@@ -86,6 +86,11 @@ Besides `-s/--server` for a single MCP server, you can declare **multiple** MCP 
 | `AIH_TODO_STORE` | persist the example app's state across processes |
 | `AIH_TOOL_CONCURRENCY` | max parallel read-only tools (default 4) |
 | `AIH_SANDBOX` | `run_cmd` backend: local / bwrap / remote |
+| `AIH_BUDGET` | PE#2 budget hard bounds: JSON or `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b` (exceeded → escalate, exit 3) |
+| `AIH_SENSORS` | PE#1 post-write sensors: SensorConfig JSON array or object (red → bounded retry → escalate) |
+| `AIH_SENSOR_RETRIES` | PE#1 sensor red-retries before escalating (default 1) |
+| `AIH_SENSOR_TIMEOUT_MS` | PE#1 per-sensor command timeout (default 60000) |
+| `AIH_SHELL_CONTEXT` | IT#1 `auto` injects recent shell context each turn |
 | `AIH_HOME` | override the global config dir |
 
 ## Next steps

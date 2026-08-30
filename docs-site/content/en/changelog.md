@@ -1,11 +1,27 @@
 ---
 title: Changelog
-description: AIH release notes — key changes in 0.3.0 / 0.2.0 / 0.1.0.
+description: AIH release notes — key changes in 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0.
 ---
 
 # Changelog
 
 The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md) (Keep a Changelog format, SemVer). This page is a per-version summary.
+
+## 0.4.0 (2026-08-29)
+
+**Added**
+
+- **Safety seam (PE#1 / PE#2 / PE#4)** — the harness enforces safety, not the model. **PE#2 budget**: `maxCostUsd` / `maxWrites` / `timeoutMs` / `denyPaths` hard bounds stop the turn with an `escalate` event; a soft tripwire (task cost ≥ 2× session mean) hints once without blocking (`AIH_BUDGET` or `safety.budget`). **PE#1 sensors**: after a write, run a declared check (`AIH_SENSORS`), red → bounded retry → escalate; sensor children inherit no secrets. **PE#4 escalate**: a model-invisible `escalate` event (`reason` + `options` + `safestDefault`); non-interactive `run` exits **code 3**, the TUI renders the options. **`test/recovery.sh`**: crash → resume parks the tool (outcome unknown) and does not re-dispatch it.
+- **Intelligent Terminal UX (IT#1–IT#5)** — **IT#1** `shell_context` tool + `/shell` + `AIH_SHELL_CONTEXT=auto`; **IT#2** deterministic failure detection + red `⚠ N failed` badge + `/fix`; **IT#3** `?` prefix starts an agent task with shell context auto-injected; **IT#4** `/sessions` panel (dashboard / `kill <id>` / `view <name>`); **IT#5** run-or-copy approval `[R]un / [C]opy / [N]o` for write commands.
+- **`aih measure` distance ruler (PR#2)** — `distance` / `stream` (seeded permutation test) / `crystallize`; pure functions, `--json` out.
+- **`aih session rm --all`** — real `-a/--all` flag to clear every saved session.
+- **Quota auto-resume (CC#51)**, **read-only auto-allow (CC#54)**, **credential scope (CC#59)**, **BOM tolerance (CC#55)**, **MCP empty-schema (CC#56)**, **`/usage` per-loop breakdown (CC#57)**, **TUI truncation (CC#58)**, **injected-source isolation (CC#60)**, **question tool**, **bilingual docs site + GitHub Pages**, **harness scorecard (PE#3)**, **`escalate` event (PE#4 foundation)**.
+
+**Fixed**
+
+- **Tool-output budget marker (FA#2)**: the old cryptic truncation marker no longer blind-loops the model — it now tells it to stop re-issuing tools and wrap up.
+- **Language rule covers progress notes**: every user-facing text (final answer *and* mid-task progress notes) matches the user's language.
+- **Slash-command parsing**, **subagent partial results (CC#50)**, **`load_skill` dedup (CC#52)**, **permission ask for write tools (CC#53)**.
 
 ## 0.3.0 (2026-08-26)
 

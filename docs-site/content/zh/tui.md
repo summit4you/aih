@@ -65,3 +65,11 @@ AIH 的交互终端是 opencode / MiMo-Code 风格的全屏 TUI。
 跨所有工具输出逐行检索（含 32KB 内带上限的展开内容），命中工具自动展开并滚动到首个命中，
 列出最近 12 条命中（`tool · line · 片段`）。超出内带上限的全量输出用
 `run_cmd keep_output=true` 落盘 `.aih/outputs/*.log`。
+
+## Intelligent Terminal（IT#1–IT#5）
+
+- **`/sessions`（IT#4）**——会话管理面板：列出活跃 + 已存 agent 会话，含状态、token 用量与成本。`/sessions kill <id>` 取消运行中任务；`/sessions view <name>` 查看单会话摘要。
+- **`/shell`（IT#1）**——打印最近 shell 上下文（最近命令、退出码、cwd、输出尾部）。设 `AIH_SHELL_CONTEXT=auto` 时每轮自动注入该上下文。
+- **`/fix`（IT#2）**——确定性（无 LLM）失败检测在 `run_cmd` 出错时点亮红色 `⚠ N failed` 徽标；`/fix` 把失败上下文发给 agent 生成修复建议。
+- **`?` 前缀（IT#3）**——TUI 输入行以 `?` 开头即起一个 agent 任务，并自动注入当前 shell 上下文（快速询问最近 shell 的便捷方式）。
+- **run-or-copy 批准（IT#5）**——写类 `run_cmd` 批准为显式 `[R]un / [C]opy / [N]o`（无剪贴板时 copy 退化为打印命令）；绝不自动执行。
