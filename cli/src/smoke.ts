@@ -1766,7 +1766,9 @@ await srv.connect(new StdioServerTransport());
     )) as { ok: boolean; result?: { truncated?: boolean; stdout?: string; output_file?: string; output_bytes?: number }; error?: string };
     assert(r.ok, `keep_output run succeeds (${r.error ?? "none"})`);
     assert(r.result?.truncated === true, "in-band stdout is still capped (truncated=true)");
-    assert((r.result?.stdout ?? "").length <= 32 * 1024, "in-band stdout capped at 32KB");
+    // FA#1: middle-truncation = 32KB budget + the "… N chars elided …" marker
+    // (a few dozen chars), so the bound is budget + a small marker allowance.
+    assert((r.result?.stdout ?? "").length <= 32 * 1024 + 64, "in-band stdout bounded by 32KB budget + elided marker");
     const file = r.result?.output_file;
     assert(!!file && file.startsWith(work), "output_file is under the working dir");
     const full = rfs(file!, "utf8");
@@ -1783,6 +1785,195 @@ await srv.connect(new StdioServerTransport());
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+{
+  // FA#1 — middle-truncate (head + tail, elide the middle) so the verdict
+  // lines at the END of shell output survive the in-band cap.
+  const { truncateMiddle } = await import("./dev-tools.js");
+  // short input: unchanged, no marker.
+  const short = truncateMiddle("hello world", 100);
+  assert(short.text === "hello world" && !short.truncated && short.elidedChars === 0, "FA#1 short input unchanged");
+  // long input: head + marker + tail, elidedChars consistent.
+  const body = "H".repeat(500) + "MIDDLE" + "T".repeat(500);
+  const mid = truncateMiddle(body, 200);
+  assert(mid.truncated === true, "FA#1 long input flagged truncated");
+  assert(mid.text.includes("chars elided"), "FA#1 elided marker present");
+  assert(mid.text.startsWith("H"), "FA#1 head preserved");
+  assert(mid.text.endsWith("T"), "FA#1 tail (verdict) preserved");
+  assert(mid.elidedChars === body.length - 200, "FA#1 elidedChars = total - budget");
+  assert(mid.text.length > 200, "FA#1 marker adds chars beyond the budget");
+  // headRatio: 0 → all tail; 1 → all head.
+  const allTail = truncateMiddle(body, 100, { headRatio: 0 });
+  assert(allTail.text.endsWith("T".repeat(100)), "FA#1 headRatio 0 → all tail");
+  const allHead = truncateMiddle(body, 100, { headRatio: 1 });
+  assert(allHead.text.startsWith("H".repeat(100)), "FA#1 headRatio 1 → all head");
+  console.log("ok: FA#1 truncateMiddle pure (head+tail, elided marker, headRatio)");
+
+  // run_cmd integration: 60KB output is middle-truncated in-band (tail kept),
+  // while keep_output still holds the FULL body.
+  const { ToolRegistry, AutoApprove } = await import("@aih/core");
+  const { registerDevTools } = await import("./dev-tools.js");
+  const { mkdtempSync, readFileSync: rfs2 } = await import("node:fs");
+  const { tmpdir: tdir2 } = await import("node:os");
+  const { join: j2 } = await import("node:path");
+  const work2 = mkdtempSync(j2(tdir2(), "aih-fa1-"));
+  try {
+    const reg = new ToolRegistry(new AutoApprove());
+    registerDevTools(reg, work2);
+    // 60KB of distinct lines: the LAST line is the "verdict" that must survive.
+    const r = (await reg.invoke(
+      "run_cmd",
+      { command: "node -e 'for(let i=0;i<6000;i++)console.log(\"line-\"+i)'" , keep_output: true },
+      { turnId: "smoke", inject: () => {} },
+    )) as { ok: boolean; result?: { truncated?: boolean; stdout?: string; elided_chars?: number; output_file?: string }; error?: string };
+    assert(r.ok, `FA#1 run_cmd succeeds (${r.error ?? "none"})`);
+    assert(r.result?.truncated === true, "FA#1 run_cmd flags truncated");
+    assert((r.result?.elided_chars ?? 0) > 0, "FA#1 run_cmd reports elided_chars");
+    // The in-band stdout must END with the real last line (the verdict).
+    const tail = (r.result?.stdout ?? "").split("\n").filter(Boolean).pop() ?? "";
+    assert(tail === "line-5999", `FA#1 in-band stdout keeps the last line (got "${tail}")`);
+    assert((r.result?.stdout ?? "").includes("chars elided"), "FA#1 in-band stdout has the elided marker");
+    // Full output still recoverable from the spill file.
+    const full = rfs2(r.result?.output_file as string, "utf8");
+    assert(full.endsWith("line-5999\n"), "FA#1 keep_output file holds the FULL body incl. last line");
+  } finally {
+    rmSync(work2, { recursive: true, force: true });
+  }
+  console.log("ok: FA#1 run_cmd middle-truncation (tail kept, full in spill)");
+}
+
+{
+  // IT#1 — shell context awareness (pure extract/format over the session log).
+  const { SessionLog } = await import("@aih/core");
+  const { extractShellContext, formatShellContext, describeCommand } = await import("./shell-context.js");
+
+  // empty state: no events → no commands, empty block.
+  const emptyLog = new SessionLog();
+  assert(extractShellContext(emptyLog.all()).length === 0, "IT#1 empty state → no commands");
+  assert(formatShellContext([]) === "", "IT#1 empty block formats to ''");
+
+  // one run_cmd call+result → extracted with command, exit code, output.
+  const log = new SessionLog();
+  log.append({ type: "tool/call", turnId: "t1", callId: "c1", name: "run_cmd", args: { command: "npm test", cwd: "/w" } });
+  log.append({ type: "tool/result", turnId: "t1", callId: "c1", ok: true, result: { code: 1, timed_out: false, stdout: "FAIL: 3 tests failed\n  at suite\n" } });
+  const one = extractShellContext(log.all());
+  assert(one.length === 1, "IT#1 one run_cmd extracted");
+  assert(one[0].command === "npm test", "IT#1 command captured");
+  assert(one[0].code === 1 && one[0].ok === false, "IT#1 non-zero exit → ok:false (reads code, not ok)");
+  assert(one[0].cwd === "/w", "IT#1 cwd captured");
+  assert(one[0].output.includes("FAIL"), "IT#1 output tail captured");
+  const fmt = formatShellContext(one);
+  assert(fmt.includes("npm test") && fmt.includes("exit 1"), "IT#1 block shows command + exit code");
+
+  // non-run_cmd tools must NOT leak into shell context.
+  const log2 = new SessionLog();
+  log2.append({ type: "tool/call", turnId: "t1", callId: "x1", name: "read_file", args: { path: "secret.txt" } });
+  log2.append({ type: "tool/result", turnId: "t1", callId: "x1", ok: true, result: { path: "secret.txt", bytes: 10, stdout: "TOP-SECRET" } });
+  assert(extractShellContext(log2.all()).length === 0, "IT#1 non-run_cmd tool output is excluded");
+
+  // newest-first ordering + max_commands cap.
+  const log3 = new SessionLog();
+  for (const [i, cmd] of ["first", "second", "third", "fourth"].entries()) {
+    const id = `c${i}`;
+    log3.append({ type: "tool/call", turnId: "t", callId: id, name: "run_cmd", args: { command: cmd } });
+    log3.append({ type: "tool/result", turnId: "t", callId: id, ok: true, result: { code: 0, stdout: cmd + "-out\n" } });
+  }
+  const three = extractShellContext(log3.all(), { maxCommands: 3 });
+  assert(three.length === 3, "IT#1 maxCommands caps to 3");
+  assert(three[0].command === "fourth" && three[2].command === "second", "IT#1 newest-first order");
+
+  // large output → bounded tail + truncated flag.
+  const log4 = new SessionLog();
+  const big = "L".repeat(20000);
+  log4.append({ type: "tool/call", turnId: "t", callId: "cb", name: "run_cmd", args: { command: "big" } });
+  log4.append({ type: "tool/result", turnId: "t", callId: "cb", ok: true, result: { code: 0, stdout: big } });
+  const bigCmd = extractShellContext(log4.all())[0];
+  assert(bigCmd.outputTruncated === true, "IT#1 large output flagged truncated");
+  assert(bigCmd.output.length <= 4000, "IT#1 output tail bounded to cap");
+  assert(bigCmd.output.endsWith("L"), "IT#1 tail keeps the END of the output");
+  assert(formatShellContext([bigCmd]).includes("elided"), "IT#1 block notes elided output");
+
+  // describeCommand renders the outcome line.
+  assert(describeCommand(one[0]).includes("npm test") && describeCommand(one[0]).includes("exit 1"), "IT#1 describeCommand line");
+  console.log("ok: IT#1 shell-context pure extract/format");
+}
+
+{
+  // IT#1 — shell_context agent tool (on-demand fetch over the live log).
+  const { ToolRegistry, AutoApprove, SessionLog } = await import("@aih/core");
+  const { registerGeneralTools } = await import("./general-tools.js");
+
+  const log = new SessionLog();
+  log.append({ type: "tool/call", turnId: "t", callId: "c1", name: "run_cmd", args: { command: "ls -la" } });
+  log.append({ type: "tool/result", turnId: "t", callId: "c1", ok: true, result: { code: 0, stdout: "total 8\nfile.txt\n" } });
+
+  const reg = new ToolRegistry(new AutoApprove());
+  registerGeneralTools(reg, { logProvider: () => log });
+  const r = (await reg.invoke("shell_context", {}, { turnId: "t", inject: () => {} })) as {
+    ok: boolean;
+    result?: { found?: boolean; count?: number; commands?: Array<{ command?: string; code?: number }> };
+  };
+  assert(r.ok, "IT#1 shell_context invokes");
+  assert(r.result?.found === true && r.result?.count === 1, "IT#1 shell_context found 1 command");
+  assert(r.result?.commands?.[0]?.command === "ls -la" && r.result?.commands?.[0]?.code === 0, "IT#1 shell_context returns command+code");
+
+  // no log wired → graceful not-found (not an error).
+  const reg2 = new ToolRegistry(new AutoApprove());
+  registerGeneralTools(reg2, {});
+  const r2 = (await reg2.invoke("shell_context", {}, { turnId: "t", inject: () => {} })) as {
+    ok: boolean;
+    result?: { found?: boolean };
+  };
+  assert(r2.ok && r2.result?.found === false, "IT#1 shell_context not-wired → found:false");
+
+  // empty log → found:false.
+  const reg3 = new ToolRegistry(new AutoApprove());
+  const emptyLog = new SessionLog();
+  registerGeneralTools(reg3, { logProvider: () => emptyLog });
+  const r3 = (await reg3.invoke("shell_context", {}, { turnId: "t", inject: () => {} })) as {
+    ok: boolean;
+    result?: { found?: boolean };
+  };
+  assert(r3.ok && r3.result?.found === false, "IT#1 shell_context empty log → found:false");
+  console.log("ok: IT#1 shell_context tool");
+}
+
+{
+  // IT#1 — e2e: injected shell context lands in the FIRST model call of the
+  // next turn (the auto-injection seam, proven via onPromptInput).
+  const { AgentLoop, ToolRegistry, AutoApprove, SessionLog, MockLLM, toolCall } = await import("@aih/core");
+  const { extractShellContext, formatShellContext } = await import("./shell-context.js");
+
+  const log = new SessionLog();
+  log.append({ type: "tool/call", turnId: "t0", callId: "c1", name: "run_cmd", args: { command: "npm test" } });
+  log.append({ type: "tool/result", turnId: "t0", callId: "c1", ok: true, result: { code: 1, stdout: "ERROR: build failed\n" } });
+
+  // Simulate the TUI auto-inject: pull the shell context and inject it before
+  // the next user turn (exactly what the AIH_SHELL_CONTEXT=auto path does).
+  const block = formatShellContext(extractShellContext(log.all()));
+  assert(block.includes("npm test"), "IT#1 e2e: block built from log");
+
+  const seen: string[] = [];
+  const llm = new MockLLM([
+    { text: "I see the failing build.", stopReason: "end_turn" },
+  ]);
+  const loop = new AgentLoop({
+    llm,
+    tools: new ToolRegistry(new AutoApprove()),
+    log,
+    systemPrompt: "sys",
+    onPromptInput: (messages) =>
+      seen.push(messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n")),
+  });
+  loop.inject(block);
+  await loop.send("why did it fail?");
+  const firstCall = seen[0] ?? "";
+  assert(
+    firstCall.includes("[shell context]") && firstCall.includes("npm test"),
+    "IT#1 e2e: injected shell context is in the first model call",
+  );
+  console.log("ok: IT#1 e2e injection lands in first model call");
 }
 
 {
@@ -3444,6 +3635,81 @@ await srv.connect(new StdioServerTransport());
   assert(bad.results[0]?.status === "error" || bad.totals.errors === 0, "external failure surfaces as error or empty-output fail");
 }
 
+// --- FA#6: result persistence + failed-cell retry + status inspection ---
+{
+  const {
+    runExperiment: re,
+    loadResults: lr,
+    saveResults: sr,
+    retryCellIds: rci,
+    statusSummary: ss,
+    resultsPath: rp,
+    expandCells: ec,
+  } = await import("./eval.js");
+  const tasks = [
+    { id: "t1", prompt: "always ok", expect: ["OK"] },
+    { id: "t2", prompt: "flaky", expect: ["OK"] },
+  ];
+  const models = [{ model: "mock" }];
+  const rd = mkdtempSync("/tmp/aih-fa6-");
+  const spec = ec(tasks, models, 1); // t1__mock__r1, t2__mock__r1
+
+  // Flaky subject: t2 fails on its first attempt, passes on the retry.
+  let t2Attempts = 0;
+  const flaky = async (task: { id: string }, _m: unknown, _wd: string) => {
+    if (task.id === "t2") {
+      t2Attempts += 1;
+      return t2Attempts === 1 ? { output: "nope" } : { output: "OK" };
+    }
+    return { output: "OK" };
+  };
+
+  // 1) first run: t1 passes, t2 fails → persisted.
+  const r1 = await re(tasks, models, 1, flaky, { outDir: join(rd, "c1"), expId: "e1", resultsDir: rd });
+  assert(r1.totals.passed === 1 && r1.totals.failed === 1, `FA#6 first run: 1 passed 1 failed (got ${r1.totals.passed}/${r1.totals.failed})`);
+  const p1 = rp(rd, "e1");
+  assert(existsSync(p1), "FA#6 results file persisted");
+  const s1 = lr(rd, "e1");
+  assert(!!s1 && s1.cells["t1__mock__r1"].status === "passed", "FA#6 t1 persisted as passed");
+  assert(s1?.cells["t2__mock__r1"].status === "failed", "FA#6 t2 persisted as failed");
+
+  // 2) retry only the failed cell: t1 must NOT re-run, t2 must re-run and pass.
+  const only = rci(spec, lr(rd, "e1"));
+  assert(only.length === 1 && only[0] === "t2__mock__r1", `FA#6 retry targets only the failed cell (got ${JSON.stringify(only)})`);
+  const r2 = await re(tasks, models, 1, flaky, { outDir: join(rd, "c2"), expId: "e1", resultsDir: rd, onlyCells: only });
+  assert(r2.results.length === 1 && r2.results[0].cellId === "t2__mock__r1", "FA#6 retry ran exactly the failed cell");
+  assert(r2.results[0].status === "passed", "FA#6 retried cell now passes");
+  assert(t2Attempts === 2, "FA#6 t2 attempted exactly twice (1 fail + 1 retry)");
+
+  // 3) merged result set: both cells passed, t1's first-run status retained.
+  const s2 = lr(rd, "e1");
+  const sum2 = ss(s2!.cells);
+  assert(sum2.passed === 2 && sum2.failed === 0 && sum2.total === 2, `FA#6 merged set all passed (got ${JSON.stringify(sum2)})`);
+  assert(s2!.cells["t1__mock__r1"].status === "passed", "FA#6 passed cell retained across retry");
+
+  // 4) status inspection reads the same persisted set (cross-process safe).
+  const s3 = lr(rd, "e1");
+  assert(!!s3 && ss(s3.cells).total === 2, "FA#6 status reads persisted set");
+
+  // 5) all-passed → retry targets nothing.
+  const allPassed: Record<string, import("./eval.js").CellResult> = {
+    "a__mock__r1": { cellId: "a__mock__r1", taskId: "a", model: "mock", repetition: 1, status: "passed", durationMs: 1, outputTail: "" },
+  };
+  assert(rci([{ taskId: "a", model: "mock", repetition: 1 }], { expId: "x", updatedAt: "", cells: allPassed, skipped: [] }).length === 0, "FA#6 all-passed → nothing to retry");
+
+  // 6) no prior set → retry targets the full spec (first run).
+  assert(rci(spec, undefined).length === 2, "FA#6 no prior → full spec");
+
+  // 7) saveResults → loadResults round-trip.
+  const rd2 = mkdtempSync("/tmp/aih-fa6b-");
+  sr(rd2, { expId: "e2", updatedAt: "now", cells: allPassed, skipped: [] });
+  assert(lr(rd2, "e2")?.cells["a__mock__r1"].status === "passed", "FA#6 save/load round-trip");
+
+  rmSync(rd, { recursive: true, force: true });
+  rmSync(rd2, { recursive: true, force: true });
+  console.log("ok: FA#6 result persistence + failed-cell retry + status inspection");
+}
+
 // --- P#39①: result-bearing extension events (cancel / rewrite / turn:end) ---
 {
   const { createExtensionEventBridge, loadExtensions } = await import("./extensions.js");
@@ -4399,6 +4665,17 @@ import { width } from "./tui.js";
   const all = log.all();
   assert(all.length === 1, "TP#7.10 chaos: null byte message appended");
   console.log("ok: TP#7.10 chaos null bytes in message");
+}
+
+// --- session rm --all (safe "remove everything"; runs last so the earlier
+// --- session tests are unaffected) ------------------------------------------
+{
+  const before = aih(["session", "list"]);
+  assert(before.status === 0, "session list runs before --all");
+  const rmAll = aih(["session", "rm", "--all"]);
+  assert(rmAll.status === 0 && rmAll.stdout.includes("removed"), "session rm --all removes every session");
+  const listAfter = aih(["session", "list"]);
+  assert(listAfter.status === 0 && listAfter.stdout.includes("(no saved sessions)"), "session list is empty after --all");
 }
 
 console.log("ok: TP#7 all stress/chaos tests passed (10 cases)");

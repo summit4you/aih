@@ -132,6 +132,7 @@ import {
 import { isKnownSlashCommand } from "./slash.js";
 import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
 import { registerDevTools } from "./dev-tools.js";
+import { extractShellContext, formatShellContext, describeCommand } from "./shell-context.js";
 import { registerGeneralTools, todoStateFromLog, applyTodoState } from "./general-tools.js";
 import {
   T_AGENTS_MD,
@@ -158,6 +159,31 @@ import {
   loadWorkflow,
   runWorkflow,
 } from "./workflow.js";
+import {
+  runExperiment,
+  loadResults,
+  retryCellIds,
+  statusSummary,
+  expandCells,
+  cliSubjectAdapter,
+  externalSubjectAdapter,
+  resultsPath,
+  type EvalTask,
+  type EvalModelSpec,
+  type SubjectAdapter,
+} from "./eval.js";
+import {
+  distance,
+  behaviorDistance,
+  toolFlow,
+  permutationTest,
+  crystallize,
+  formatDistance,
+  formatPermutationTest,
+  type Snapshot,
+  type ActionEvent,
+  type Trace,
+} from "./measure.js";
 
 export const VERSION = "0.4.0";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
@@ -176,6 +202,7 @@ Usage:
 aih session <list|show|rm|export|import|fork> [args]
                                 fork: aih session fork [source] <target> [--from seq]
                                 import: aih session import <file.jsonl|file.json> [target]
+                                rm:    aih session rm <name>... | --all   (quote globs: 's-*')
   aih stats                       token usage across saved sessions
   aih scorecard [--format json]   harness health scorecard (6 metrics, PE#3)
   aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
@@ -191,6 +218,9 @@ aih session <list|show|rm|export|import|fork> [args]
   aih workflow <list|run> [name]  deterministic multi-phase agent runs
                                    list: list .aih/workflows/*.mjs
                                    run: aih workflow run <name> [--format json]
+  aih experiment <run|status>     P#46 eval matrix + failed-cell retry (FA#6)
+                                   run <spec.json> [--exp-id id] [--retry-failed] [--mock]
+                                   status <exp-id> [--json]
   aih mcp                         serve the bundled todo-app over stdio
   aih serve --port N              headless harness over HTTP/SSE (P2#8)
                                   GET /health · GET /events (SSE) · POST /message · GET /tools
@@ -307,6 +337,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     "note",
     "sender",
     "image",
+    // FA#6 — `aih experiment` value flags
+    "exp-id",
+    "reps",
+    "concurrency",
+    "out",
+    "results-dir",
+    "external",
+    "args-template",
+    "timeout",
   ]);
   const booleanFlags = new Set(["thinking"]);
   const optionalValueFlags = new Set(["continue", "c"]);
@@ -802,6 +841,7 @@ export function registerLocalTools(
   gate: ApprovalGate,
   tuiRef: { current: Tui | null },
   hideWrites = false,
+  logRef?: { current: { all: () => readonly SessionEvent[] } | null },
 ): void {
   registerDevTools(registry, process.cwd(), hideWrites);
   registerGeneralTools(
@@ -810,6 +850,9 @@ export function registerLocalTools(
       gate,
       llm: () => buildLlm(flags),
       toolsProvider: () => registry,
+      // IT#1 — resolve the live session log at call time (created after the
+      // registry in every path); absent → shell_context reports "not wired".
+      logProvider: logRef ? () => logRef.current ?? undefined : undefined,
       ask: (q) => (tuiRef.current ? tuiRef.current.askQuestion(q) : makeStdinAsk(q)),
       // D#11: builtin hooks (redaction+timing) first, then the audit consumer.
       // Compose the after-waterfall manually (spread would drop the builtin
@@ -1008,10 +1051,14 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     void loadExtensions(registry, {
       enabled: !bool(flags, "no-extensions") && projectTrustState() === "trusted",
     });
-    if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
+    // IT#1 — resolve the live session log at call time (created after the
+    // registry); absent → shell_context reports "not wired".
+    const logRef: { current: { all: () => readonly SessionEvent[] } | null } = { current: null };
+    if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
     attachAudit(registry, flags);
 
     const log = loadSession(sessionPath);
+    logRef.current = log; // IT#1 — shell_context now resolves the live log
     // MK#43: prune oversized old tool results once at session start (the
     // fresh-turn path prunes nothing; resumed sessions may reclaim context).
     pruneOldToolResults(log, 0);
@@ -1216,9 +1263,13 @@ async function cmdWorkflow(
       for (const def2 of await backend.listTools()) registry.register(def2);
       const skillTracker = new SkillLoadTracker(); // CC#52 — per-session load-skill dedup
       const skills = registerSkillTool(registry, { projectTrusted: projectTrustState() === "trusted", loadTracker: skillTracker });
-      if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
+      // IT#1 — resolve the live session log at call time (created after the
+      // registry); absent → shell_context reports "not wired".
+      const logRef: { current: { all: () => readonly SessionEvent[] } | null } = { current: null };
+      if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
       attachAudit(registry, flags);
       const log = loadSession(sessionPath);
+      logRef.current = log; // IT#1 — shell_context now resolves the live log
       const llm = buildLlm(flags);
       await probeWindow(flags);
       const loop = new AgentLoop({
@@ -1297,6 +1348,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // likely no longer in context.
   const skillTracker = new SkillLoadTracker();
   const tuiRef: { current: Tui | null } = { current: null };
+  // IT#1 — the live session log, resolved by the shell_context tool at call
+  // time. Populated below once `log` is created (after the first rebuild).
+  const logRef: { current: { all: () => readonly SessionEvent[] } | null } = { current: null };
   // P#39 — TUI slash commands contributed by extensions.
   const extensionCommands = new Map<string, { run(args: string): void | Promise<void> }>();
   // P#39① — result-bearing extension events (cancel / rewrite / turn:end).
@@ -1315,7 +1369,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       onEvent: (event, handler) => extensionEvents.on(event as "tool:before" | "tool:after" | "turn:end", handler),
     });
     if (!bool(flags, "no-dev")) {
-      registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan");
+      registerLocalTools(registry, flags, gate, tuiRef, agentMode === "plan", logRef);
     }
     attachAudit(registry, flags);
     // Extension hooks ride LAST in the waterfall (after redaction+audit) so
@@ -1334,6 +1388,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // (from load) drives per-event incremental appends between turns.
   const store = sessionPath ? new SessionStore(sessionPath) : undefined;
   const log = store?.load() ?? loadSession(sessionPath);
+  logRef.current = log; // IT#1 — shell_context now resolves the live log
   process.on("exit", () => {
     saveSession(sessionPath, log);
   });
@@ -1505,6 +1560,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "vivid (concise render)", hint: "/vivid — toggle plain render (no borders/panel)", run: () => handleLine("/vivid") },
       { name: "background jobs", hint: "/bg <prompt> — dispatch a background agent turn (list/cancel)", run: () => handleLine("/bg") },
       { name: "search tool output", hint: "/find <text> — search across tool outputs (T#22)", run: () => handleLine("/find") },
+      { name: "shell context", hint: "/shell — recent run_cmd output + exit codes (IT#1) · /shell --send", run: () => handleLine("/shell") },
       { name: "clear chat", hint: "/clear — clear the message view", run: () => handleLine("/clear") },
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
@@ -1597,6 +1653,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/distill",
       "/tidy",
       "/find",
+      "/shell",
       "/vivid",
       "/bg",
       "/clear",
@@ -2082,6 +2139,40 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         .reverse()
         .map((m) => `  ${m.tool} · line ${m.line}  ${m.snippet}`);
       tui.pushSystem(`found ${n} line(s) matching "${q}" (showing last ${rows.length}):\n${rows.join("\n")}`);
+      return;
+    }
+    // IT#1: /shell — show the recent shell (run_cmd) context the agent can
+    // reach for: command, exit code, output tail, and the full-output file
+    // when keep_output was used. `--send` also injects it into the next turn.
+    if (input === "/shell" || input.startsWith("/shell ")) {
+      const arg = input === "/shell" ? "" : input.slice("/shell ".length).trim();
+      const cmds = extractShellContext(log.all());
+      if (!cmds.length) {
+        tui.pushSystem(
+          "no shell history yet — run a command with run_cmd first.\n" +
+            "  (auto-inject on the next turn: set AIH_SHELL_CONTEXT=auto)",
+        );
+        return;
+      }
+      const rows = cmds
+        .slice()
+        .reverse()
+        .map((c) => {
+          const tail = c.output.replace(/\s+$/, "").split("\n").slice(-6).join("\n");
+          const lines = [describeCommand(c)];
+          if (tail) lines.push(`    ${tail.replace(/\n/g, "\n    ")}`);
+          if (c.outputTruncated) lines.push("    …(earlier output elided)…");
+          if (c.outputFile) lines.push(`    full output: ${c.outputFile}`);
+          return lines.join("\n");
+        });
+      tui.pushSystem(`recent shell context (newest last):\n${rows.join("\n")}`);
+      if (arg === "--send") {
+        const block = formatShellContext(cmds);
+        if (block) {
+          loop.inject(block);
+          tui.pushSystem("↳ injected into the next turn — send a message to use it");
+        }
+      }
       return;
     }
     // D#13: /bg — background tasks (dispatch + status + cancel)
@@ -2653,6 +2744,21 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
     }
 
+    // IT#1: shell context awareness — when AIH_SHELL_CONTEXT=auto, attach the
+    // recent run_cmd output + exit codes to the next turn so the agent can
+    // reason about the user's shell without the user pasting it. Only for
+    // normal messages (not slash commands), and only when there IS shell
+    // history (empty state → no-op). Best-effort: any error is swallowed.
+    if (process.env.AIH_SHELL_CONTEXT === "auto" && !input.startsWith("/")) {
+      try {
+        const cmds = extractShellContext(log.all());
+        const block = formatShellContext(cmds);
+        if (block) loop.inject(block);
+      } catch {
+        /* shell-context injection is best-effort */
+      }
+    }
+
     try {
       const started = Date.now();
       const result = await evalTurn(input);
@@ -2821,10 +2927,25 @@ function cmdSessionShow(name: string) {
   }
 }
 
-function cmdSessionRm(names: string[]) {
-  if (names.length === 0) {
-    console.error("error: session rm needs a name (or --all)");
+function cmdSessionRm(names: string[], flags: Record<string, string | boolean> = {}) {
+  if (names.length === 0 && !bool(flags, "all", "a")) {
+    console.error("error: session rm needs a name, a glob (quoted), or --all");
     process.exit(1);
+  }
+  // `--all` removes every saved session. A bare glob that the shell expands
+  // (`aih session rm *`) becomes a list of CWD files, none of which are
+  // session names — the shell must never be trusted to know our sessions.
+  if (bool(flags, "all", "a")) {
+    const all = sessionFiles();
+    if (all.length === 0) {
+      console.log("(no saved sessions)");
+      return;
+    }
+    for (const s of all) {
+      rmSync(s.path, { force: true });
+      console.log(`${dim("removed")} ${s.name}`);
+    }
+    return;
   }
   let missing = 0;
   for (const raw of names) {
@@ -2832,9 +2953,9 @@ function cmdSessionRm(names: string[]) {
     // Guard: a session name must be a bare id — never a path. A shell glob
     // (`aih session rm *`) expands to every file in the CWD; feeding those
     // into join() could reach outside the sessions dir or silently "remove"
-    // names that were never sessions.
+    // names that were never sessions. Suggest --all instead.
     if (!name || /[/\\]/.test(name) || name === "." || name === "..") {
-      console.error(`error: "${raw}" is not a valid session name`);
+      console.error(`error: "${raw}" is not a valid session name (use "aih session rm --all" to remove every session)`);
       missing += 1;
       continue;
     }
@@ -3890,6 +4011,325 @@ function cmdScript(name: string) {
   process.exit(res.status ?? 1);
 }
 
+// ---------------------------------------------------------------------------
+// PR#2 — `aih measure`: structural / behavioral distance instrument
+//
+//   aih measure distance <a.json> <b.json> [--revised skills=a,b]
+//       a/b: { "surfaces": [{ "surface": "skills", "entries": ["x","y"] }] }
+//   aih measure stream <traces.json> [--perms N] [--seed N]
+//       traces: { "traces": [{ "label": "arm-a", "events": [{ "type": "tool/call", "name": "run_cmd" }] }] }
+//   aih measure crystallize <evolved.json> <neutral.json>
+//
+// Pure measurement (cli/src/measure.ts): reads DECLARED surfaces + NORMALIZED
+// traces, never the agent's self-report. Missing snapshots degrade explicitly
+// (reported, never fabricated).
+// ---------------------------------------------------------------------------
+function readJsonFile(path: string): unknown {
+  const abs = resolve(path);
+  if (!existsSync(abs)) {
+    console.error(`error: file not found: ${abs}`);
+    process.exit(1);
+  }
+  try {
+    return JSON.parse(readFileSync(abs, "utf8"));
+  } catch (e) {
+    console.error(`error: ${abs} is not valid JSON: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  }
+}
+
+function parseSnapshots(raw: unknown): Snapshot[] {
+  const o = raw as { surfaces?: unknown };
+  if (!o || !Array.isArray(o.surfaces)) {
+    console.error('error: snapshot file must be { "surfaces": [ { "surface": "...", "entries": [...] } ] }');
+    process.exit(1);
+  }
+  return o.surfaces.map((s) => {
+    const x = s as { surface?: unknown; entries?: unknown };
+    if (typeof x.surface !== "string" || !Array.isArray(x.entries)) {
+      console.error("error: each surface needs a string \"surface\" and an \"entries\" array");
+      process.exit(1);
+    }
+    return { surface: x.surface, entries: x.entries.map(String) };
+  });
+}
+
+function parseTraces(raw: unknown): Trace[] {
+  const o = raw as { traces?: unknown };
+  if (!o || !Array.isArray(o.traces)) {
+    console.error('error: traces file must be { "traces": [ { "label": "...", "events": [...] } ] }');
+    process.exit(1);
+  }
+  return o.traces.map((t) => {
+    const x = t as { label?: unknown; events?: unknown };
+    if (typeof x.label !== "string" || !Array.isArray(x.events)) {
+      console.error("error: each trace needs a string \"label\" and an \"events\" array");
+      process.exit(1);
+    }
+    return { label: x.label, events: x.events as ActionEvent[] };
+  });
+}
+
+function cmdMeasure(positionals: string[], flags: Record<string, string | boolean>) {
+  const sub = positionals.shift() ?? "";
+  const asJson = bool(flags, "json");
+
+  if (sub === "distance") {
+    const a = parseSnapshots(readJsonFile(positionals.shift() ?? ""));
+    const b = parseSnapshots(readJsonFile(positionals.shift() ?? ""));
+    // --revised surface=entry,entry (repeatable) — caller declares which
+    // shared entries changed (the module cannot infer meaning of opaque keys).
+    const revised: Record<string, string[]> = {};
+    for (const r of (str(flags, "revised") ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+      const eq = r.indexOf("=");
+      if (eq < 0) {
+        console.error(`error: --revised expects surface=entry,entry (got "${r}")`);
+        process.exit(1);
+      }
+      const name = r.slice(0, eq);
+      revised[name] = [...(revised[name] ?? []), ...r.slice(eq + 1).split(",").map((s) => s.trim()).filter(Boolean)];
+    }
+    const report = distance(a, b, revised);
+    if (asJson) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatDistance(report));
+    if (report.degraded) process.exitCode = 1;
+    return;
+  }
+
+  if (sub === "stream") {
+    const traces = parseTraces(readJsonFile(positionals.shift() ?? ""));
+    const perms = Math.max(0, Math.floor(Number(str(flags, "perms") ?? "") || 500));
+    const seed = Math.floor(Number(str(flags, "seed") ?? "") || 12345);
+    const test = permutationTest(traces, { permutations: perms, seed });
+    // Pairwise behavior distances (matrix) for the report.
+    const pairs: { a: string; b: string; mix: number; order: number; score: number }[] = [];
+    for (let i = 0; i < traces.length; i += 1) {
+      for (let j = i + 1; j < traces.length; j += 1) {
+        const d = behaviorDistance(traces[i].events, traces[j].events);
+        pairs.push({ a: traces[i].label, b: traces[j].label, ...d });
+      }
+    }
+    const flows = traces.map((t) => ({ label: t.label, flow: toolFlow(t.events) }));
+    const out = { test, pairs, flows };
+    if (asJson) console.log(JSON.stringify(out, null, 2));
+    else {
+      console.log(formatPermutationTest(test));
+      for (const p of pairs) {
+        console.log(`  ${p.a} × ${p.b}:  mix=${p.mix.toFixed(3)}  order=${p.order.toFixed(3)}  score=${p.score.toFixed(3)}`);
+      }
+      for (const f of flows) {
+        const freq = Object.entries(f.flow.frequency)
+          .sort((x, y) => y[1] - x[1])
+          .map(([k, v]) => `${k}×${v}`)
+          .join(" ");
+        console.log(`  ${f.label}: ${f.flow.totalCalls} calls, ${f.flow.distinctTools} tools  [${freq}]`);
+      }
+    }
+    return;
+  }
+
+  if (sub === "crystallize") {
+    const evolved = parseSnapshots(readJsonFile(positionals.shift() ?? ""));
+    const neutral = parseSnapshots(readJsonFile(positionals.shift() ?? ""));
+    const result = crystallize(evolved, neutral);
+    if (asJson) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(
+        `crystallize  ${result.degraded ? "DEGRADED" : result.stable ? "STABLE" : "DRIFTED"}  distance=${result.distance}${result.reason ? `  (${result.reason})` : ""}`,
+      );
+    }
+    if (result.degraded || !result.stable) process.exitCode = 1;
+    return;
+  }
+
+  console.error(
+    "usage: aih measure distance <a.json> <b.json> [--revised surface=a,b] [--json]\n" +
+      "       aih measure stream <traces.json> [--perms N] [--seed N] [--json]\n" +
+      "       aih measure crystallize <evolved.json> <neutral.json> [--json]",
+  );
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// FA#6 — `aih experiment` (the P#46 eval framework's CLI surface)
+//
+//   aih experiment run <spec.json> [--exp-id <id>] [--retry-failed]
+//       [--mock] [--reps N] [--concurrency N] [--out <dir>]
+//       [--results-dir <dir>] [--external <cmd> --args-template "…{prompt}…"]
+//   aih experiment status <exp-id> [--results-dir <dir>]
+//
+// `run` executes the tasks × models × repetitions matrix against a subject
+// (bundled CLI by default) and persists per-cell status to
+// `<results-dir>/<exp-id>.results.json`. `--retry-failed` re-runs ONLY the
+// cells whose last status is not "passed" (failed/error/never-run) and merges
+// the new outcomes back into the same result set — saving tokens and time.
+// `status` prints the passed/failed/error distribution for an experiment id.
+//
+// NOTE: `aih eval` is already the repo QA gate (doctor+bootstrap+check+test),
+// so the experiment framework lives under `aih experiment` instead of the
+// roadmap's literal `aih eval --retry-failed`.
+// ---------------------------------------------------------------------------
+interface ExperimentSpec {
+  tasks: EvalTask[];
+  models: EvalModelSpec[];
+  repetitions?: number;
+}
+
+function parseSpecFile(path: string): ExperimentSpec {
+  const abs = resolve(path);
+  if (!existsSync(abs)) {
+    console.error(`error: spec file not found: ${abs}`);
+    process.exit(1);
+  }
+  let spec: ExperimentSpec;
+  try {
+    spec = JSON.parse(readFileSync(abs, "utf8")) as ExperimentSpec;
+  } catch (e) {
+    console.error(`error: spec is not valid JSON: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  }
+  if (!Array.isArray(spec.tasks) || spec.tasks.length === 0) {
+    console.error('error: spec must have a non-empty "tasks" array');
+    process.exit(1);
+  }
+  for (const t of spec.tasks) {
+    if (!t.id || typeof t.prompt !== "string") {
+      console.error('error: every task needs an "id" and a "prompt"');
+      process.exit(1);
+    }
+  }
+  if (!Array.isArray(spec.models) || spec.models.length === 0) {
+    spec.models = [{ model: "mock" }];
+  }
+  spec.repetitions = Math.max(1, Math.floor(spec.repetitions ?? 1));
+  return spec;
+}
+
+function defaultExpId(spec: ExperimentSpec): string {
+  // Deterministic id from the task ids + model ids (stable across runs so
+  // --retry-failed / --status can find the same result set without --exp-id).
+  const seed = [spec.tasks.map((t) => t.id).join(","), spec.models.map((m) => m.model).join(",")].join("|");
+  let h = 5381;
+  for (let i = 0; i < seed.length; i += 1) h = (h * 33 + seed.charCodeAt(i)) >>> 0;
+  return `exp-${h.toString(16)}`;
+}
+
+async function cmdExperiment(positionals: string[], flags: Record<string, string | boolean>) {
+  const cwd = process.cwd();
+  const sub = positionals.shift() ?? "";
+  const resultsDir = str(flags, "results-dir") ?? join(cwd, ".aih", "eval");
+  const outDir = str(flags, "out") ?? join(resultsDir, "cells");
+
+  if (sub === "status") {
+    const expId = positionals.shift() ?? str(flags, "exp-id");
+    if (!expId) {
+      console.error("error: `aih experiment status <exp-id>` needs an experiment id");
+      process.exit(1);
+    }
+    const res = loadResults(resultsDir, expId);
+    if (!res) {
+      console.error(`error: no results for "${expId}" under ${resultsDir}`);
+      process.exit(1);
+    }
+    const s = statusSummary(res.cells);
+    console.log(`experiment ${expId}`);
+    console.log(`  updated: ${res.updatedAt}`);
+    console.log(`  cells:   ${s.total}  (passed ${s.passed} · failed ${s.failed} · error ${s.error})`);
+    console.log(`  skipped: ${res.skipped.length ? res.skipped.join(", ") : "(none)"}`);
+    const failed = Object.values(res.cells).filter((r) => r.status !== "passed");
+    if (failed.length > 0) {
+      console.log(`  not passed (${failed.length}):`);
+      for (const r of failed) console.log(`    - ${r.cellId}  ${r.status}${r.failureReason ? `  — ${r.failureReason}` : ""}`);
+    }
+    if (bool(flags, "json")) {
+      console.log(JSON.stringify({ expId, totals: s, cells: res.cells, skipped: res.skipped }, null, 2));
+    }
+    return;
+  }
+
+  if (sub !== "run" && sub !== "retry") {
+    console.error(
+      "usage: aih experiment run <spec.json> [--exp-id <id>] [--retry-failed] [--mock] [--reps N] [--concurrency N] [--out <dir>] [--results-dir <dir>]\n" +
+        "       aih experiment status <exp-id> [--results-dir <dir>] [--json]\n" +
+        "spec.json: { \"tasks\": [{id, prompt, expect[]}], \"models\": [{model, provider?, baseUrl?}], \"repetitions\": N }",
+    );
+    process.exit(1);
+  }
+
+  const specPath = positionals.shift();
+  if (!specPath) {
+    console.error(`error: \`aih experiment ${sub}\` needs a spec.json path`);
+    process.exit(1);
+  }
+  const spec = parseSpecFile(specPath);
+  // --mock forces the bundled mock subject regardless of the spec's models.
+  if (bool(flags, "mock")) spec.models = [{ model: "mock" }];
+  const reps = Math.max(1, Math.floor(Number(str(flags, "reps") ?? "") || spec.repetitions || 1));
+  const expId = str(flags, "exp-id") ?? defaultExpId(spec);
+  const retryOnly = sub === "retry" || bool(flags, "retry-failed");
+
+  // Build the subject adapter.
+  let subject: SubjectAdapter;
+  if (str(flags, "external")) {
+    const tmpl = (str(flags, "args-template") ?? "{prompt}").split(/\s+/).filter(Boolean);
+    subject = externalSubjectAdapter(str(flags, "external")!, tmpl, {
+      timeoutMs: Number(str(flags, "timeout") ?? "") || 120_000,
+    });
+  } else {
+    // cliEntry is the `cli/` directory; cliSubjectAdapter appends
+    // `dist/index.js` (matches the smoke test's cliRoot resolution).
+    const cliEntry = dirname(dirname(fileURLToPath(import.meta.url)));
+    subject = cliSubjectAdapter(cliEntry, {
+      timeoutMs: Number(str(flags, "timeout") ?? "") || 120_000,
+    });
+  }
+
+  // FA#6 — retry: restrict to the failed/never-run cells of this exp-id.
+  let onlyCells: string[] | undefined;
+  if (retryOnly) {
+    const prev = loadResults(resultsDir, expId);
+    if (!prev) {
+      console.error(`error: --retry-failed needs a prior run for "${expId}" (run \`aih experiment run ${specPath} --exp-id ${expId}\` first)`);
+      process.exit(1);
+    }
+    const allCells = expandCells(spec.tasks, spec.models, reps);
+    onlyCells = retryCellIds(allCells, prev);
+    if (onlyCells.length === 0) {
+      console.log(`all cells for "${expId}" already passed — nothing to retry`);
+      return;
+    }
+    console.log(`retrying ${onlyCells.length} non-passed cell(s) for "${expId}": ${onlyCells.join(", ")}`);
+  }
+
+  const concurrency = Math.max(1, Math.floor(Number(str(flags, "concurrency") ?? "") || 4));
+  const report = await runExperiment(
+    spec.tasks,
+    spec.models,
+    reps,
+    subject,
+    {
+      outDir,
+      budget: { concurrency },
+      expId,
+      resultsDir,
+      onlyCells,
+    },
+  );
+
+  const t = report.totals;
+  console.log(`experiment ${expId}  [${t.stopReason}]`);
+  console.log(`  cells:   ${report.results.length}  (passed ${t.passed} · failed ${t.failed} · error ${t.errors})`);
+  if (report.skippedCells.length > 0) console.log(`  skipped: ${report.skippedCells.length}  (${report.skippedCells.join(", ")})`);
+  console.log(`  usage:   ${t.usage.totalTokens} tokens  ·  cost ${t.costUsd.toFixed(4)}`);
+  console.log(`  results: ${resultsPath(resultsDir, expId)}`);
+  if (bool(flags, "json")) {
+    console.log(JSON.stringify({ expId, totals: t, results: report.results, skipped: report.skippedCells }, null, 2));
+  }
+  // Exit non-zero if any cell did not pass (CI-friendly), but a clean retry
+  // that fixed everything exits 0.
+  if (t.failed + t.errors > 0) process.exitCode = 1;
+}
+
 async function main() {
   const { command, positionals, flags } = parseArgs(process.argv.slice(2));
 
@@ -3950,7 +4390,7 @@ async function main() {
       const sub = positionals.shift() ?? "list";
       if (sub === "list") return cmdSessionList();
       if (sub === "show") return cmdSessionShow(positionals[0] ?? latestSessionNameOrExit());
-      if (sub === "rm") return cmdSessionRm(positionals);
+      if (sub === "rm") return cmdSessionRm(positionals, flags);
       if (sub === "export") {
         return cmdSessionExport(
           positionals[0] ?? latestSessionNameOrExit(),
@@ -4016,6 +4456,10 @@ async function main() {
       return cmdInit(positionals, flags);
     case "workflow":
       return cmdWorkflow(positionals, flags);
+    case "experiment":
+      return cmdExperiment(positionals, flags);
+    case "measure":
+      return cmdMeasure(positionals, flags);
     case "mcp":
       return cmdMcp(flags);
     case "serve":
