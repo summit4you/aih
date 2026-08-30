@@ -654,7 +654,12 @@ export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
   // MiMo-Code parity: reply in the user's language instead of defaulting to
   // English (the surrounding system prompt is English, which biases the model).
-  const LANGUAGE_RULE = `\n\n# Language\nIMPORTANT: Your response must ALWAYS strictly follow the same major language as the user.`;
+  // Strong form: ALL text output — including the one-line progress notes the
+  // model writes before each tool call, not just the final answer — must match
+  // the user's major language. Otherwise a Chinese user still sees a wall of
+  // English progress narration mid-task.
+  const LANGUAGE_RULE = `\n\n# Language
+IMPORTANT: Every piece of text you output to the user — the final answer AND the short progress notes you write before and between tool calls — must ALWAYS be in the same major language the user writes in. Do not narrate tool work in English when the user writes in Chinese.`;
   const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}${LANGUAGE_RULE}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
