@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PermissionRule } from "@aih/core";
+import { checkSchemaVersion, CONFIG_SCHEMA_VERSION, stampConfigVersion } from "@aih/core";
 import { userAihDir, userAihDirs } from "./paths.js";
 import { readJson } from "./read-json.js";
 import { loadEnvSafety, mergeSafety } from "./safety.js";
@@ -90,6 +91,13 @@ export interface McpServerConfig {
 }
 
 export interface AihConfig {
+  /**
+   * OC#5 — schema version of this config file. Absent on legacy files (accepted
+   * for backward compat); present when written by a versioning build. A build
+   * refuses to open a config whose schemaVersion exceeds its own max
+   * (CONFIG_SCHEMA_VERSION) — fail-closed, loud, never silent.
+   */
+  schemaVersion?: number;
   model?: string;
   baseUrl?: string;
   defaultProvider?: string;
@@ -184,13 +192,27 @@ const PROJECT_CONFIG_FILES = ["aih.json", ".aih/config.json"];
 
 function readConfig(path: string): AihConfig {
   if (!existsSync(path)) return {};
+  let cfg: AihConfig;
   try {
-    return readJson<AihConfig>(path);
+    cfg = readJson<AihConfig>(path);
   } catch (err) {
     throw new Error(
       `invalid config file ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  // OC#5 — refuse to open a config newer than this build (fail-closed, loud).
+  checkSchemaVersion(cfg.schemaVersion, CONFIG_SCHEMA_VERSION, "config", path);
+  return cfg;
+}
+
+/**
+ * OC#5 — write a config file, stamping the current schema version so a future
+ * (newer) build can detect it and an older build can refuse to open it.
+ */
+function writeConfigFile(path: string, cfg: AihConfig): void {
+  const stamped = stampConfigVersion(cfg as unknown as Record<string, unknown>) as AihConfig;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(stamped, null, 2)}\n`, "utf8");
 }
 
 export function loadLayers(): ConfigLayer[] {
@@ -453,8 +475,7 @@ export function saveSkillRegistry(url: string): string {
     candidates.find((p) => existsSync(p)) ?? join(userAihDir(), "config.json");
   const cfg = readConfig(path);
   cfg.skills = { ...(cfg.skills ?? {}), registry: url };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  writeConfigFile(path, cfg);
   return path;
 }
 
@@ -488,8 +509,7 @@ export function savePermissionRule(rule: PermissionRule): string {
     list.push(rule);
   }
   cfg.permissions = list;
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  writeConfigFile(path, cfg);
   return path;
 }
 

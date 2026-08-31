@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { SessionLog } from "./session-log.js";
+import { SESSION_SCHEMA_VERSION, checkSchemaVersion } from "./schema-version.js";
 import type { SessionEvent } from "./types.js";
 
 export class SessionStore {
@@ -24,6 +25,10 @@ export class SessionStore {
     if (log.all().length === 0 && existsSync(this.#path)) return;
     const text = `${log.all().map((e) => JSON.stringify(e)).join("\n")}\n`;
     this.#publish(text);
+    // OC#5 — record the schema version in the meta sidecar so an older build
+    // can refuse to open this session (fail-closed, loud, never silent).
+    const existing = this.#readMeta();
+    this.#writeMeta({ title: existing.title, schemaVersion: SESSION_SCHEMA_VERSION });
     this.#rebaseline(log.all());
   }
 
@@ -69,6 +74,10 @@ export class SessionStore {
 
   load(): SessionLog | undefined {
     if (!existsSync(this.#path)) return undefined;
+    // OC#5 — refuse to open a session written by a newer schema (fail-closed).
+    // Legacy sessions have no meta sidecar (or one without schemaVersion) and
+    // load as before — backward compatible.
+    checkSchemaVersion(this.#readMeta().schemaVersion, SESSION_SCHEMA_VERSION, "session", this.#path);
     const lines = readFileSync(this.#path, "utf8").split("\n");
     const events: SessionEvent[] = [];
     const badLines: number[] = [];
@@ -132,18 +141,40 @@ export class SessionStore {
   }
 
   title(): string | undefined {
-    try {
-      const meta = JSON.parse(readFileSync(this.#metaPath(), "utf8")) as { title?: unknown };
-      return typeof meta.title === "string" && meta.title ? meta.title : undefined;
-    } catch {
-      return undefined;
-    }
+    const meta = this.#readMeta();
+    return typeof meta.title === "string" && meta.title ? meta.title : undefined;
   }
 
   setTitle(title: string): void {
+    const existing = this.#readMeta();
+    this.#writeMeta({ title, schemaVersion: existing.schemaVersion });
+  }
+
+  /**
+   * OC#5 — read the meta sidecar (title + schemaVersion). Returns an empty
+   * object when the file is absent or unparseable (legacy sessions have no
+   * meta sidecar at all — that is the backward-compat path).
+   */
+  #readMeta(): { title?: string; schemaVersion?: number } {
+    try {
+      const raw = JSON.parse(readFileSync(this.#metaPath(), "utf8")) as Record<string, unknown>;
+      return {
+        title: typeof raw.title === "string" ? raw.title : undefined,
+        schemaVersion: typeof raw.schemaVersion === "number" ? raw.schemaVersion : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /** Write the meta sidecar (title + schemaVersion), preserving existing fields. */
+  #writeMeta(meta: { title?: string; schemaVersion?: number }): void {
     const dir = dirname(this.#path);
     if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(this.#metaPath(), JSON.stringify({ title }) + "\n", "utf8");
+    const out: Record<string, unknown> = {};
+    if (meta.title !== undefined) out.title = meta.title;
+    if (meta.schemaVersion !== undefined) out.schemaVersion = meta.schemaVersion;
+    writeFileSync(this.#metaPath(), JSON.stringify(out) + "\n", "utf8");
   }
 
   static dir(root = ".aih/sessions"): string {

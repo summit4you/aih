@@ -5596,3 +5596,95 @@ console.log("══════════════════════�
 }
 
 
+
+// --- OC#5: versioned state, guarded upgrades (schema-version) --------------
+{
+  const {
+    checkSchemaVersion,
+    CONFIG_SCHEMA_VERSION,
+    SESSION_SCHEMA_VERSION,
+    stampConfigVersion,
+    stampSessionVersion,
+    SessionStore,
+    SessionLog,
+  } = await import("@aih/core");
+
+  // 1. Constants are positive integers.
+  assert(CONFIG_SCHEMA_VERSION >= 1, "OC#5 CONFIG_SCHEMA_VERSION >= 1");
+  assert(SESSION_SCHEMA_VERSION >= 1, "OC#5 SESSION_SCHEMA_VERSION >= 1");
+
+  // 2. checkSchemaVersion: undefined (legacy) → accepted, no throw.
+  let legacyOk = true;
+  try { checkSchemaVersion(undefined, CONFIG_SCHEMA_VERSION, "config"); }
+  catch { legacyOk = false; }
+  assert(legacyOk, "OC#5 checkSchemaVersion(undefined) → accepted (legacy backward-compat)");
+
+  // 3. checkSchemaVersion: version == max → accepted.
+  let eqOk = true;
+  try { checkSchemaVersion(CONFIG_SCHEMA_VERSION, CONFIG_SCHEMA_VERSION, "config"); }
+  catch { eqOk = false; }
+  assert(eqOk, "OC#5 checkSchemaVersion(version == max) → accepted");
+
+  // 4. checkSchemaVersion: version < max → accepted (newer file, older build).
+  let ltOk = true;
+  try { checkSchemaVersion(1, 2, "config"); }
+  catch { ltOk = false; }
+  assert(ltOk, "OC#5 checkSchemaVersion(version < max) → accepted");
+
+  // 5. checkSchemaVersion: version > max → throws (fail-closed, loud).
+  let threw = false, errMsg = "";
+  try { checkSchemaVersion(99, CONFIG_SCHEMA_VERSION, "config", "/tmp/aih.json"); }
+  catch (e) { threw = true; errMsg = String((e as Error).message); }
+  assert(threw, "OC#5 checkSchemaVersion(version > max) → throws (fail-closed)");
+  assert(errMsg.includes("schemaVersion 99"), "OC#5 throw message names the offending version");
+  assert(errMsg.includes("only supports up to"), "OC#5 throw message names the build max");
+  assert(errMsg.includes("Upgrade AIH"), "OC#5 throw message tells user to upgrade");
+
+  // 6. stampConfigVersion stamps the current version.
+  const stamped = stampConfigVersion({ model: "test" });
+  assert(stamped.schemaVersion === CONFIG_SCHEMA_VERSION, "OC#5 stampConfigVersion stamps schemaVersion");
+  assert(stamped.model === "test", "OC#5 stampConfigVersion preserves other fields");
+
+  // 7. stampSessionVersion stamps the current version.
+  const sStamped = stampSessionVersion({ type: "user/message" });
+  assert(sStamped.schemaVersion === SESSION_SCHEMA_VERSION, "OC#5 stampSessionVersion stamps schemaVersion");
+  assert((sStamped as { type: string }).type === "user/message", "OC#5 stampSessionVersion preserves event type");
+
+  // 8. SessionStore.save() writes schemaVersion to meta sidecar.
+  const tmpDir = mkdtempSync(join(tmpdir(), "aih-oc5-"));
+  const sessPath = join(tmpDir, "test.jsonl");
+  const log = new SessionLog();
+  log.append({ type: "user/message", turnId: "t1", text: "hello" });
+  const store = new SessionStore(sessPath);
+  store.save(log);
+  const metaRaw = readFileSync(`${sessPath}.meta.json`, "utf8");
+  const meta = JSON.parse(metaRaw);
+  assert(meta.schemaVersion === SESSION_SCHEMA_VERSION, "OC#5 SessionStore.save() writes schemaVersion to meta");
+
+  // 9. SessionStore.load() with a newer schemaVersion → throws.
+  writeFileSync(`${sessPath}.meta.json`, JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION + 100 }) + "\n");
+  let sessThrew = false;
+  try { new SessionStore(sessPath).load(); }
+  catch (e) { sessThrew = true; }
+  assert(sessThrew, "OC#5 SessionStore.load() refuses newer schema (fail-closed)");
+
+  // 10. SessionStore.load() with no meta (legacy) → loads fine.
+  rmSync(`${sessPath}.meta.json`);
+  const legacyLoad = new SessionStore(sessPath).load();
+  assert(legacyLoad !== undefined && legacyLoad.all().length === 1, "OC#5 SessionStore.load() legacy (no meta) → loads fine");
+
+  // 11. SessionStore.load() with matching schemaVersion → loads fine.
+  writeFileSync(`${sessPath}.meta.json`, JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION }) + "\n");
+  const matchLoad = new SessionStore(sessPath).load();
+  assert(matchLoad !== undefined && matchLoad.all().length === 1, "OC#5 SessionStore.load() matching schema → loads fine");
+
+  // 12. setTitle preserves schemaVersion in meta.
+  const store2 = new SessionStore(sessPath);
+  store2.setTitle("my session");
+  const meta2 = JSON.parse(readFileSync(`${sessPath}.meta.json`, "utf8"));
+  assert(meta2.title === "my session", "OC#5 setTitle writes title");
+  assert(meta2.schemaVersion === SESSION_SCHEMA_VERSION, "OC#5 setTitle preserves schemaVersion");
+
+  rmSync(tmpDir, { recursive: true, force: true });
+  console.log("ok: OC#5 versioned state guarded upgrades (schema-version)");
+}

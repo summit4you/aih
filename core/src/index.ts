@@ -15,6 +15,13 @@ export {
 } from "./recovery.js";
 export type { ToolFact, ToolRecoveryState, RecoveryReport } from "./recovery.js";
 export { SessionStore } from "./session-store.js";
+export {
+  CONFIG_SCHEMA_VERSION,
+  SESSION_SCHEMA_VERSION,
+  checkSchemaVersion,
+  stampConfigVersion,
+  stampSessionVersion,
+} from "./schema-version.js";
 export { AgentLoop, estimateTokensText } from "./agent-loop.js";
 export type { AgentLoopOptions } from "./agent-loop.js";
 export {
