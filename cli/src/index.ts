@@ -71,6 +71,8 @@ import {
 import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
 import type { SafetyHooks } from "./safety.js";
 import { projectTrustState, setProjectTrustState } from "./config.js";
+import { collectRulesSync, renderRules } from "./rules.js";
+import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
 import {
   ensureProjectTrust,
   hasProjectAssets,
@@ -705,6 +707,9 @@ export function loadSystemPrompt(): string {
   // English summary pushed the mid-prompt language rule out of reach and the
   // agent reverted to English notes). Nothing else is appended after it.
   const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
+  // opencode `rules` parity — AGENTS.md / CLAUDE.md / config `instructions`
+  // are merged in as mandatory project rules.
+  const rules = renderRules(collectRulesSync());
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [
@@ -712,11 +717,11 @@ export function loadSystemPrompt(): string {
       "Follow its contract strictly; prefer read actions; write actions may require approval.",
       "",
       content.slice(0, 6000),
-    ].join("\n") + guard;
+    ].join("\n") + guard + rules;
   }
   return (
     "You are an in-app assistant operating the connected application through its tools." +
-    guard
+    guard + rules
   );
 }
 
@@ -1764,8 +1769,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   }
 
 
+  const { byteToAction, warnings: kbWarnings } = buildKeybindDispatch(loadKeybinds());
   const tui = new Tui({
     placeholder: 'Ask anything... "add a todo"',
+    keybinds: { byteToAction },
+    keybindWarnings: kbWarnings,
     meta: () => ({ agent: agentMode, model: modelLabel, provider: providerLabel }),
     cwd: process.cwd(),
     statusLeft: `${appName} · aih ${VERSION}`,
@@ -2057,6 +2065,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     });
 
   tui.start();
+  for (const w of kbWarnings) tui.pushSystem(`keybind warning: ${w}`);
   tui.push({
     role: "banner",
     text: ["█▀▀▀ ▀█▀ █ █", "█▄▄█  █  ███", "█  █ ▄█▄ █ █"].join("\n"),

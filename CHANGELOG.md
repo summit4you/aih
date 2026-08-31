@@ -8,6 +8,23 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **Rules loading (opencode `rules` parity)**: AIH now reads and injects project
+  `AGENTS.md` (falling back to `CLAUDE.md` walking up from cwd), global
+  `~/.claude/CLAUDE.md` (Claude-Code compat, disable via
+  `AIH_DISABLE_CLAUDE_CODE[_{PROMPT,SKILLS}]`), and config `instructions`
+  (paths/globs/URLs) into the system prompt as mandatory `# Project rules`.
+  (`cli/src/rules.ts`)
+- **Provider policies (opencode `policies` parity)**: `policies` config controls
+  which configured LLM providers are usable — `provider.use` with `*`/`?`
+  wildcards, last-match-wins, global-over-project; a denied provider is blocked
+  at resolve and hidden from the model catalog even if configured.
+  (`cli/src/policies.ts`)
+- **Configurable keybinds (opencode `keybinds` parity)**: `tui.json` (project +
+  `~/.aih` global) remaps the core single-byte actions `palette` (default
+  ctrl-p), `help` (default `?`), `toggleMode`; collisions with reserved keys are
+  dropped with a warning. (`cli/src/keybinds.ts`)
+
 ## [0.4.0] - 2026-08-29
 
 ### Added

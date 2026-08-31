@@ -710,7 +710,9 @@ AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认
 | `apply_patch` | 多文件补丁（Add/Update/Delete/Move，opencode 格式） | ask |
 
 plan 模式下所有 `ask` 写工具自动隐藏。未对齐 opencode 的仅 `lsp`（语言服务器基建）
-与实验性 `execute`(code-mode)——前者属 MCP 外挂范畴，后者由 run_cmd + roadmap 沙箱 seam 覆盖。
+与实验性 `execute`(code-mode)——前者属 MCP 外挂范畴，后者由 run_cmd + roadmap 沙箱
+seam 覆盖。除工具集外，opencode 的 `rules`（AGENTS.md/CLAUDE.md/instructions）、
+`policies`（provider.use）、`keybinds`（tui.json）三块能力也已对齐——见 Configuration 节。
 
 ### 安全与调试
 
@@ -780,6 +782,64 @@ L0 接入层   mcp-server/  AppAdapter: Context(读) / Action(写,带权限) / E
 在 `aih models` 与 TUI 的 `ctrl-p` 模型选择器里各占一行，用
 `/model <provider>/<model>` 或直接点选即可热切换——适合把免费档 / 多档模型
 都挂在一个端点下随时切。
+
+### 规则（`AGENTS.md` / `CLAUDE.md` / `instructions` — opencode `rules` parity）
+
+AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**（对齐 opencode 的
+`rules` 机制，此前只读 APP.md 应用契约）。加载顺序（同类中第一个命中优先）：
+
+1. **项目规则** — 从 `cwd` 向上逐层找 `AGENTS.md`（无则回退 `CLAUDE.md`）；
+2. **全局规则** — `~/.claude/CLAUDE.md`（Claude Code 兼容，`AIH_DISABLE_CLAUDE_CODE=1`
+   关闭，`AIH_DISABLE_CLAUDE_CODE_PROMPT=1` 只关此文件）；
+3. **配置 `instructions`** — 任意已信任配置层的 `instructions` 数组（路径 / glob /
+   远程 URL）。
+
+```json
+{
+  "instructions": ["CONTRIBUTING.md", "docs/guidelines.md", ".cursor/rules/*.md"]
+}
+```
+
+规则内容被合并进系统提示的 `# Project rules` 段（每条 6000 字符预算），标记为
+`mandatory`，且会覆盖默认行为。Claude Code 兼容可在 `AIH_DISABLE_CLAUDE_CODE`
+家族环境变量下按需关闭。
+
+### 策略（`policies` — opencode `policies` parity）
+
+`policies` 控制**哪些已配置的 LLM provider 可用**，与 `permissions`（管工具）
+正交——被 deny 的 provider 即使配了凭据也不可选、不可用。资源支持 `*` / `?`
+通配；**最后一个匹配的语句生效**（因此宽规则放前、特例放后）；全局策略优先于
+项目策略（仓库无法重新启用你在全局 deny 的 provider）；无匹配默认放行。
+
+```json
+{
+  "policies": [
+    { "effect": "deny", "action": "provider.use", "resource": "*" },
+    { "effect": "allow", "action": "provider.use", "resource": "opencode" }
+  ]
+}
+```
+
+以上配置只允许 `opencode` provider，其余全部不可用。
+
+### 快捷键（`tui.json` — opencode `keybinds` parity）
+
+核心操作键位可通过 `tui.json`（cwd 项目级 + `~/.aih/tui.json` 全局）重绑，全局
+覆盖项目。支持 `ctrl+<letter>`、`tab`、单个可打印字符、`none`（禁用）。与内置
+保留键（Enter/Ctrl+C 等）冲突的映射会被丢弃并告警。
+
+```json
+{
+  "keybinds": {
+    "palette": "ctrl+x",
+    "toggleMode": "none",
+    "help": "?"
+  }
+}
+```
+
+默认：`palette=ctrl+p`、`help=?`；`toggleMode` 默认不设独立键（Tab 已经驱动
+补全与 build/plan 切换）。`Alt+…`/功能键属转义序列，超出单字节重绑范围。
 
 ### 多 MCP 服务器（`mcpServers`）
 

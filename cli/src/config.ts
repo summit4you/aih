@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PermissionRule } from "@aih/core";
 import { checkSchemaVersion, CONFIG_SCHEMA_VERSION, stampConfigVersion } from "@aih/core";
+import type { Policy } from "./policies.js";
+import { loadPolicies, providerAllowed } from "./policies.js";
 import { userAihDir, userAihDirs } from "./paths.js";
 import { readJson } from "./read-json.js";
 import { loadEnvSafety, mergeSafety } from "./safety.js";
@@ -121,6 +123,19 @@ export interface AihConfig {
   prices?: Record<string, { input: number; output: number }>;
   /** external skill registry (opencode-compatible index.json base URL(s)) */
   skills?: { registry?: string | string[] };
+  /**
+   * opencode `policies` parity — control which configured resources (LLM
+   * providers) AIH may use. A provider denied by policy is not available for
+   * model selection or use, even if configured. Last matching statement wins.
+   *   { "policies": [ { "effect":"deny", "action":"provider.use", "resource":"openai" } ] }
+   */
+  policies?: Policy[];
+  /**
+   * opencode `rules` parity — extra instruction files (paths, globs, or remote
+   * URLs) merged into the system prompt alongside AGENTS.md / CLAUDE.md.
+   * e.g. ["CONTRIBUTING.md", "docs/guidelines.md", ".cursor/rules/*.md"]
+   */
+  instructions?: string[];
   /**
    * E#18 — named agent profiles: `--as <name>` selects one. A profile carries
    * its own permission rules (applied on top of the base ruleset) and an
@@ -535,8 +550,11 @@ export interface ModelCatalogEntry {
 export function loadModelCatalog(activeProvider?: string, activeModel?: string): ModelCatalogEntry[] {
   const layers = loadLayers();
   const mergedCfg = merged(layers);
+  // opencode `policies` parity — a denied provider is not selectable.
+  const pols = loadPolicies(layers);
   const out: ModelCatalogEntry[] = [];
   for (const [name, p] of Object.entries(mergedCfg.providers ?? {})) {
+    if (!providerAllowed(pols, name)) continue; // denied by policy → hidden
     // A provider may expose several selectable models: the primary `model`
     // plus any `models[]` extras (string ids or F#34 `{ model, contextWindow }`
     // objects). Each becomes its own catalog entry.
@@ -628,6 +646,17 @@ export function resolveLlm(opts: {  flagModel?: string;
   const cfg = merged(layers);
 
   const providerName = opts.flagProvider ?? cfg.defaultProvider;
+  // opencode `policies` parity — a provider denied by policy is unusable even
+  // if configured (throws on resolve so model use is blocked, not just hidden).
+  if (providerName) {
+    const pols = loadPolicies(layers);
+    if (!providerAllowed(pols, providerName)) {
+      throw new Error(
+        `provider "${providerName}" is denied by policy (action provider.use) — ` +
+        `remove it from the deny policy in aih.json / config.json to use it`,
+      );
+    }
+  }
   let provider: ProviderConfig | undefined;
   if (providerName) {
     provider = cfg.providers?.[providerName];

@@ -5688,3 +5688,79 @@ console.log("══════════════════════�
   rmSync(tmpDir, { recursive: true, force: true });
   console.log("ok: OC#5 versioned state guarded upgrades (schema-version)");
 }
+
+// --- OC parity: rules (AGENTS.md/CLAUDE.md/instructions) + policies + keybinds
+{
+  const {
+    findProjectRuleFiles,
+    collectRulesSync,
+    renderRules,
+  } = await import("./rules.js");
+  const {
+    evaluatePolicy,
+    wildcardMatch,
+    providerAllowed,
+  } = await import("./policies.js");
+  const {
+    loadKeybinds,
+    keyToBytes,
+    buildKeybindDispatch,
+  } = await import("./keybinds.js");
+  const { loadSystemPrompt } = await import("./index.js");
+
+  // ---- RULES ----
+  const ruleDir = mkdtempSync(join(tmpdir(), "aih-rules-"));
+  writeFileSync(join(ruleDir, "AGENTS.md"), "# Repo Rules\nAlways use tabs.\n");
+  const f = findProjectRuleFiles(ruleDir);
+  assert(f.length === 1 && f[0].endsWith("AGENTS.md"), "rules: finds project AGENTS.md by walking up");
+  const blocks = collectRulesSync(ruleDir);
+  assert(blocks.length === 1, "rules: collects the AGENTS.md block");
+  assert(blocks[0].content.includes("Always use tabs"), "rules: block carries rule content");
+  const rendered = renderRules(blocks);
+  assert(rendered.includes("Project rules") && rendered.includes("mandatory"), "rules: render marks rules mandatory");
+  // CLAUDE.md fallback (AGENTS.md absent → CLAUDE.md)
+  const fallbackDir = mkdtempSync(join(tmpdir(), "aih-rules-"));
+  writeFileSync(join(fallbackDir, "CLAUDE.md"), "# Claude rules\nNo commits.\n");
+  const fb = findProjectRuleFiles(fallbackDir);
+  assert(fb.length === 1 && fb[0].endsWith("CLAUDE.md"), "rules: falls back to CLAUDE.md when no AGENTS.md");
+  // loadSystemPrompt injection
+  const savedCwd = process.cwd();
+  process.chdir(ruleDir);
+  const sp = loadSystemPrompt();
+  process.chdir(savedCwd);
+  assert(sp.includes("Project rules"), "rules: loadSystemPrompt injects the Project rules section");
+  assert(sp.includes("Always use tabs"), "rules: system prompt carries rule content");
+  rmSync(ruleDir, { recursive: true, force: true });
+  rmSync(fallbackDir, { recursive: true, force: true });
+
+  // ---- POLICIES ----
+  assert(wildcardMatch("company-*", "company-us"), "policies: '*' wildcard matches");
+  assert(wildcardMatch("compan?-us", "company-us"), "policies: '?' wildcard matches");
+  assert(!wildcardMatch("compan?-us", "company-eu"), "policies: '?' does not match different char");
+  const denyAllAllowOne = [
+    { effect: "deny" as const, action: "provider.use" as const, resource: "*" },
+    { effect: "allow" as const, action: "provider.use" as const, resource: "anthropic" },
+  ];
+  assert(evaluatePolicy(denyAllAllowOne, "provider.use", "anthropic") === "allow", "policies: last-match-wins → anthropic allowed");
+  assert(evaluatePolicy(denyAllAllowOne, "provider.use", "openai") === "deny", "policies: deny-all blocks openai");
+  assert(providerAllowed(undefined, "openai") === true, "policies: no policy → allowed by default");
+  assert(providerAllowed(denyAllAllowOne, "openai") === false, "policies: providerAllowed false for denied");
+
+  // ---- KEYBINDS ----
+  const def = buildKeybindDispatch(loadKeybinds());
+  assert(def.byteToAction["\x10"] === "palette", "keybinds: default palette = ctrl-p");
+  assert(def.byteToAction["?"] === "help", "keybinds: default help = ?");
+  assert(!Object.values(def.byteToAction).includes("toggleMode"), "keybinds: toggleMode not keyed by default");
+  assert(keyToBytes("ctrl+p") === "\x10", "keybinds: ctrl+p → \\x10");
+  assert(keyToBytes("tab") === "\t", "keybinds: tab → \\t");
+  assert(keyToBytes("none") === undefined, "keybinds: none → disabled");
+  // custom palette remap
+  const custom = buildKeybindDispatch({ palette: "ctrl+x", toggleMode: "none", help: "?" });
+  assert(custom.byteToAction["\x18"] === "palette", "keybinds: remap palette to ctrl+x");
+  assert(custom.byteToAction["\x10"] === undefined, "keybinds: old palette byte no longer bound");
+  // collision is dropped with warning
+  const clash = buildKeybindDispatch({ palette: "ctrl+p", toggleMode: "ctrl+p", help: "?" });
+  assert(clash.warnings.length === 1 && clash.warnings[0].includes("toggleMode"), "keybinds: colliding remap dropped with warning");
+
+  console.log("ok: OC-parity rules + policies + keybinds");
+}

@@ -1,6 +1,7 @@
 import { accent, bold, blue, cyan, danger, dim, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
+import type { KeybindAction } from "./keybinds.js";
 import stringWidth from "string-width";
 
 export interface TodoItem {
@@ -69,6 +70,14 @@ export interface TuiOptions {
   onTab?(): void;
   /** open the command palette (ctrl-p) */
   onPalette?(): void;
+  /**
+   * Keybinds — remap of core-action keystrokes (opencode `keybinds` parity).
+   * Maps raw bytes → action name, built by `cli/keybinds.ts`. When absent, the
+   * built-in defaults apply (palette=ctrl-p, toggleMode=tab, help=?).
+   */
+  keybinds?: { byteToAction: Record<string, KeybindAction> };
+  /** Keybind load/validation warnings to surface to the user at startup. */
+  keybindWarnings?: string[];
   /**
    * Fixed terminal width override (cols). When set, the TUI uses this instead
    * of process.stdout.columns — for tests, embedding and replay harnesses.
@@ -477,6 +486,8 @@ export class Tui {
   #groupCache = new Map<number, { w: number; d: boolean; open: boolean; lines: string[] }>();
   #batching = false;
   #edit = "";
+  #keybinds: Record<string, KeybindAction> = {};
+  #keybindWarnings: string[] = [];
   #cursor = 0;
   #history: string[] = [];
   #held = "";
@@ -517,6 +528,8 @@ export class Tui {
 
 constructor(opts: TuiOptions) {
     this.#opts = opts;
+    this.#keybinds = opts.keybinds?.byteToAction ?? {};
+    this.#keybindWarnings = opts.keybindWarnings ?? [];
     if (typeof opts.width === "number" && opts.width > 0) this.#cols = Math.floor(opts.width);
   }
 
@@ -1112,21 +1125,28 @@ constructor(opts: TuiOptions) {
       this.#pasteChar(ch);
       return;
     }
-    if (ch === "\x10" && !this.#overlay) {
-      this.#opts.onPalette?.();
-      return;
-    }
-    // `?` opens help only on an empty, idle composer — in any other state it
-    // is a perfectly ordinary question mark.
-    if (
-      ch === "?" &&
-      !this.#overlay &&
-      !this.#question &&
-      !this.#confirm &&
-      this.#edit === ""
-    ) {
-      this.openHelp();
-      return;
+    // Keybind dispatch (opencode `keybinds` parity): an incoming byte that a
+    // configured keybind maps to an action fires that action. The palette byte
+    // (default ctrl-p) and help-byte (default ?) both live here. Overlay /
+    // question / confirm states take precedence so a remap never hijacks a
+    // modal prompt's own keys.
+    if (!this.#overlay && !this.#question && !this.#confirm) {
+      const action = this.#keybinds[ch];
+      if (action === "palette") {
+        this.#opts.onPalette?.();
+        return;
+      }
+      if (action === "toggleMode") {
+        this.#opts.onTab?.();
+        return;
+      }
+      if (action === "help") {
+        // Help only on an empty, idle composer; otherwise it's a plain '?'.
+        if (ch === "?" && this.#edit === "") {
+          this.openHelp();
+          return;
+        }
+      }
     }
     if (this.#overlay) {
       if (ch === "\x1b" || this.#held) {
