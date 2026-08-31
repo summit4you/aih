@@ -24,6 +24,16 @@ the versions listed here (`scripts/package` derives the version from
   `~/.aih` global) remaps the core single-byte actions `palette` (default
   ctrl-p), `help` (default `?`), `toggleMode`; collisions with reserved keys are
   dropped with a warning. (`cli/src/keybinds.ts`)
+- **Credential ownership isolation (OC#7, OpenClaw "secrets have owners")**:
+  a credential-class failure (auth 401/403, or quota exhaustion) on a provider
+  DEGRADES THAT OWNER — recorded in a user-level `owner.json` with a redacted
+  reason; the error still propagates (no silent auto-fallback to another
+  credential). A later successful call auto-clears the degradation. `aih models`
+  marks degraded owners (`⚠ degraded`), and `aih models`/`aih stats` print a
+  redacted "degraded owners" report with `--clear-degraded` to reset.
+  Hard-fail still blocks: missing key / unknown provider / policy-denied
+  providers throw at resolve time. (`cli/src/owner-state.ts`,
+  `core/src/seams/llm-openai.ts`)
 
 ## [0.4.0] - 2026-08-29
 

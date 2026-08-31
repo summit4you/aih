@@ -74,6 +74,13 @@ import { projectTrustState, setProjectTrustState } from "./config.js";
 import { collectRulesSync, renderRules } from "./rules.js";
 import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
 import {
+  clearAllOwnerDegraded,
+  clearOwnerDegraded,
+  listDegradedOwners,
+  markOwnerDegraded,
+  renderDegradationReport,
+} from "./owner-state.js";
+import {
   ensureProjectTrust,
   hasProjectAssets,
 } from "./project-trust.js";
@@ -618,6 +625,7 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
   // Number("") is 0 and Number.isFinite(0) is true, which silently disabled
   // ALL retries (the "fetch failed" on every provider blip).
   const retries = parseRetryEnv(process.env.AIH_RETRIES);
+  const owner = resolved.provider;
   return new OpenAICompatibleLLM({
     baseUrl: resolved.baseUrl.value ?? "https://api.openai.com/v1",
     apiKey,
@@ -625,6 +633,13 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
     ...(resolved.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     ...(retries !== undefined ? { retries } : {}),
     ...(Object.keys(resolved.headers).length > 0 ? { headers: resolved.headers } : {}),
+    // OC#7 — credential ownership isolation: a credential failure on this
+    // provider degrades ITS OWNER (recorded for `aih models`/doctor/status);
+    // a later success auto-clears it. Never auto-falls back (the error still
+    // propagates; re-selecting another owner is an explicit user choice).
+    ...(owner ? { owner } : {}),
+    onCredentialFailure: (o, cls, reason) => markOwnerDegraded(o, cls, reason),
+    onOwnerSuccess: (o) => clearOwnerDegraded(o),
   });
 }
 
@@ -3636,6 +3651,14 @@ function cmdStats() {
   if (genMs > 0 && genCompletion > 0) {
     console.log(`streaming  ${fmtTps(genCompletion / (genMs / 1000))} (completion tokens / real generation time)`);
   }
+  // OC#7 — `aih stats` names every degraded credential owner (redacted), the
+  // way opencode's `doctor`/`status` surface degraded owners.
+  const degReport = renderDegradationReport(listDegradedOwners());
+  if (degReport) {
+    console.log("");
+    console.log(degReport);
+    console.log("  (clear with: aih models --clear-degraded)");
+  }
 }
 
 /**
@@ -4201,7 +4224,9 @@ async function cmdSkills(
   process.exit(1);
 }
 
-function cmdModels() {
+function cmdModels(flags: Record<string, string | boolean>) {
+  // OC#7 — `aih models --clear-degraded` resets the owner degradation registry.
+  if (bool(flags, "clear-degraded")) clearAllOwnerDegraded();
   const resolved = resolveLlm({
     flagProvider: undefined,
     flagModel: undefined,
@@ -4220,17 +4245,27 @@ function cmdModels() {
     string,
     { model?: string; models?: Array<string | { model: string }>; baseUrl?: string }
   >;
+  // OC#7 — mark owners whose credential is degraded, so `aih models` names
+  // every down credential (redacted) instead of hiding it.
+  const degraded = new Map(listDegradedOwners().map((r) => [r.owner, r]));
   for (const [name, p] of Object.entries(providers)) {
     const ids = [
       ...(p.model !== undefined ? [p.model] : []),
       ...normalizeModelEntries(p.models).map((e) => e.id).filter((m) => m !== p.model),
     ];
     if (!ids.length) ids.push("-");
-    for (const mid of ids) rows.push([name, mid, p.baseUrl ?? "-"]);
+    const mark = degraded.has(name) ? " ⚠ degraded" : "";
+    for (const mid of ids) rows.push([`${name}${mark}`, mid, p.baseUrl ?? "-"]);
   }
-  console.log(`${"provider".padEnd(20)} ${"model".padEnd(28)} base-url`);
+  console.log(`${"provider".padEnd(22)} ${"model".padEnd(28)} base-url`);
   for (const [provider, model, baseUrl] of rows) {
-    console.log(`${provider.padEnd(20)} ${model.padEnd(28)} ${baseUrl}`);
+    console.log(`${provider.padEnd(22)} ${model.padEnd(28)} ${baseUrl}`);
+  }
+  const report = renderDegradationReport(listDegradedOwners());
+  if (report) {
+    console.log("");
+    console.log(report);
+    console.log("  (clear with: aih models --clear-degraded)");
   }
 }
 
@@ -4800,7 +4835,7 @@ async function main() {
     case "config":
       return cmdConfig(flags);
     case "models":
-      return cmdModels();
+      return cmdModels(flags);
     case "agents":
       return cmdAgents();
     case "init":

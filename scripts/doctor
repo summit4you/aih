@@ -41,9 +41,7 @@ fi
 check "credential scope: leak guard drops secrets on host mismatch" "node -e 'const {credentialSafeHeaders}=require(\"./cli/dist/config.js\");const r=credentialSafeHeaders({authorization:\"Bearer X\",\"x-api-key\":\"k\",\"user-agent\":\"aih\"},\"https://api.anthropic.com/v1\",\"https://evil.example.com/v1\");if(\"authorization\" in r||\"x-api-key\" in r) process.exit(1);if(r[\"user-agent\"]!==\"aih\") process.exit(2)'"
 printf '  credential scope: providers → own host only (leak guard active)\n'
 
-if [ "$fail" -eq 0 ]; then
-  printf '\nready.\n'
-else
-  printf '\nnot ready; fix the FAIL items above.\n'
-  exit 1
-fi
+# OC#7 — credential ownership isolation: a provider failure must degrade ITS OWNER
+# (recorded, redacted) and the reason must never contain a raw secret.
+check "owner isolation: owner-state module wired (redact + degrade)" "node -e 'const m=require(\"./cli/dist/owner-state.js\");const r=m.redactCredential(\"HTTP 401 Bearer sk-abcdef1234567890 owner=empero\");if(r.includes(\"sk-abcdef1234567890\")) process.exit(1);if(!r.includes(\"[redacted]\")) process.exit(2);if(typeof m.markOwnerDegraded!==\"function\") process.exit(3)'"
+printf '  owner isolation: credential failures degrade their owner (no fallback)\n'

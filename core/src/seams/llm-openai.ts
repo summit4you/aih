@@ -53,6 +53,28 @@ export interface OpenAICompatibleOptions {
    * explicit cap to stay under it. Undefined → omit the field (provider default).
    */
   maxTokens?: number;
+  /**
+   * OC#7 — credential ownership isolation. When set, the provider's "owner"
+   * name for degradation attribution (a provider id such as "empero"). Undefined
+   * for consumers that are not owner-tracked (defaults off; no-op).
+   */
+  owner?: string;
+  /**
+   * OC#7 — invoked when a credential-class failure (auth 401/403, or quota
+   * exhaustion) is observed for `owner`. The runtime NEVER auto-falls back to a
+   * different credential — this hook only RECORDS the degradation (marks the
+   * owner unavailable) so a report can name it; the original error still
+   * propagates. Undefined → no hook (default behavior unchanged).
+   *
+   * `reason` is the raw failure text; the recorder is responsible for redacting
+   * it before persistence (see owner-state.redactCredential).
+   */
+  onCredentialFailure?: (owner: string, cls: "credential" | "quota", reason: string) => void;
+  /**
+   * OC#7 — invoked on a SUCCESSFUL completion for `owner`. Used to auto-clear a
+   * prior degradation once the credential demonstrably works again (recovery).
+   */
+  onOwnerSuccess?: (owner: string) => void;
 }
 
 interface OpenAIToolCall {
@@ -176,6 +198,32 @@ export class OpenAICompatibleLLM implements LLMAdapter {
     this.#sid = opencodeIDBody();
   }
 
+  /**
+   * OC#7 — record a credential-class degradation for this client's owner.
+   * Only fires when the client is owner-tracked AND a hook is installed; the
+   * original error is NOT swallowed (no auto-fallback; it continues to throw).
+   */
+  #notifyDeGrade(cls: "credential" | "quota", reason: string): void {
+    const { owner, onCredentialFailure } = this.#options;
+    if (!owner || !onCredentialFailure) return;
+    try {
+      onCredentialFailure(owner, cls, reason);
+    } catch {
+      /* the recorder must never break the request path */
+    }
+  }
+
+  /** OC#7 — a successful completion clears any prior degradation for the owner. */
+  #notifySuccess(): void {
+    const { owner, onOwnerSuccess } = this.#options;
+    if (!owner || !onOwnerSuccess) return;
+    try {
+      onOwnerSuccess(owner);
+    } catch {
+      /* best-effort; never break the success path */
+    }
+  }
+
   async complete(req: LLMRequest): Promise<LLMResponse> {
     const startedAt = Date.now(); // F#30: per-request generation span
     const { baseUrl, apiKey, model } = this.#options;
@@ -263,6 +311,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         const retryAfterNum = retryAfterRaw ? Number(retryAfterRaw) : NaN;
         const retryAfterSec = Number.isFinite(retryAfterNum) ? retryAfterNum : undefined;
         if (isQuotaExhaustion(res.status, text, retryAfterSec)) {
+          this.#notifyDeGrade("quota", message);
           throw new QuotaError(res.status, text, retryAfterSec ?? 0);
         }
         const cls = classifyProviderError(res.status, text);
@@ -270,6 +319,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
           attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
         }
         const httpError = new Error(message);
+        if (cls === "auth") this.#notifyDeGrade("credential", message);
         if ((cls === "retryable" || cls === "capacity") && attempt < attempts - 1) {
           lastError = httpError;
           continue;
@@ -337,6 +387,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
           if (stalled) {
             throw new StallError(accOut.text, stallMs);
           }
+          this.#notifySuccess();
           return {
             text: accOut.text,
             toolCalls: accOut.toolCalls,
@@ -348,7 +399,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
             genMs: Math.max(0, Date.now() - startedAt),
           };
         }
-        return toResponse(await res.json());
+        const ok = toResponse(await res.json());
+        this.#notifySuccess();
+        return ok;
       } catch (err) {
         if (req.signal?.aborted) throw err;
         // CC#49 — a stall with partial content is NOT retryable-blind: the

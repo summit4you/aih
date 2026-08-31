@@ -5764,3 +5764,104 @@ console.log("══════════════════════�
 
   console.log("ok: OC-parity rules + policies + keybinds");
 }
+
+// --- OC#7: credential ownership isolation (degrade own owner, never fallback)
+{
+  const {
+    redactCredential,
+    markOwnerDegraded,
+    clearOwnerDegraded,
+    clearAllOwnerDegraded,
+    isOwnerDegraded,
+    listDegradedOwners,
+    renderDegradationReport,
+  } = await import("./owner-state.js");
+
+  // ---- redaction: secrets masked, benign text kept ----
+  const r1 = redactCredential("llm request failed: HTTP 401 Bearer sk-abcdef1234567890 window");
+  assert(!/sk-abcdef1234567890/.test(r1) && r1.includes("[redacted]"), "OC#7 redact masks a bearer sk- token");
+  assert(!/[A-Za-z0-9]{28,}/.test(r1), "OC#7 redact masks long base62 runs");
+  const r2 = redactCredential("api-key=wp_0123456789abcdefghijklmnopqrstuv");
+  assert(!/wp_0123456/.test(r2) && r2.includes("[redacted]"), "OC#7 redact masks a key=value assignment");
+  const r3 = redactCredential("quota exhausted on provider X at /v1/chat/completions");
+  assert(r3.includes("quota exhausted on provider X"), "OC#7 redact keeps benign reason text");
+
+  // ---- isolated registry under AIH_HOME ----
+  const oHome = mkdtempSync(join(tmpdir(), "aih-owner-"));
+  const prevHome = process.env.AIH_HOME;
+  process.env.AIH_HOME = oHome;
+  clearAllOwnerDegraded();
+  markOwnerDegraded("empero", "credential", "HTTP 401 Bearer sk-empero-secret-token12345");
+  assert(isOwnerDegraded("empero"), "OC#7 markOwnerDegraded marks owner degraded");
+  assert(!isOwnerDegraded("opencode"), "OC#7 unrelated owner not degraded");
+  const listed = listDegradedOwners();
+  assert(listed.length === 1 && listed[0].owner === "empero", "OC#7 listDegradedOwners returns the owner");
+  assert(listed[0].cls === "credential", "OC#7 failure class recorded");
+  assert(!/sk-empero-secret-token12345/.test(listed[0].reason), "OC#7 persisted reason is redacted (no secret on disk)");
+  const rep = renderDegradationReport(listDegradedOwners());
+  assert(rep.includes("empero") && rep.includes("[credential]"), "OC#7 render report names owner + class");
+  assert(!/sk-empero-secret-token12345/.test(rep), "OC#7 render report is redacted");
+
+  // re-mark increments count
+  markOwnerDegraded("empero", "quota", "429 usage limit reached");
+  assert(listDegradedOwners()[0].count === 2, "OC#7 re-mark increments failure count");
+
+  // recovery: clear one / clear all
+  markOwnerDegraded("zhipu", "credential", "HTTP 403 forbidden");
+  clearOwnerDegraded("empero");
+  assert(!isOwnerDegraded("empero") && isOwnerDegraded("zhipu"), "OC#7 clearOwnerDegraded only clears the named owner");
+  clearAllOwnerDegraded();
+  assert(listDegradedOwners().length === 0, "OC#7 clearAllOwnerDegraded empties the registry");
+
+  if (prevHome === undefined) delete process.env.AIH_HOME;
+  else process.env.AIH_HOME = prevHome;
+  rmSync(oHome, { recursive: true, force: true });
+
+  // ---- LLM adapter: 401 degrades the owner AND the error still throws ----
+  // Load the built LLM adapter at runtime (TS-free) — the cli tsconfig's rootDir
+  // forbids static-importing core source, so resolve the compiled module.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const { OpenAICompatibleLLM } = (await import(
+    /* webpackIgnore: true */ new URL("../../core/dist/seams/llm-openai.js", import.meta.url).href
+  )) as any;
+  const degrades: Array<{ o: string; cls: string; reason: string }> = [];
+  const successes: string[] = [];
+  const failing = new OpenAICompatibleLLM({
+    baseUrl: "https://api.example.com/v1",
+    model: "m",
+    owner: "empero",
+    onCredentialFailure: (o: string, cls: string, reason: string) => degrades.push({ o, cls, reason }),
+    onOwnerSuccess: (o: string) => successes.push(o),
+    fetchImpl: async () =>
+      new Response("Unauthorized", { status: 401, headers: { "content-type": "text/plain" } }),
+  });
+  let threw = false;
+  try {
+    await failing.complete({ messages: [{ role: "user", content: "hi" }], tools: [] } as any);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "OC#7 auth failure still throws (no silent auto-fallback)");
+  assert(degrades.length === 1 && degrades[0].o === "empero" && degrades[0].cls === "credential",
+    "OC#7 401 fires onCredentialFailure for that owner as credential");
+  assert(successes.length === 0, "OC#7 failure does not clear the owner");
+
+  // an OK response clears a prior degradation (recovery)
+  const ok = new OpenAICompatibleLLM({
+    baseUrl: "https://api.example.com/v1",
+    model: "m",
+    owner: "opencode",
+    onCredentialFailure: (o: string, cls: string, reason: string) => degrades.push({ o, cls, reason }),
+    onOwnerSuccess: (o: string) => successes.push(o),
+    fetchImpl: async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "ok", role: "assistant" }, finish_reason: "stop" }], usage: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  await ok.complete({ messages: [{ role: "user", content: "hi" }], tools: [] } as any);
+  assert(successes.includes("opencode"), "OC#7 successful completion calls onOwnerSuccess (recovery)");
+  assert(degrades.length === 1, "OC#7 success does not degrade anyone");
+
+  console.log("ok: OC#7 credential ownership isolation (owner-state + adapter hook)");
+}

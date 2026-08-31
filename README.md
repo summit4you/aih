@@ -841,6 +841,36 @@ AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**�
 默认：`palette=ctrl+p`、`help=?`；`toggleMode` 默认不设独立键（Tab 已经驱动
 补全与 build/plan 切换）。`Alt+…`/功能键属转义序列，超出单字节重绑范围。
 
+### 凭据所有者隔离（OC#7 — OpenClaw「secrets have owners」）
+
+一条凭据失败时**只降级它的归属者（owner）**，绝不静默 fallback 到另一条凭据。
+AIH 的 owner 即一个已配置的 LLM provider（`empero` / `llamacpp` / `zhipu` /
+`opencode` …）。语义：
+
+- **可隔离降级** — provider 出现凭据类失败（401/403 认证、或配额耗尽）时，该
+  owner 被标记为不可用，在**用户级** `owner.json` 记录**脱敏**原因；原错误仍
+  照常抛出（不会自动换到别的凭据）。之后的一次**成功调用会自动清除**该降级。
+- **硬失败阻止启动** — 缺少必需 API key、未知 provider、被 policy deny 的
+  provider，都在解析时直接 throw（fail-closed），不降级糊弄。
+- **报告** — `aih models` 会在降级 provider 行标 `⚠ degraded`，并在末尾打印
+  `degraded owners` 报告（含脱敏原因）；`aih stats` 同样打印该报告。
+  `aih models --clear-degraded` 重置脱敏登记。
+
+```text
+$ aih models
+provider               model                       base-url
+...
+opencode ⚠ degraded    gpt-5.1-codex              https://opencode.ai
+
+degraded owners:
+  - opencode [credential] x2 @ 2026-08-31T…: llm request failed: HTTP 401 [redacted]
+  (clear with: aih models --clear-degraded)
+```
+
+选择另一个（未降级）owner 仍是**显式用户决策**——不是自动 fallback；`/model`、
+`--provider` 切到其它可用 provider 依然正常。实现见 `cli/src/owner-state.ts` +
+`core/src/seams/llm-openai.ts`（`onCredentialFailure` / `onOwnerSuccess` 钩子）。
+
 ### 多 MCP 服务器（`mcpServers`）
 
 除 `-s/--server` 指定单个 MCP server 外，配置里可以声明**多个** MCP 服务器，
