@@ -1,4 +1,4 @@
-import { COMPACT_CONTINUE_PROMPT } from "./prompts.js";
+import { COMPACT_CONTINUE_PROMPT, COMPACTION_STATE_GUARD, LANGUAGE_RULE } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { scanRecovery } from "./recovery.js";
 
@@ -300,11 +300,19 @@ export class SessionLog {
       .filter(Boolean)
       .join("\n\n");
     const summary = summaryBlock || undefined;
-    const systemContent = summary
+    // COMPACTION_STATE_GUARD rides along with every summary so a compacted
+    // agent verifies current state before re-implementing "pending" work (see
+    // prompts.ts). Always injected with a summary, never without one.
+    const summaryWithGuard = summary
+      ? `${summary}\n\n${COMPACTION_STATE_GUARD}`
+      : undefined;
+    const systemContent = summaryWithGuard
       ? systemPrompt
-        ? `${systemPrompt}\n\n${summary}`
-        : summary
-      : systemPrompt;
+        ? `${systemPrompt}\n\n${summaryWithGuard}\n\n${LANGUAGE_RULE}`
+        : `${summaryWithGuard}\n\n${LANGUAGE_RULE}`
+      : systemPrompt
+        ? `${systemPrompt}\n\n${LANGUAGE_RULE}`
+        : undefined;
     const messages: ChatMessage[] = [];
     if (systemContent) messages.push({ role: "system", content: systemContent });
     const pushMessage = (event: SessionEvent): void => {

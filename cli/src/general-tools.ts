@@ -14,7 +14,7 @@ import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
 import type { DiffLine } from "./diff.js";
 import { lineDiff } from "./diff.js";
 import { formatAfterWrite } from "./formatter.js";
-import { bestOfN } from "./maxmode.js";
+import { bestOfN, capAnswer, answerCapLimit } from "./maxmode.js";
 import { userAihDir } from "./paths.js";
 import { extractShellContext } from "./shell-context.js";
 
@@ -842,14 +842,24 @@ export function registerGeneralTools(
         .reverse()
         .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
       const rawAnswer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
+      // FB#5 — cap the answer that re-enters the parent context; spill the
+      // full text to .aih/outputs/ and point the capped answer at it.
+      const capped = capAnswer(rawAnswer, answerCapLimit(), opts.cwd ?? ".");
       // CC#50 — honest partial marking: a subagent that hit its step limit (or
       // stopped for any non-end_turn reason) is NOT a finished answer. Prefix a
       // marker so the parent doesn't consume a truncated result as complete.
       const finished = result.stopReason === "end_turn";
       const answer = finished
-        ? rawAnswer
-        : `[partial — subagent stopped at ${result.stopReason ?? "step limit"}; re-delegate with a narrower prompt or ask it to continue] ${rawAnswer}`;
-      return { description: String(a.description ?? ""), steps: result.steps, stopReason: result.stopReason, answer, partial: !finished };
+        ? capped.answer
+        : `[partial — subagent stopped at ${result.stopReason ?? "step limit"}; re-delegate with a narrower prompt or ask it to continue] ${capped.answer}`;
+      return {
+        description: String(a.description ?? ""),
+        steps: result.steps,
+        stopReason: result.stopReason,
+        answer,
+        partial: !finished,
+        ...(capped.truncated ? { truncated: true, fullOutputPath: capped.fullOutputPath } : {}),
+      };
     },
   });
 

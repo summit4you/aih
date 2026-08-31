@@ -86,6 +86,40 @@ A single tool result is capped (≈8KB); a whole turn's tool output is capped (�
 - If you have already gathered enough to answer, stop issuing tools and deliver your result.`;
 
 /**
+ * COMPACTION_STATE_GUARD — injected alongside every compaction summary to
+ * prevent the agent from re-doing work it already completed BEFORE the
+ * context was folded. Observed failure (same turn, two implementations of
+ * webfetch hardening): after auto-compaction the objective "diagnose and
+ * harden webfetch" survived verbatim while the "Completed" detail that it
+ * WAS already done was buried, so the agent re-wrote the whole module and hit
+ * duplicate-identifier compile errors. The guard makes the completion check
+ * explicit and cheap: the summary is a memory of PAST turns — current reality
+ * lives in the worktree/tools, so verify state before re-implementing.
+ */
+export const COMPACTION_STATE_GUARD = `# After a context compaction
+Everything before this point was summarized because the window filled up. The summary reflects PAST turns, not current reality. Before you implement anything the summary lists as pending:
+1. First verify the ACTUAL current state with a cheap read/grep/status check — the work may already be done (a previous turn completed it and the summary still lists it as pending).
+2. Only re-implement when verification proves it is genuinely missing or broken.
+3. If verification shows the work IS already present in the worktree (uncommitted or committed), treat it as YOUR OWN earlier work from this session unless you have hard evidence otherwise — do NOT assume it belongs to a parallel session. "Parallel session" is the last-resort explanation, not the default. Reuse and finish it; do not rebuild it.
+4. Never restart a task that is already complete: confirm with evidence, not from memory.`;
+
+/**
+ * LANGUAGE_RULE — always appended at the VERY END of the system prompt so it
+ * is the last instruction the model reads (buried mid-prompt it loses to the
+ * surrounding English guardrails). Observed failure: after a compaction the
+ * English summary pushed the language rule out of the recency window and the
+ * agent reverted to English progress notes for a Chinese-speaking user.
+ *
+ * Wording is deliberately language-AGNOSTIC (opencode kimi.txt parity):
+ * "the same language as the user", never a hardcoded language like Chinese —
+ * a hardcoded language would be wrong for any other user and reads as
+ * "English is fine unless the user writes Chinese". The rule is appended
+ * after any summary/guard so nothing can follow it.
+ */
+export const LANGUAGE_RULE = `# Language
+IMPORTANT: Every piece of text you output to the user — the final answer AND the short progress notes you write before and between tool calls — must ALWAYS be in the same language the user writes in. Follow the user's language exactly; do not switch to another language for narration, progress notes, or summaries.`;
+
+/**
  * Final-step handoff, injected as an assistant prefill when a turn reaches its
  * (opt-in) step budget (opencode/MiMo-Code `MAX_STEPS_PROMPT`,
  * packages/core/src/session/runner/max-steps.ts): the model must stop calling

@@ -9,6 +9,9 @@
  * Zero new dependencies: core AgentLoop/ToolRegistry + a small ordered
  * concurrency pool.
  */
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
 
@@ -19,12 +22,50 @@ export interface SubagentOptions {
   hooks?: ToolHooks;
   /** max steps per subagent (default 8, same as `task`) */
   maxSteps?: number;
+  /** working dir for spilling over-length answers (default ".") */
+  cwd?: string;
 }
 
 export interface SubagentResult {
   answer: string;
   steps: number;
   stopReason: string;
+  /** FB#5 — true when the answer was capped to fit the parent context. */
+  truncated?: boolean;
+  /** FB#5 — where the FULL answer was spilled (present when `truncated`). */
+  fullOutputPath?: string;
+}
+
+/**
+ * FB#5 — subagent answer cap. A subagent's final answer is what lands in the
+ * PARENT's context; an unbounded one can blow it up with process noise. Cap the
+ * answer to `cap` chars; the full text is spilled to `.aih/outputs/` and the
+ * capped answer points at it. `cap <= 0` disables capping.
+ */
+export interface CappedAnswer {
+  answer: string;
+  truncated: boolean;
+  fullOutputPath?: string;
+}
+export function capAnswer(raw: string, cap: number, cwd = "."): CappedAnswer {
+  if (cap <= 0 || raw.length <= cap) return { answer: raw, truncated: false };
+  const dir = join(cwd, ".aih", "outputs");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `subagent-${Date.now()}-${randomUUID().slice(0, 8)}.txt`);
+  writeFileSync(file, raw, "utf8");
+  return {
+    answer: `${raw.slice(0, cap)}\n…[truncated, full output at ${file}]`,
+    truncated: true,
+    fullOutputPath: file,
+  };
+}
+/** FB#5 — effective cap from AIH_SUBAGENT_ANSWER_CAP (default 8000; 0 = off). */
+export function answerCapLimit(): number {
+  // Distinguish "unset" (→ default 8000) from an explicit value (0 = off).
+  const raw = process.env.AIH_SUBAGENT_ANSWER_CAP;
+  if (raw === undefined || raw.trim() === "") return 8000;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : 8000;
 }
 
 /**
@@ -57,8 +98,16 @@ export async function runSubagent(o: SubagentOptions, prompt: string): Promise<S
   const lastAssistant = [...log.all()]
     .reverse()
     .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
-  const answer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
-  return { answer, steps: result.steps, stopReason: result.stopReason };
+  const rawAnswer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
+  // FB#5 — cap the answer that re-enters the parent context; spill the full
+  // text to .aih/outputs/ and point the capped answer at it.
+  const capped = capAnswer(rawAnswer, answerCapLimit(), o.cwd ?? ".");
+  return {
+    answer: capped.answer,
+    steps: result.steps,
+    stopReason: result.stopReason,
+    ...(capped.truncated ? { truncated: true, fullOutputPath: capped.fullOutputPath } : {}),
+  };
 }
 
 /**
@@ -77,6 +126,30 @@ export async function mapOrdered<T>(jobs: Array<() => Promise<T>>, limit: number
   });
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * FB#6 — parse the goal judge's strict-JSON verdict
+ * `{"met": bool, "reason": "...", "unmet": [...]}`. Regex fallback covers the
+ * minimal schema when the JSON is malformed. Shared by the `run --goal` loop
+ * and the TUI goal check so both parse identically.
+ */
+export interface GoalVerdict {
+  met: boolean;
+  reason: string;
+  unmet: string[];
+}
+export function parseGoalVerdict(text: string): GoalVerdict {
+  const met = /"met"\s*:\s*(true|false)/.exec(text)?.[1] === "true";
+  const reason = /"reason"\s*:\s*"([^"]*)"/.exec(text)?.[1] ?? text.slice(0, 200);
+  let unmet: string[] = [];
+  try {
+    const parsed = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+    if (Array.isArray(parsed?.unmet)) unmet = parsed.unmet.map(String).slice(0, 5);
+  } catch {
+    /* regex fallback above covers the minimal schema */
+  }
+  return { met, reason, unmet };
 }
 
 /**

@@ -1121,6 +1121,24 @@ assert(
   req.some((m) => typeof m.content === "string" && m.content.includes("SUMMARY")),
   "post-compaction request carries the summary",
 );
+// Compaction state guard — after compaction the system prompt must carry
+// COMPACTION_STATE_GUARD so the agent verifies current state before
+// re-implementing work the summary lists as pending (observed bug: a single
+// turn re-wrote the whole webfetch-hardening module after auto-compaction
+// because the objective survived verbatim in the summary while the
+// "already done" detail was buried → duplicate-identifier compile errors).
+assert(
+  req.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("After a context compaction")),
+  "post-compaction system prompt carries the state-guard (verify before re-implement)",
+);
+assert(
+  req.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("Only re-implement when verification proves it is genuinely missing")),
+  "state-guard forbids re-implementing verified-complete work",
+);
+assert(
+  req.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("do NOT assume it belongs to a parallel session")),
+  "state-guard steers against parallel-session misattribution",
+);
 // Freebuff ③ — the compaction prompt must tell the model the summary is
 // HISTORICAL MEMORY ONLY: not dialogue, not an output template, not a
 // tool-call format. Guards against the model copying the summary's
@@ -1166,6 +1184,97 @@ assert(
     tamperedDerived.some((m) => String(m.content).includes("TAMPERED")),
     "coverage mismatch fails open to raw events (no false projection)",
   );
+}
+
+// Rolling compaction must tell the summarizer to drop finished work from
+// "Objective" — otherwise a stale Objective duplicates a Completed item and
+// the agent re-does finished work after compaction, misattributing its own
+// earlier edits to a parallel session (observed: FB#5/#6 implemented, then
+// re-implemented "by a parallel session" after compaction).
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const rLog = new SessionLog();
+  const rGate = new PolicyGate([{ match: (r) => r.tool === "echo", action: "allow" }]);
+  const rTools = new ToolRegistry(rGate);
+  rTools.register(echo);
+  const rScripted = new MockLLM([
+    { text: "SUMMARY-ONE" },
+    { text: "SUMMARY-TWO" },
+    { text: "final", stopReason: "end_turn" },
+  ]);
+  const rReq: ChatMessage[][] = [];
+  const rLoop = new Loop({
+    llm: { complete: (req) => { rReq.push(req.messages); return rScripted.complete(req); } },
+    tools: rTools,
+    log: rLog,
+    systemPrompt: "sys",
+    contextWindow: 5000,
+    compactAt: 0.8,
+  });
+  // First compaction (no prior summary → initial SUMMARY_TEMPLATE).
+  rLog.append({ type: "user/message", turnId: "b1", text: `bulk1: ${"x".repeat(400)}` });
+  rLog.append({ type: "assistant/message", turnId: "b1", text: `answer1: ${"y".repeat(400)}`, toolCalls: [] });
+  const first = await rLoop.compactNow();
+  assert(first.applied, "rolling: first compaction applies");
+  assert(rLog.all().some((e) => e.type === "compaction"), "rolling: first compaction fires");
+  // Second compaction — now there IS a prior summary, so the summarizer gets
+  // SUMMARY_UPDATE_INSTRUCTIONS; it must forbid leaving done work in Objective.
+  rLog.append({ type: "user/message", turnId: "b2", text: `bulk2: ${"z".repeat(400)}` });
+  rLog.append({ type: "assistant/message", turnId: "b2", text: `answer2: ${"w".repeat(400)}`, toolCalls: [] });
+  const updated = await rLoop.compactNow();
+  assert(updated.applied, "rolling: second compaction applies");
+  const updatePrompt = rReq.flat().map((m) => String(m.content)).join("\n");
+  assert(
+    updatePrompt.includes("never keep an item in \"Objective\" that is already done"),
+    "rolling summary instructions forbid keeping finished work in Objective",
+  );
+  assert(
+    updatePrompt.includes("misattributing its own earlier work to a parallel session"),
+    "summary guidance steers clear of the parallel-session misattribution trap",
+  );
+  console.log("ok: rolling compaction warns against re-doing finished work / parallel-session misattribution");
+}
+
+// compactContext — an authoritative state snapshot (e.g. todo list) must be
+// folded into EVERY compaction summary prompt so a compacted agent cannot
+// forget what is done vs pending (the FB#5/#6 "re-did by a parallel session"
+// bug). The summarizer must see "done, do NOT redo" as authoritative truth.
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const cLog = new SessionLog();
+  const cGate = new PolicyGate([{ match: (r) => r.tool === "echo", action: "allow" }]);
+  const cTools = new ToolRegistry(cGate);
+  cTools.register(echo);
+  const cReq: ChatMessage[][] = [];
+  const cScripted = new MockLLM([{ text: "SNAPSHOT-SUMMARY" }]);
+  const cLoop = new Loop({
+    llm: { complete: (req) => { cReq.push(req.messages); return cScripted.complete(req); } },
+    tools: cTools,
+    log: cLog,
+    systemPrompt: "sys",
+    contextWindow: 5000,
+    compactAt: 0.8,
+    compactContext: () =>
+      "# Authoritative todo state (from .aih/todos.json)\n### Todos — ALREADY COMPLETED (verified, do NOT redo):\n- [x] FB#5 subagent answer cap\n- [x] FB#6 dual judge\n### Todos — still PENDING:\n- [ ] FB#7",
+  });
+  cLog.append({ type: "user/message", turnId: "c1", text: `bulk: ${"m".repeat(400)}` });
+  cLog.append({ type: "assistant/message", turnId: "c1", text: `answer: ${"n".repeat(400)}`, toolCalls: [] });
+  const applied = await cLoop.compactNow();
+  assert(applied.applied, "compactContext: compaction applies");
+  const prompt = cReq.flat().map((m) => String(m.content)).join("\n");
+  assert(
+    prompt.includes("Authoritative CURRENT STATE") && prompt.includes("ALREADY COMPLETED (verified, do NOT redo)"),
+    "compactContext: todo snapshot folded into the summary prompt",
+  );
+  assert(
+    prompt.includes("FB#5 subagent answer cap") && prompt.includes("FB#6 dual judge"),
+    "compactContext: completed todos carried into the summary (do NOT redo)",
+  );
+  assert(
+    prompt.includes("FB#7"),
+    "compactContext: pending todos carried into the summary",
+  );
+  console.log("ok: compactContext folds authoritative todo state into every compaction summary");
 }
 
 // User-query invariant (opencode/MiMo-Code parity): a compaction that folds

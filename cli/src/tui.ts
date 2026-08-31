@@ -1304,9 +1304,22 @@ constructor(opts: TuiOptions) {
       return;
     }
     if (this.#held === "\x1b") {
+      // '[' / 'O' start a CSI/SS3 sequence. ']' starts an OSC (operating-system
+      // command, e.g. tmux/terminal title: ESC ] 0;title BEL), and 'P' starts a
+      // DCS (device control string, e.g. tmux passthrough). All three are
+      // TERMINAL-control sequences, not user input — absorb them instead of
+      // treating the follow-up ESC as a second bare-Esc (double-Esc cancel).
+      // Observed bug: tmux repainting its status line / title fired OSC/DCS
+      // ESC bursts that were misread as double-Esc, cancelling an active turn.
       if (ch === "[" || ch === "O") {
         this.#escAt = 0;
         this.#held += ch;
+        return;
+      }
+      if (ch === "]" || ch === "P") {
+        this.#escAt = 0;
+        this.#lastBareEscAt = 0;
+        this.#held = ch === "]" ? "osc:" : "dcs:";
         return;
       }
       const now = Date.now();
@@ -1317,6 +1330,14 @@ constructor(opts: TuiOptions) {
         this.#lastBareEscAt = now;
       }
       this.#held = "";
+    } else if (this.#held === "osc:" || this.#held === "dcs:") {
+      // OSC/DCS payload absorbed until terminator (BEL / ST ESC\ ).
+      if (ch === "\x07") this.#held = ""; // BEL ends OSC
+      else if (ch === "\x1b") this.#held = "\x1boscST"; // ESC begins ST; next '\' closes
+      // else: keep absorbing payload
+    } else if (this.#held === "\x1boscST") {
+      // '\' completes ST (ESC \); anything else resets to absorbing the OSC.
+      this.#held = ch === "\\" ? "" : ch === "\x07" ? "" : "osc:";
     } else {
       this.#held += ch;
       const final = /[A-Za-z~]/.test(ch);

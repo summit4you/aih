@@ -166,6 +166,8 @@ export type SessionEvent = {
     reason: string;
     unmet: string[];
     roundsLeft?: number;
+    /** FB#6 — true when the verdict did not come from a clean single-judge call (two-judge panel disagreed / one judge failed). */
+    degraded?: boolean;
 } | {
     seq: number;
     ts: number;

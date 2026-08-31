@@ -17,6 +17,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { userAihDir } from "./paths.js";
+import { judgePanel, parseGoalVerdict } from "./maxmode.js";
 import { fileURLToPath } from "node:url";
 import {
   AgentLoop,
@@ -669,17 +670,40 @@ export function loadMemoryBlock(cwd = process.cwd()): string {
   return `\n\n${parts.join("\n\n")}`;
 }
 
+/**
+ * Build the authoritative todo-state snapshot folded into every compaction
+ * summary (auto + manual). This prevents a compacted agent from forgetting
+ * which items are done vs pending — the observed failure mode was the agent
+ * re-implementing finished work (FB#5/#6) after compaction and misattributing
+ * its own earlier edits to a "parallel session". The summary must carry this
+ * forward verbatim (see AgentLoop compactContext).
+ */
+export function compactTodoContext(
+  log: { all: () => readonly SessionEvent[] },
+  cwd: string,
+): string {
+  const todos = todoStateFromLog(log.all());
+  if (!todos || todos.length === 0) return "";
+  const done = todos.filter((t) => t.status === "completed").map((t) => t.content);
+  const pending = todos.filter((t) => t.status !== "completed").map((t) => t.content);
+  const lines: string[] = [];
+  if (pending.length) lines.push("### Todos — still PENDING (do not mark done):");
+  for (const p of pending) lines.push(`- [ ] ${p}`);
+  if (done.length) lines.push("### Todos — ALREADY COMPLETED (verified, do NOT redo):");
+  for (const d of done) lines.push(`- [x] ${d}`);
+  void cwd;
+  if (lines.length === 0) return "";
+  return `# Authoritative todo state (from .aih/todos.json)\n${lines.join("\n")}`;
+}
+
 export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
-  // MiMo-Code parity: reply in the user's language instead of defaulting to
-  // English (the surrounding system prompt is English, which biases the model).
-  // Strong form: ALL text output — including the one-line progress notes the
-  // model writes before each tool call, not just the final answer — must match
-  // the user's major language. Otherwise a Chinese user still sees a wall of
-  // English progress narration mid-task.
-  const LANGUAGE_RULE = `\n\n# Language
-IMPORTANT: Every piece of text you output to the user — the final answer AND the short progress notes you write before and between tool calls — must ALWAYS be in the same major language the user writes in. Do not narrate tool work in English when the user writes in Chinese.`;
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}${LANGUAGE_RULE}`;
+// The language rule now lives in core (LANGUAGE_RULE) and is appended at the
+  // very END of the derived system prompt by session-log deriveMessages, so a
+  // compaction summary can never bury it (observed: after compaction the
+  // English summary pushed the mid-prompt language rule out of reach and the
+  // agent reverted to English notes). Nothing else is appended after it.
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [
@@ -1183,6 +1207,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      compactContext: () => compactTodoContext(log, process.cwd()),
       ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       ...(bool(flags, "debug-prompt")
         ? {
@@ -1248,26 +1273,31 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     if (goal) {
       let goalMet = false;
       let rounds = Number(process.env.AIH_GOAL_ROUNDS ?? "") || 3;
+      const goalJudge2 = buildJudge2Llm(flags); // FB#6 — undefined → single judge
       for (;;) {
         let verdict: { met: boolean; reason: string; unmet: string[] };
+        let degraded = false;
         try {
-          const resp = await llm.complete({
-            messages: [
-              ...log.deriveMessages(),
-              { role: "user", content: buildGoalJudgePrompt(goal) },
-            ],
-            tools: [],
-          });
-          const met = /"met"\s*:\s*(true|false)/.exec(resp.text)?.[1] === "true";
-          const reason = /"reason"\s*:\s*"([^"]*)"/.exec(resp.text)?.[1] ?? resp.text.slice(0, 200);
-          let unmet: string[] = [];
-          try {
-            const parsed = JSON.parse(resp.text.slice(resp.text.indexOf("{"), resp.text.lastIndexOf("}") + 1));
-            if (Array.isArray(parsed?.unmet)) unmet = parsed.unmet.map(String).slice(0, 5);
-          } catch {
-            /* regex fallback covers the minimal schema */
-          }
-          verdict = { met, reason, unmet };
+          // FB#6 — goal judge runs as a two-judge panel (primary = llm, optional
+          // secondary = AIH_SECOND_JUDGE_MODEL). The primary's verdict is kept;
+          // a disagreement / failed judge is flagged (degraded) and warned, never
+          // silently dropped. Single-judge when goalJudge2 is undefined.
+          const panel = await judgePanel(
+            llm,
+            {
+              messages: [
+                ...log.deriveMessages(),
+                { role: "user", content: buildGoalJudgePrompt(goal) },
+              ],
+              tools: [],
+            },
+            parseGoalVerdict,
+            goalJudge2,
+            "goal",
+            (a, b) => a.met === b.met,
+          );
+          verdict = panel.verdict;
+          degraded = panel.degraded;
         } catch (err) {
           process.stderr.write(
             `${red("goal judge failed, stopping goal chain: ")}${err instanceof Error ? err.message : String(err)}\n`,
@@ -1275,7 +1305,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
           break;
         }
         const turnId = result.turnId;
-        log.append({ type: "goal/judge", turnId, met: verdict.met, reason: verdict.reason, unmet: verdict.unmet, roundsLeft: verdict.met ? 0 : rounds });
+        log.append({ type: "goal/judge", turnId, met: verdict.met, reason: verdict.reason, unmet: verdict.unmet, roundsLeft: verdict.met ? 0 : rounds, ...(degraded ? { degraded: true } : {}) });
         saveSession(sessionPath, log);
         if (verdict.met) {
           goalMet = true;
@@ -1380,6 +1410,7 @@ async function cmdWorkflow(
         maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
         contextWindow: resolveContextWindow(flags),
         compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+        compactContext: () => compactTodoContext(log, process.cwd()),
         ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
       const send = async (prompt: string): Promise<string> => {
@@ -1517,6 +1548,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       maxStepsPerTurn: maxSteps,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
+      compactContext: () => compactTodoContext(log, process.cwd()),
       ...(tuiSafety
         ? {
             budget: tuiSafety.budget,
@@ -2102,26 +2134,25 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     return promise;
   }
 
-  async function judgeGoal(): Promise<{ met: boolean; reason: string; unmet: string[] }> {
-    const resp = await buildLlm(flags).complete({
-      messages: [
-        ...log.deriveMessages(),
-        { role: "user", content: buildGoalJudgePrompt(goalCondition) },
-      ],
-      tools: [],
-    });
-    const met = /"met"\s*:\s*(true|false)/.exec(resp.text)?.[1] === "true";
-    const reason =
-      /"reason"\s*:\s*"([^"]*)"/.exec(resp.text)?.[1] ?? resp.text.slice(0, 200);
-    // Optional extended schema: list of criteria still unmet (empty when met).
-    let unmet: string[] = [];
-    try {
-      const parsed = JSON.parse(resp.text.slice(resp.text.indexOf("{"), resp.text.lastIndexOf("}") + 1));
-      if (Array.isArray(parsed?.unmet)) unmet = parsed.unmet.map(String).slice(0, 5);
-    } catch {
-      /* one-line regex fallback above already covers the minimal schema */
-    }
-    return { met, reason, unmet };
+  // FB#6 — goal judge as a two-judge panel (primary + optional
+  // AIH_SECOND_JUDGE_MODEL). Returns the verdict plus whether the panel
+  // degraded (disagreement / one judge failed) so it can be recorded.
+  async function judgeGoal(): Promise<{ met: boolean; reason: string; unmet: string[]; degraded: boolean }> {
+    const panel = await judgePanel(
+      buildLlm(flags),
+      {
+        messages: [
+          ...log.deriveMessages(),
+          { role: "user", content: buildGoalJudgePrompt(goalCondition) },
+        ],
+        tools: [],
+      },
+      parseGoalVerdict,
+      buildJudge2Llm(flags),
+      "goal",
+      (a, b) => a.met === b.met,
+    );
+    return { ...panel.verdict, degraded: panel.degraded };
   }
 
   // Most recent turnId on record (falls back to a synthetic id) so goal/judge
@@ -2136,7 +2167,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   }
 
   function recordGoalJudge(
-    verdict: { met: boolean; reason: string; unmet: string[] },
+    verdict: { met: boolean; reason: string; unmet: string[]; degraded?: boolean },
     roundsLeft: number,
   ): void {
     log.append({
@@ -2146,6 +2177,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       reason: verdict.reason,
       unmet: verdict.unmet,
       roundsLeft,
+      ...(verdict.degraded ? { degraded: true } : {}),
     });
     store?.save(log);
   }

@@ -106,6 +106,16 @@ export interface AgentLoopOptions {
    */
   observers?: readonly LoopObserver[];
   /**
+   * compactContext — optional state snapshot appended to every compaction
+   * summary prompt (auto and manual). The CLI wires this to the current todo
+   * state so a compacted agent does not forget which items are done vs
+   * pending (observed: after compaction the agent re-did finished work,
+   * misattributing its own earlier edits to a "parallel session"). The string
+   * is folded into the summary request as an "Authoritative current state"
+   * block the summarizer must carry forward verbatim.
+   */
+  compactContext?: () => string;
+  /**
    * PE#2 — budget tracker (hard constraint + tripwire). When present, the
    * loop checks it after each step: a HARD verdict emits an `escalate` event
    * and stops the turn (stopReason "escalated"); a SOFT (tripwire) verdict is
@@ -241,7 +251,8 @@ Rules:
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
 - Do not mention the summary process or that context was compacted.
-- Historical memory only. The summary is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below; when actions are needed, use real tool calls.`;
+- Historical memory only. The summary is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below; when actions are needed, use real tool calls.
+- Respond in the SAME language as the conversation (opencode compaction.txt parity): match the user's language exactly, whatever it is. A summary in a different language than the user's nudges the agent back into that language for narration after compaction.`;
 
 const SUMMARY_UPDATE_INSTRUCTIONS = `The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
 
@@ -251,7 +262,9 @@ When combining:
 - Add new progress, decisions, constraints, and context from the conversation.
 - Move completed work from "Active" to "Completed".
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
-- Update "Objective" and "Next Move" to reflect the current work state.`;
+- Update "Objective" and "Next Move" to reflect the current work state.
+- CRITICAL — never keep an item in "Objective" that is already done. Once the conversation shows a task was implemented, tested, or delivered (even if uncommitted), move it OUT of "Objective" and into "Completed"/"Active" with its verification state. "Objective" lists only what is genuinely NOT yet done. A stale Objective that duplicates a Completed item is the #1 cause of the agent re-doing finished work after compaction and misattributing its own earlier work to a parallel session.
+- Keep the summary in the SAME language as the conversation — match the user's language exactly.`;
 
 export class AgentLoop {
   #llm: LLMAdapter;
@@ -289,6 +302,8 @@ export class AgentLoop {
   /** P#35 — follow-up messages queued for the NEXT natural turn boundary. */
   #followUp: string[] = [];
   #activeAbort: AbortController | null = null;
+  /** compactContext — authoritative state snapshot folded into summary prompts. */
+  #compactContext?: () => string;
 
   constructor(options: AgentLoopOptions) {
     this.#llm = options.llm;
@@ -301,6 +316,7 @@ export class AgentLoop {
     this.#maxSteps = options.maxStepsPerTurn ?? Infinity;
     this.#contextWindow = options.contextWindow ?? 0;
     this.#compactAt = options.compactAt ?? 0.8;
+    this.#compactContext = options.compactContext;
     this.#readConcurrency = Math.max(
       1,
       Math.floor(options.readConcurrency ?? (Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4)),
@@ -1353,7 +1369,18 @@ export class AgentLoop {
     // per-session state and the main conversation's prompt-cache lineage
     // free of summary traffic. The mock adapter ignores the field.
     this.#summarySid ??= `aih-compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const { text, usage } = await this.#summarizeHead(head, previousSummary, opts?.instructions);
+    // Fold authoritative current state (e.g. todo list) into the summary so a
+    // compacted agent never forgets what is already done vs still pending.
+    const contextSnapshot = this.#compactContext?.()?.trim();
+    const effectiveInstructions = [
+      opts?.instructions?.trim(),
+      contextSnapshot
+        ? `Authoritative CURRENT STATE (carry this forward verbatim; it overrides any stale "Objective" entry in the summary):\n${contextSnapshot}`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const { text, usage } = await this.#summarizeHead(head, previousSummary, effectiveInstructions || undefined);
     if (!text.trim()) return { usage, applied: false };
     // User-query invariant (opencode/MiMo-Code "replay"): the compaction must
     // never strand the conversation without a visible user turn — strict chat

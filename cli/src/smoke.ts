@@ -2496,6 +2496,44 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // tmux/terminal ESC control sequences must NOT cancel an active turn.
+  // tmux repaints its status line / title via OSC (ESC ] ... BEL) and DCS
+  // (ESC P ... ST) bursts. Before the fix, two such ESC-led sequences inside
+  // 500ms were misread as double-Esc and aborted the running turn — the user
+  // saw "turn cancelled" without pressing Esc. The sequences must be absorbed
+  // and the turn must keep running.
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  let cancelled = 0;
+  let busy = false;
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => busy,
+    onLine: (l: string) => lines.push(l),
+    cancelTurn: () => {
+      cancelled += 1;
+    },
+  });
+  // Simulate: a turn is running (busy) while tmux fires its control bursts.
+  busy = true;
+  tui.feed("\x1b]0;tmux status title\x07"); // OSC title update
+  tui.feed("\x1b]2;window 0\x07"); // second OSC inside the 500ms window
+  tui.feed("\x1bPtmux passthrough payload\x1b\\"); // DCS with ST terminator
+  tui.feed("\x1b]133;A\x1b\\"); // kitty/tmux inline-bell-ish OSC+ST
+  assert(cancelled === 0, "tmux OSC/DCS bursts do not cancel a running turn");
+  // A REAL double bare-Esc still cancels (nothing regressed).
+  tui.feed("\x1b");
+  tui.feed("\x1b");
+  assert(cancelled === 1, "genuine double-Esc still cancels after OSC/DCS absorption");
+  assert(lines.length === 0, "tmux control bytes never reach the composer");
+  console.log("ok: tmux OSC/DCS control sequences are absorbed, not cancel-turn");
+}
+
+{
   // theme: OSC 11 background query resolves light/dark; response bytes must not
   // leak into the input
   const { Tui } = await import("./tui.js");
@@ -3340,6 +3378,88 @@ await srv.connect(new StdioServerTransport());
     registerGeneralTools(regBoth, { gate: new AutoApprove(), llm: judgeDown, toolsProvider: () => parent, cwd: "/tmp", judge2: judgeDown });
     const both = (await regBoth.invoke("best_of_n", { description: "j", prompt: "x", n: 2 }, { turnId: "t", inject: () => {} })) as BonResult;
     assert(both.ok === false && /both judges failed/.test(both.error ?? ""), "dual-judge: both judges failed → hard error");
+  }
+
+  // --- FB#5 — subagent answer cap (capAnswer + answerCapLimit) ------------
+  {
+    const { capAnswer, answerCapLimit } = await import("./maxmode.js");
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+
+    // short answer → unchanged, not truncated
+    const short = capAnswer("hello", 8000, tmpdir());
+    assert(short.truncated === false && short.answer === "hello" && !short.fullOutputPath, "FB#5: short answer passes through untouched");
+
+    // cap <= 0 → capping disabled
+    const off = capAnswer("x".repeat(100), 0, tmpdir());
+    assert(off.truncated === false && off.answer.length === 100, "FB#5: cap 0 disables capping");
+
+    // long answer → truncated, spilled to a real file, capped text points at it
+    const long = "A".repeat(5000);
+    const capped = capAnswer(long, 100, tmpdir());
+    assert(capped.truncated === true, "FB#5: long answer is truncated");
+    assert(capped.answer.startsWith("A".repeat(100)), "FB#5: capped answer keeps the first `cap` chars");
+    assert(/\[truncated, full output at /.test(capped.answer), "FB#5: capped answer points at the full output");
+    assert(typeof capped.fullOutputPath === "string" && existsSync(capped.fullOutputPath), "FB#5: full output spilled to a real file");
+    assert(readFileSync(capped.fullOutputPath!, "utf8") === long, "FB#5: spilled file holds the FULL answer");
+
+    // answerCapLimit: default 8000, env override, 0 = off
+    const saved = process.env.AIH_SUBAGENT_ANSWER_CAP;
+    delete process.env.AIH_SUBAGENT_ANSWER_CAP;
+    assert(answerCapLimit() === 8000, "FB#5: default cap is 8000");
+    process.env.AIH_SUBAGENT_ANSWER_CAP = "123";
+    assert(answerCapLimit() === 123, "FB#5: AIH_SUBAGENT_ANSWER_CAP overrides the cap");
+    process.env.AIH_SUBAGENT_ANSWER_CAP = "0";
+    assert(answerCapLimit() === 0, "FB#5: cap 0 is respected (off)");
+    if (saved === undefined) delete process.env.AIH_SUBAGENT_ANSWER_CAP;
+    else process.env.AIH_SUBAGENT_ANSWER_CAP = saved;
+    console.log("ok: FB#5 subagent answer cap");
+  }
+
+  // --- FB#6 — goal judge two-judge panel (parseGoalVerdict + judgePanel) ---
+  {
+    const { parseGoalVerdict, judgePanel } = await import("./maxmode.js");
+
+    // parseGoalVerdict: met / reason / unmet
+    const v1 = parseGoalVerdict('{"met": true, "reason": "file written", "unmet": []}');
+    assert(v1.met === true && v1.reason === "file written" && v1.unmet.length === 0, "FB#6: parseGoalVerdict reads met/reason/unmet (met)");
+    const v2 = parseGoalVerdict('{"met": false, "reason": "no test run", "unmet": ["run tests", "commit"]}');
+    assert(v2.met === false && v2.reason === "no test run" && v2.unmet.length === 2, "FB#6: parseGoalVerdict reads the unmet list");
+    // malformed JSON → regex fallback still extracts met
+    const v3 = parseGoalVerdict('garbage {"met": true} trailing');
+    assert(v3.met === true, "FB#6: parseGoalVerdict falls back to regex on malformed JSON");
+
+    const goalJudge = (met: boolean) => ({
+      complete: async (req: { tools: unknown[] }) => {
+        if (req.tools.length === 0) {
+          return { text: JSON.stringify({ met, reason: `judge-${met}`, unmet: met ? [] : ["x"] }), toolCalls: [], stopReason: "end_turn" as const };
+        }
+        return { text: "c", toolCalls: [], stopReason: "end_turn" as const };
+      },
+    });
+    const req = { messages: [{ role: "user" as const, content: "judge" }], tools: [] };
+    const same = (a: { met: boolean }, b: { met: boolean }) => a.met === b.met;
+
+    // both agree → clean verdict, not degraded
+    const agree = await judgePanel(goalJudge(true), req, parseGoalVerdict, goalJudge(true), "goal", same);
+    assert(agree.degraded === false && agree.verdict.met === true, "FB#6: agreement → clean verdict, not degraded");
+
+    // disagree → PRIMARY kept, FLAGGED
+    const dis = await judgePanel(goalJudge(true), req, parseGoalVerdict, goalJudge(false), "goal", same);
+    assert(dis.degraded === true && dis.verdict.met === true, "FB#6: disagreement keeps the PRIMARY's verdict, flagged degraded");
+
+    // second judge fails → primary kept, FLAGGED
+    const secFail = await judgePanel(goalJudge(true), req, parseGoalVerdict, { complete: async () => { throw new Error("2nd down"); } }, "goal", same);
+    assert(secFail.degraded === true && secFail.verdict.met === true, "FB#6: second judge failed → primary verdict, flagged");
+
+    // primary fails → secondary decides, FLAGGED
+    const primFail = await judgePanel({ complete: async () => { throw new Error("primary down"); } }, req, parseGoalVerdict, goalJudge(false), "goal", same);
+    assert(primFail.degraded === true && primFail.verdict.met === false, "FB#6: primary failed → secondary decides, flagged");
+
+    // no secondary → single-judge (unchanged), not degraded
+    const single = await judgePanel(goalJudge(true), req, parseGoalVerdict, undefined, "goal", same);
+    assert(single.degraded === false && single.verdict.met === true, "FB#6: no secondary → single-judge, not degraded");
+    console.log("ok: FB#6 goal judge two-judge panel");
   }
 
   // CC#50 — subagent partial-results honesty marking.
