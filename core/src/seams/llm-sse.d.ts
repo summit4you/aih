@@ -56,6 +56,12 @@ export interface StreamAccumulator {
     usage?: TokenUsage;
     /** Whether eager-finalize already built tool calls before stream ended. */
     eagerFinalized: boolean;
+    /** Internal: per-index tool call accumulation frames. */
+    toolFrames: Map<number, {
+        id: string;
+        name: string;
+        args: string;
+    }>;
 }
 export interface ParseOptions {
     /** Called with each text delta chunk (streaming to TUI). */
@@ -64,6 +70,64 @@ export interface ParseOptions {
     onReasoning?: (delta: string) => void;
     /** Fired once when first data frame arrives (for stall detection). */
     onFirstToken?: () => void;
+    /**
+     * CC#49 — fired on EVERY observed stream activity (each data frame line).
+     * The caller (llm-openai) resets its inter-frame stall timer on this.
+     */
+    onActivity?: () => void;
+    /**
+     * FA#3 — reasoning-runaway watchdog. When set, a reasoning-only stream
+     * (no text, no tool call yet) that exceeds `maxChars` of reasoning or
+     * `timeoutMs` of elapsed time throws ReasoningRunawayError. Omit to disable.
+     */
+    reasoningWatchdog?: {
+        maxChars: number;
+        timeoutMs: number;
+    };
+}
+/**
+ * CC#49 — the stream went silent past the stall budget AFTER partial content
+ * had already arrived. Carries what was received so the turn can resume
+ * honestly ("[stream interrupted] continue from where you left off") instead
+ * of losing the partial answer or presenting it as complete.
+ */
+/**
+ * FA#3 — the stream produced ONLY reasoning (no text, no tool call) past the
+ * reasoning-only budget. Carries what was received so the caller can decide
+ * whether to resume honestly or fold into the retry budget (mirrors StallError).
+ */
+export declare class ReasoningRunawayError extends Error {
+    readonly reasoningChars: number;
+    readonly elapsedMs: number;
+    readonly limitChars: number;
+    constructor(reasoningChars: number, elapsedMs: number, limitChars: number);
+}
+/**
+ * FA#3 — pure decision: has a reasoning-only stream run away?
+ *
+ * A reasoning model that "thinks" forever without ever emitting content or a
+ * tool call burns budget and stalls the turn. This fires when ALL of:
+ *   - no text content yet AND no tool call yet (the stream is reasoning-only),
+ *   - reasoning chars exceed `limitChars` (token-ish cap), OR
+ *   - the reasoning-only phase has lasted longer than `timeoutMs`.
+ *
+ * Pure (no I/O, no Date.now) so it is unit-testable: callers pass `elapsedMs`.
+ * Returns false when reasoning is not the only thing being produced (text or
+ * a tool call has arrived) — that is a healthy stream, not a runaway.
+ */
+export declare function isReasoningRunaway(state: {
+    reasoningChars: number;
+    hasText: boolean;
+    hasToolCall: boolean;
+    elapsedMs: number;
+}, limit: {
+    maxChars: number;
+    timeoutMs: number;
+}): boolean;
+export declare class StallError extends Error {
+    /** Text received before the stall (may be empty). */
+    partialText: string;
+    constructor(partialText: string, silentMs: number);
 }
 /**
  * Parse a single SSE JSON data frame and update the accumulator.
@@ -89,4 +153,19 @@ export declare function consumeSSEStream(body: ReadableStream<Uint8Array>, opts?
  */
 export type ProviderErrorClass = "retryable" | "capacity" | "auth" | "fatal";
 export declare function classifyProviderError(status: number, body: string): ProviderErrorClass;
+/**
+ * CC#51 — true when a 429 (or 402) is a quota/usage-window exhaustion rather
+ * than a transient rate limit. `retryAfterSec` is the Retry-After header in
+ * seconds (undefined when absent).
+ */
+export declare function isQuotaExhaustion(status: number, body: string, retryAfterSec?: number): boolean;
+/**
+ * CC#51 — a provider rejected the call because the usage window is spent.
+ * Carries the reset horizon so the caller can wait + resume the SAME call.
+ */
+export declare class QuotaError extends Error {
+    /** Seconds until the provider expects the window to reset (0 = unknown). */
+    retryAfterSec: number;
+    constructor(status: number, body: string, retryAfterSec: number);
+}
 export {};

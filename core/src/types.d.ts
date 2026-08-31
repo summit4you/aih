@@ -66,6 +66,13 @@ export interface ToolCall {
 export interface ToolContext {
     turnId: string;
     inject(text: string): void;
+    /**
+     * CC#60 — where this turn's input came from. "tty" (default): a human at a
+     * keyboard. "injected": serve/attach POST /message or a steering queue —
+     * message text, NOT keyboard approval. Gates use this so injected input can
+     * never approve a pending action.
+     */
+    source?: "tty" | "injected";
 }
 export interface ToolDefinition {
     name: string;
@@ -204,11 +211,48 @@ export type SessionEvent = {
     type: "app/event";
     source: string;
     payload: unknown;
+} | {
+    seq: number;
+    ts: number;
+    type: "quota_wait";
+    turnId: string;
+    /**
+     * CC#51 — the provider's usage window is exhausted (quota 429). We wait
+     * for the reset and then re-issue the SAME rejected call (not re-run the
+     * turn). Model-invisible (deriveMessages skips it).
+     */
+    /** Seconds we wait before resuming (provider Retry-After, or the default). */
+    retryAfterSec: number;
+    /** Epoch ms at which the rejected call is re-issued. */
+    resumeAtMs: number;
+    /** Which quota-wait this is (1-based), bounded by MAX_QUOTA_WAITS. */
+    wait: number;
+} | {
+    seq: number;
+    ts: number;
+    type: "escalate";
+    turnId?: string;
+    /**
+     * PE#4 — explicit "stop and give a human a decision" primitive, distinct
+     * from `ask` (which approves a single pending action). Emitted when the
+     * harness hits a bound it cannot resolve alone: a sensor stays red after
+     * bounded retries, a budget is exceeded, or a call fails repeatedly.
+     * Model-invisible (deriveMessages skips it). Non-interactive runs log it
+     * and exit with code 3; interactive runs surface the options in the TUI.
+     */
+    /** Why the loop stopped (e.g. "sensors red after 1 retry", "cost budget exceeded"). */
+    reason: string;
+    /** Concrete options for the human to pick from (2-4). */
+    options: string[];
+    /** The safest action if no response arrives (the playbook's "safest default"). */
+    safestDefault: string;
 };
 export interface ContentBlock {
     type: "text" | "image_url";
     text?: string;
-    image_url?: { url: string };
+    image_url?: {
+        url: string;
+    };
 }
 export interface ChatMessage {
     role: "system" | "user" | "assistant" | "tool";
