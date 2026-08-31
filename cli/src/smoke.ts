@@ -4673,6 +4673,7 @@ import {
   SessionLog,
   FINAL_STATE_GUARD,
   TASK_CONTRACT_RULES,
+  REPAIR_DOCTRINE,
   DECISION_QUESTION_RULE,
 } from "@aih/core";
 
@@ -4831,6 +4832,24 @@ import {
   assert(TASK_CONTRACT_RULES.length > 100, "TP#3.12 prompts: TASK_CONTRACT_RULES is substantial");
   assert(/acceptance|constraint|verifiable/i.test(TASK_CONTRACT_RULES), "TP#3.12 prompts: TASK_CONTRACT_RULES mentions acceptance criteria");
   console.log("ok: TP#3.12 TASK_CONTRACT_RULES present");
+}
+
+{
+  // TP#3.16 — REPAIR_DOCTRINE (OpenClaw AGENTS.md borrow): root-cause-first,
+  // owner-bound, net-LOC-disciplined repair rules present AND injected into
+  // the main system prompt (loadSystemPrompt).
+  assert(typeof REPAIR_DOCTRINE === "string", "TP#3.16 prompts: REPAIR_DOCTRINE is string");
+  assert(REPAIR_DOCTRINE.length > 200, "TP#3.16 prompts: REPAIR_DOCTRINE is substantial");
+  assert(/root.?cause/i.test(REPAIR_DOCTRINE), "TP#3.16 prompts: REPAIR_DOCTRINE is root-cause-first");
+  assert(/producer|owner/i.test(REPAIR_DOCTRINE), "TP#3.16 prompts: REPAIR_DOCTRINE fixes at the owner, not downstream");
+  assert(/net ≤0|net <=0|production loc/i.test(REPAIR_DOCTRINE), "TP#3.16 prompts: REPAIR_DOCTRINE carries the net-LOC constraint");
+  assert(/never mask|consumer-only guard/i.test(REPAIR_DOCTRINE), "TP#3.16 prompts: REPAIR_DOCTRINE forbids masking root causes");
+  assert(/reproduction|regression test/i.test(REPAIR_DOCTRINE), "TP#3.16 prompts: REPAIR_DOCTRINE requires a failing repro before editing");
+  const { loadSystemPrompt } = await import("./index.js");
+  const sys = loadSystemPrompt();
+  assert(sys.includes("Repair doctrine"), "TP#3.16 injection: main system prompt carries REPAIR_DOCTRINE");
+  assert(sys.includes("Root-cause repair is the default"), "TP#3.16 injection: doctrine text is the real constant, not a stub");
+  console.log("ok: TP#3.16 REPAIR_DOCTRINE present + injected");
 }
 
 {

@@ -29,6 +29,7 @@ import {
   FINAL_STATE_GUARD,
   GOAL_CONTRACT_TEMPLATE,
   TASK_CONTRACT_RULES,
+  REPAIR_DOCTRINE,
   DECISION_QUESTION_RULE,
   TOOL_OUTPUT_NOTES,
   buildGoalJudgePrompt,
@@ -703,7 +704,7 @@ export function loadSystemPrompt(): string {
   // compaction summary can never bury it (observed: after compaction the
   // English summary pushed the mid-prompt language rule out of reach and the
   // agent reverted to English notes). Nothing else is appended after it.
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
   if (existsSync(appMd)) {
     const content = readFileSync(appMd, "utf8");
     return [
