@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { userAihDir } from "./paths.js";
+import { userAihDir, userAihDirs } from "./paths.js";
 import { judgePanel, parseGoalVerdict } from "./maxmode.js";
 import { fileURLToPath } from "node:url";
 import {
@@ -73,6 +73,7 @@ import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
 import type { SafetyHooks } from "./safety.js";
 import { projectTrustState, setProjectTrustState } from "./config.js";
 import { collectRulesSync, renderRules } from "./rules.js";
+import { migrateConfigFile, configMigrationTargets } from "./migrate.js";
 import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
 import {
   clearAllOwnerDegraded,
@@ -247,6 +248,9 @@ aih session <list|show|rm|export|import|fork> [args]
                                   GET /health · GET /events (SSE) · POST /message · GET /tools
   aih attach <url>                attach a lightweight REPL to a running serve
   aih doctor | check | eval       run harness scripts
+  aih doctor --fix                config self-healing: detect legacy config shapes,
+                                  back up, and rewrite them in the current canonical
+                                  form (OC#5 residual; idempotent)
 
 Options:
   -m, --model <id>            model id (env AIH_MODEL > aih.json)
@@ -4398,6 +4402,40 @@ function cmdScript(name: string) {
   process.exit(res.status ?? 1);
 }
 
+/**
+ * OC#5 residual — `aih doctor --fix`: config self-healing. Scans the user's
+ * global + project config files, detects legacy shapes (e.g. a pre-OC#5 config
+ * that was accepted by the guard but never stamped with schemaVersion), backs
+ * up each file it changes, and rewrites it in the current canonical form.
+ * Idempotent: a second run reports nothing to do.
+ */
+function cmdDoctorFix(): void {
+  const targets = configMigrationTargets(userAihDirs(), process.cwd());
+  console.log("AIH doctor --fix (config self-healing)");
+  console.log("----------");
+  let migratedCount = 0;
+  for (const path of targets) {
+    const res = migrateConfigFile(path);
+    if (!existsSync(path)) {
+      console.log(`  skip  ${path} (not present)`);
+      continue;
+    }
+    if (!res.migrated) {
+      console.log(`  ok    ${path} (already canonical)`);
+      continue;
+    }
+    migratedCount += 1;
+    console.log(`  fix   ${path}`);
+    for (const c of res.changes) console.log(`        - ${c.rule}: ${c.description}`);
+    if (res.backup) console.log(`        backup: ${res.backup}`);
+  }
+  if (migratedCount === 0) {
+    console.log("nothing to migrate — all config files are already canonical.");
+  } else {
+    console.log(`${migratedCount} config file(s) migrated (originals backed up alongside).`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PR#2 — `aih measure`: structural / behavioral distance instrument
 //
@@ -4857,6 +4895,10 @@ async function main() {
       console.log(VERSION);
       return;
     case "doctor":
+      if (bool(flags, "fix")) {
+        return cmdDoctorFix();
+      }
+      return cmdScript("doctor");
     case "check":
     case "eval":
       return cmdScript(command);

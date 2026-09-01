@@ -60,6 +60,16 @@ the versions listed here (`scripts/package` derives the version from
   isolation, sandbox seam, tool `deny` red line). Documented in `APP.md`
   §3 (capability boundary → new "trust model" subsection) and `README.md`
   (permissions section).
+- **Config self-healing via `aih doctor --fix` (OC#5 residual)**: the OC#5
+  guard makes an OLD build refuse to open a NEWER config (fail-closed); this
+  adds the complementary direction — a NEW build helps a user migrate a legacy
+  config UP. `aih doctor --fix` scans the global user config + project
+  `aih.json` / `.aih/config.json`, detects legacy shapes (currently the missing
+  `schemaVersion` stamp — rule `M1-schema-version-stamp`), backs up each changed
+  file to `<path>.bak.<ts>`, and rewrites it in the canonical stamped form.
+  Idempotent (a second run is a no-op); unparseable files are left for the user
+  to fix. The top-level flat `model`/`baseUrl` are still a valid current shape
+  and are deliberately NOT touched. (`cli/src/migrate.ts`, `cli/src/index.ts`)
 
 ## [0.4.0] - 2026-08-29
 

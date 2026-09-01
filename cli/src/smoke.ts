@@ -5708,6 +5708,74 @@ console.log("══════════════════════�
   console.log("ok: OC#5 versioned state guarded upgrades (schema-version)");
 }
 
+// --- OC#5 residual: doctor --fix config self-healing (migration) -----------
+{
+  const { CONFIG_SCHEMA_VERSION } = await import("@aih/core");
+  const {
+    detectConfigMigrations,
+    migrateConfig,
+    migrateConfigFile,
+    configMigrationTargets,
+  } = await import("./migrate.js");
+
+  // 1. detect: legacy config (no schemaVersion) → needs migration (M1).
+  const legacyCfg = { defaultProvider: "opencode", model: "gpt-5.1" } as Record<string, unknown>;
+  const det = detectConfigMigrations(legacyCfg);
+  assert(det.needsMigration === true, "doctor --fix detect: legacy config needs migration");
+  assert(det.changes.some((c) => c.rule === "M1-schema-version-stamp"), "doctor --fix detect: M1 stamp rule present");
+
+  // 2. detect: already-canonical config (stamped) → no migration.
+  const canonicalCfg = { schemaVersion: CONFIG_SCHEMA_VERSION, defaultProvider: "opencode" } as Record<string, unknown>;
+  const det2 = detectConfigMigrations(canonicalCfg);
+  assert(det2.needsMigration === false && det2.changes.length === 0, "doctor --fix detect: canonical config → no migration");
+
+  // 3. migrateConfig: stamps schemaVersion, preserves other fields.
+  const { config: mig, changes } = migrateConfig(legacyCfg);
+  assert(mig.schemaVersion === CONFIG_SCHEMA_VERSION, "doctor --fix migrate: schemaVersion stamped");
+  assert(mig.defaultProvider === "opencode" && mig.model === "gpt-5.1", "doctor --fix migrate: other fields preserved");
+  assert(changes.length === 1, "doctor --fix migrate: exactly one change reported");
+
+  // 4. migrateConfig is idempotent (second pass → no changes).
+  const second = migrateConfig(mig);
+  assert(second.changes.length === 0, "doctor --fix migrate: idempotent (second pass no-op)");
+
+  // 5. migrateConfigFile: legacy file → migrated + backup written + content stamped.
+  const dir = mkdtempSync(join(tmpdir(), "aih-doctor-fix-"));
+  const cfgPath = join(dir, "aih.json");
+  writeFileSync(cfgPath, JSON.stringify({ defaultProvider: "opencode", model: "gpt-5.1" }) + "\n");
+  const fileRes = migrateConfigFile(cfgPath);
+  assert(fileRes.migrated === true, "doctor --fix file: legacy file migrated");
+  assert(fileRes.backup !== undefined && existsSync(fileRes.backup), "doctor --fix file: backup exists");
+  const after = JSON.parse(readFileSync(cfgPath, "utf8"));
+  assert(after.schemaVersion === CONFIG_SCHEMA_VERSION, "doctor --fix file: rewritten content stamped");
+  assert(after.defaultProvider === "opencode" && after.model === "gpt-5.1", "doctor --fix file: content preserved");
+  const bakContent = JSON.parse(readFileSync(fileRes.backup!, "utf8"));
+  assert(bakContent.schemaVersion === undefined, "doctor --fix file: backup holds the ORIGINAL (un-stamped) config");
+
+  // 6. migrateConfigFile is idempotent (second run → no migration, no new backup).
+  const fileRes2 = migrateConfigFile(cfgPath);
+  assert(fileRes2.migrated === false && fileRes2.backup === undefined, "doctor --fix file: idempotent (second run no-op)");
+
+  // 7. migrateConfigFile on a missing file → no-op, no throw.
+  const missingRes = migrateConfigFile(join(dir, "does-not-exist.json"));
+  assert(missingRes.migrated === false, "doctor --fix file: missing file → no-op");
+
+  // 8. migrateConfigFile on an unparseable file → no-op (left for the user).
+  const badPath = join(dir, "bad.json");
+  writeFileSync(badPath, "{ not valid json");
+  const badRes = migrateConfigFile(badPath);
+  assert(badRes.migrated === false, "doctor --fix file: unparseable file → no-op (not a migration concern)");
+
+  // 9. configMigrationTargets lists global + project config files.
+  const targets = configMigrationTargets(["/u/aih"], "/proj");
+  assert(targets.includes("/u/aih/config.json"), "doctor --fix targets: global config included");
+  assert(targets.includes("/proj/aih.json"), "doctor --fix targets: project aih.json included");
+  assert(targets.includes("/proj/.aih/config.json"), "doctor --fix targets: project .aih/config.json included");
+
+  rmSync(dir, { recursive: true, force: true });
+  console.log("ok: OC#5 residual doctor --fix config self-healing (migration)");
+}
+
 // --- OC parity: rules (AGENTS.md/CLAUDE.md/instructions) + policies + keybinds
 {
   const {
