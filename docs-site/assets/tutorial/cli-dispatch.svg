@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="430" viewBox="0 0 820 430" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="820" height="430" fill="#ffffff"/>
+  <!-- Title -->
+  <text x="20" y="28" font-size="16" font-weight="700" fill="#1a1a1a">CLI 命令分发：从 aih &lt;命令&gt; 到子命令处理</text>
+
+  <!-- argv -->
+  <rect x="40" y="48" width="740" height="46" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="56" y="70" font-size="13" font-weight="700" fill="#1e40af">parseArgs(argv[2..])</text>
+  <text x="56" y="86" font-size="11" fill="#374151">命令 + positionals + flags；先做项目信任门（--trust / 交互 / AIH_TRUST_ALL_PROJECTS）</text>
+
+  <!-- branch: no command -->
+  <rect x="40" y="114" width="330" height="52" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="56" y="136" font-size="12" font-weight="700" fill="#92400e">无命令（裸 aih）</text>
+  <text x="56" y="153" font-size="11" fill="#374151">TTY → 直接 cmdChat()；否则打印帮助并退出</text>
+
+  <!-- switch -->
+  <rect x="430" y="114" width="350" height="52" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="446" y="136" font-size="12" font-weight="700" fill="#166534">switch(command)</text>
+  <text x="446" y="153" font-size="11" fill="#374151">run / chat / tools / describe / session / skills / workflow …</text>
+
+  <path d="M410 71 L410 114" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="235" y="107" font-size="10" fill="#6b7280">有命令？</text>
+
+  <!-- dispatch row -->
+  <rect x="40" y="196" width="150" height="86" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="52" y="218" font-size="12" font-weight="700" fill="#166534">cmdRun</text>
+  <text x="52" y="236" font-size="10" fill="#444">非交互执行</text>
+  <text x="52" y="252" font-size="10" fill="#444">--goal 裁判续跑</text>
+  <text x="52" y="268" font-size="10" fill="#444">--mock 离线</text>
+
+  <rect x="210" y="196" width="150" height="86" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="222" y="218" font-size="12" font-weight="700" fill="#166534">cmdChat</text>
+  <text x="222" y="236" font-size="10" fill="#444">交互式 TUI</text>
+  <text x="222" y="252" font-size="10" fill="#444">Tab /mode 切换</text>
+  <text x="222" y="268" font-size="10" fill="#444">/usage /goal</text>
+
+  <rect x="380" y="196" width="150" height="86" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="392" y="218" font-size="12" font-weight="700" fill="#166534">cmd* 工具族</text>
+  <text x="392" y="236" font-size="10" fill="#444">tools / describe</text>
+  <text x="392" y="252" font-size="10" fill="#444">session (list/…)</text>
+  <text x="392" y="268" font-size="10" fill="#444">skills · stats</text>
+
+  <rect x="550" y="196" width="220" height="86" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="562" y="218" font-size="12" font-weight="700" fill="#166534">服务 / 门禁族</text>
+  <text x="562" y="236" font-size="10" fill="#444">serve / attach</text>
+  <text x="562" y="252" font-size="10" fill="#444">doctor / check / eval</text>
+  <text x="562" y="268" font-size="10" fill="#444">workflow / team / mcp</text>
+
+  <!-- TTY input -->
+  <rect x="40" y="310" width="740" height="56" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="56" y="332" font-size="12" font-weight="700" fill="#334155">（交互态补充：TUI 内斜杠命令）</text>
+  <text x="56" y="350" font-size="11" fill="#374151">/model /compact /usage /goal /mode /skills /bg … — 命中即调对应 handler，其余当作普通消息发模型</text>
+
+  <path d="M120 140 L120 196" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M605 140 L605 196" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="620" y="175" font-size="10" fill="#2563eb">每个子命令独立入口</text>
+  <text x="20" y="404" font-size="10" fill="#6b7280">主要逻辑都在 cli/src/index.ts main()：parseArgs → 信任门 → switch(command) → 子命令 cmd*</text>
+</svg>

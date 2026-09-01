@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="430" viewBox="0 0 820 430" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="820" height="430" fill="#ffffff"/>
+  <!-- Title -->
+  <text x="20" y="28" font-size="16" font-weight="700" fill="#1a1a1a">技能系统：发现 → 解析 → 按名去重 → BM25 建议</text>
+
+  <!-- SKILL.md sources -->
+  <rect x="40" y="48" width="236" height="70" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="56" y="70" font-size="12" font-weight="700" fill="#92400e">项目级 .aih/skills/</text>
+  <text x="56" y="88" font-size="10" fill="#444">（最高优先，仅受信项目加载）</text>
+
+  <rect x="292" y="48" width="236" height="70" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="308" y="70" font-size="12" font-weight="700" fill="#92400e">用户级 XDG ~/.aih/skills/</text>
+  <text x="308" y="88" font-size="10" fill="#444">（中优先）</text>
+
+  <rect x="544" y="48" width="236" height="70" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="560" y="70" font-size="12" font-weight="700" fill="#92400e">内置 BUILTIN_SKILLS</text>
+  <text x="560" y="88" font-size="10" fill="#444">（最低优先，仅当无同名时补入）</text>
+
+  <!-- three arrows into parse -->
+  <path d="M158 118 L310 152" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M410 118 L410 152" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M662 118 L510 152" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- parse -->
+  <rect x="240" y="152" width="340" height="58" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="256" y="174" font-size="12" font-weight="700" fill="#1e40af">parseSkillMd() / loadSkillDir()</text>
+  <text x="256" y="192" font-size="10" fill="#374151">解析 frontmatter（name/description/secretpatterns）+ 正文</text>
+
+  <!-- discover byName -->
+  <rect x="240" y="226" width="340" height="58" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="256" y="248" font-size="12" font-weight="700" fill="#166534">discoverSkills()：按 name 去重</text>
+  <text x="256" y="266" font-size="10" fill="#374151">Map&lt;name, Skill&gt; — 同名校后者覆盖前者（项目 &gt; 用户 &gt; 内置）</text>
+  <path d="M410 210 L410 226" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- two branches -->
+  <path d="M410 284 L410 308" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="420" y="302" font-size="10" fill="#6b7280">roster（2% 预算）</text>
+
+  <rect x="60" y="308" width="330" height="66" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="76" y="330" font-size="12" font-weight="700" fill="#166534">load_skill(name)：SkillLoadTracker</text>
+  <text x="76" y="348" font-size="10" fill="#444">首次加载返回全文，同名再次调用只回摘要</text>
+  <text x="76" y="364" font-size="10" fill="#444">（去重防重复占用上下文）</text>
+
+  <rect x="430" y="308" width="330" height="66" rx="8" fill="#ffffff" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="446" y="330" font-size="12" font-weight="700" fill="#6b21a8">suggestSkills()：BM25 rank</text>
+  <text x="446" y="348" font-size="10" fill="#444">K1=1.5 · B=0.75 · CJK bigram 分词</text>
+  <text x="446" y="364" font-size="10" fill="#444">按相关性给当前对话自动推荐最匹配技能</text>
+
+  <path d="M90 284 L90 308" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="30" y="302" font-size="10" fill="#6b7280">显式</text>
+
+  <text x="20" y="404" font-size="10" fill="#6b7280">实现：cli/src/skills.ts（discoverSkills / loadSkillDir / SkillLoadTracker）+ cli/src/bm25.ts（tokenize / buildIndex / rank）</text>
+</svg>
