@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="400" viewBox="0 0 840 400" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="es" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+    <marker id="eso" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#9333ea"/></marker>
+  </defs>
+  <rect width="840" height="400" fill="#ffffff"/>
+  <text x="20" y="30" font-size="16" font-weight="700" fill="#1a1a1a">一次对话轮（turn）如何变成一条可重放的事件流</text>
+
+  <!-- 事件时间线 -->
+  <text x="20" y="66" font-size="12" font-weight="700" fill="#334155">SessionLog（append-only）按序追加事件：</text>
+  <line x1="30" y1="120" x2="820" y2="120" stroke="#2563eb" stroke-width="2" marker-end="url(#es)"/>
+  <g font-size="10" text-anchor="middle">
+    <rect x="30" y="96" width="86" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="73" y="112" fill="#1e40af">turn/start</text>
+    <rect x="126" y="96" width="96" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="174" y="112" fill="#1e40af">user/message</text>
+    <rect x="232" y="96" width="112" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="288" y="112" fill="#1e40af">assistant/message</text>
+    <rect x="354" y="96" width="78" height="24" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="393" y="112" fill="#92400e">tool/call</text>
+    <rect x="442" y="96" width="82" height="24" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="483" y="112" fill="#92400e">tool/result</text>
+    <rect x="534" y="96" width="86" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a"/><text x="577" y="112" fill="#166534">goal/judge</text>
+    <rect x="630" y="96" width="78" height="24" rx="5" fill="#fdf4ff" stroke="#9333ea"/><text x="669" y="112" fill="#6b21a8">turn/end</text>
+  </g>
+  <text x="20" y="160" font-size="10" fill="#475569">事件自带单调递增序号（seq）。"模型可见的 = 可重放的"：任何影响模型决策的信息，都必须先落成一条事件。</text>
+
+  <!-- 观察者 -->
+  <text x="20" y="196" font-size="12" font-weight="700" fill="#334155">观察者 LoopObserver：在一旁监听生命周期钩子，不改变主流程</text>
+  <rect x="30" y="208" width="790" height="70" rx="8" fill="#faf5ff" stroke="#9333ea"/>
+  <g font-size="10" fill="#0f172a">
+    <text x="42" y="228">onTurnStart(turnId)</text>
+    <text x="190" y="228">onModelResponse(text, toolCalls)</text>
+    <text x="420" y="228">onToolCall(call)</text>
+    <text x="560" y="228">onToolResult(result)</text>
+    <text x="42" y="248">onCompaction(summaryChars)</text>
+    <text x="320" y="248">onTurnEnd(turnId, stopReason)</text>
+    <text x="42" y="268" fill="#475569">钩子可用来做 UI 更新、进度条、审计、指标采集；LoopAbort 可随时中断当前轮。</text>
+  </g>
+
+  <!-- 目标判定器 -->
+  <text x="20" y="304" font-size="12" font-weight="700" fill="#334155">目标判定器（/goal）：独立裁决，防止自说自话</text>
+  <rect x="30" y="316" width="790" height="66" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <g font-size="10" fill="#0f172a">
+    <text x="42" y="336">独立 LLM 只依据对话中的"证据"作裁定，agent 的自述不作数；返回三态 JSON：</text>
+    <text x="42" y="356" font-family="monospace" font-size="11" fill="#166534">{"met": true|false, "reason": "…", "unmet": ["…"]}</text>
+    <text x="380" y="356" fill="#475569">未达成 → 生成续跑指令，驱动下一轮继续。</text>
+  </g>
+</svg>

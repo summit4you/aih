@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="400" viewBox="0 0 840 400" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="eh" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+    <marker id="eho" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#9333ea"/></marker>
+  </defs>
+  <rect width="840" height="400" fill="#ffffff"/>
+  <text x="20" y="30" font-size="16" font-weight="700" fill="#1a1a1a">插件（extension）加载与"钩子瀑布流"中的位置</text>
+
+  <!-- 加载流程 -->
+  <text x="20" y="64" font-size="12" font-weight="700" fill="#334155">loadExtensions() 启动时扫描（从最安全到最定制）：</text>
+  <line x1="30" y1="108" x2="820" y2="108" stroke="#2563eb" stroke-width="2" marker-end="url(#eh)"/>
+  <g font-size="10" text-anchor="middle">
+    <rect x="30" y="84" width="240" height="24" rx="5" fill="#fef2f2" stroke="#dc2626"/><text x="150" y="100" fill="#991b1b">项目级 .aih/extensions（需项目信任）</text>
+    <rect x="290" y="84" width="210" height="24" rx="5" fill="#fef3c7" stroke="#d97706"/><text x="395" y="100" fill="#92400e">用户级（XDG 数据目录）</text>
+    <rect x="520" y="84" width="280" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a"/><text x="660" y="100" fill="#166534">内置插件</text>
+  </g>
+  <text x="20" y="142" font-size="10" fill="#475569">项目级插件只在项目受信时加载 —— 防恶意仓库借插件注入代码。可用 --no-extensions 全部禁用。</text>
+  <text x="20" y="160" font-size="10" fill="#475569">插件 API：registerTool(定义新工具) · registerCommand(新 CLI 命令) · onEvent(监听生命周期事件)。</text>
+
+  <!-- 钩子瀑布流水位 -->
+  <text x="20" y="196" font-size="12" font-weight="700" fill="#334155">工具执行的"瀑布流"：扩展钩子坐在最末位</text>
+  <line x1="40" y1="250" x2="800" y2="250" stroke="#9333ea" stroke-width="2" marker-end="url(#eho)"/>
+  <g font-size="10" text-anchor="middle">
+    <rect x="40" y="226" width="140" height="24" rx="5" fill="#f8fafc" stroke="#94a3b8"/><text x="110" y="242" fill="#334155">权限门</text>
+    <rect x="200" y="226" width="140" height="24" rx="5" fill="#f8fafc" stroke="#94a3b8"/><text x="270" y="242" fill="#334155">脱敏/审计</text>
+    <rect x="360" y="226" width="140" height="24" rx="5" fill="#f8fafc" stroke="#94a3b8"/><text x="430" y="242" fill="#334155">def.execute 执行</text>
+    <rect x="600" y="226" width="160" height="24" rx="5" fill="#fdf4ff" stroke="#9333ea"/><text x="680" y="242" fill="#6b21a8">扩展钩子（最末）</text>
+  </g>
+  <line x1="180" y1="238" x2="200" y2="238" stroke="#9333ea" stroke-width="1.5" marker-end="url(#eho)"/>
+  <line x1="340" y1="238" x2="360" y2="238" stroke="#9333ea" stroke-width="1.5" marker-end="url(#eho)"/>
+  <line x1="500" y1="238" x2="600" y2="238" stroke="#9333ea" stroke-width="1.5" marker-end="url(#eho)"/>
+  <text x="20" y="292" font-size="10" fill="#0f172a">扩展钩子看到的是"已经过安全层处理"的结果（脱敏/审计之后），对结果的改写也会被审计记录。</text>
+  <text x="20" y="310" font-size="10" fill="#475569">安全层永远在扩展之前执行 —— 插件能力再大，也绕不过权限门与审计（CC#53 AskError 也无法被扩展吞掉）。</text>
+
+  <!-- AskError -->
+  <rect x="20" y="326" width="790" height="56" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="32" y="348" font-size="12" font-weight="700" fill="#991b1b">AskError：强制人工确认底线</text>
+  <text x="32" y="368" font-size="10" fill="#0f172a">扩展可抛出 AskError 强制系统停下等人类批准（比静默拒绝更透明），是"问人"这一底线的实现。</text>
+</svg>
