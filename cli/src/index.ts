@@ -109,6 +109,7 @@ import {
   totalCost,
 } from "./cost.js";
 import { computeScorecard, formatScorecard } from "./scorecard.js";
+import { loadCoverageRegistry, selectForProfile, formatCoverage, profileStats } from "./coverage.js";
 import { detectedWindow, probeContextWindow } from "./window.js";
 import { gitStatusSummary, formatWorktreeSummary } from "./worktree.js";
 import { peekWorkspaceIdentity, compareIdentity } from "./workspace-identity.js";
@@ -227,6 +228,7 @@ aih session <list|show|rm|export|import|fork> [args]
                                 rm:    aih session rm <name>... | --all   (quote globs: 's-*')
   aih stats                       token usage across saved sessions
   aih scorecard [--format json]   harness health scorecard (6 metrics, PE#3)
+  aih coverage [--profile NAME]   maturity scorecard: coverage-ID + evidence-mode matrix (OC#6)
   aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
                                Agent Teams: roster + task board + mailbox (D#15)
   aih skills <list|find|install|show|registry> [args]
@@ -3721,6 +3723,31 @@ function cmdScorecard(flags: Record<string, string | boolean>) {
 }
 
 /**
+ * OC#6 — maturity scorecard: `aih coverage [--profile NAME]`.
+ * Renders the coverage-ID + evidence-mode matrix derived from the smoke
+ * source (each group header is a stable coverage anchor), and the subset a
+ * given profile selects. A release profile additionally includes `live`
+ * groups (real provider/channel) that smoke-ci skips.
+ */
+function cmdCoverage(flags: Record<string, string | boolean>): void {
+  const profile = str(flags, "profile") ?? "smoke-ci";
+  // Read the compiled smoke (dist/smoke.js) — comments with group headers are
+  // preserved by tsc, so the registry never drifts from the tests.
+  const registry = loadCoverageRegistry(fileURLToPath(new URL("./smoke.js", import.meta.url)));
+  if (registry.length === 0) {
+    console.error("coverage: could not read cli/dist/smoke.js — build first?");
+    process.exit(1);
+  }
+  console.log(formatCoverage(registry, profile as never));
+  const release = profileStats(registry, "release");
+  const smoke = profileStats(registry, "smoke-ci");
+  console.log(
+    `  release ${release.total} (${release.mock} mock · ${release.live} live) vs ` +
+      `smoke-ci ${smoke.total} (${smoke.mock} mock · ${smoke.live} live)`,
+  );
+}
+
+/**
  * E#17 — non-interactive distill: `aih distill [--format json]`.
  * Deterministic repeated-flow extraction over the recent sessions (the same
  * pure functions /distill uses in the TUI). Non-interactive so it can run as
@@ -4863,6 +4890,8 @@ async function main() {
       return cmdStats();
     case "scorecard":
       return cmdScorecard(flags);
+    case "coverage":
+      return cmdCoverage(flags);
     case "team":
       return cmdTeam(positionals, flags);
     case "tidy":

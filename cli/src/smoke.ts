@@ -5952,3 +5952,50 @@ console.log("══════════════════════�
 
   console.log("ok: OC#7 credential ownership isolation (owner-state + adapter hook)");
 }
+
+// --- OC#6: maturity scorecard — coverage-ID + evidence-mode classification ---
+{
+  const {
+    coverageIdFromTitle,
+    inferEvidenceMode,
+    loadCoverageRegistry,
+    selectForProfile,
+    profileStats,
+    formatCoverage,
+  } = await import("./coverage.js");
+
+  // 1. Stable slug derives from a group title (# becomes a separator).
+  const slug = coverageIdFromTitle("OC#5 residual: doctor --fix config self-healing (migration)");
+  assert(slug === "oc-5-residual-doctor-fix-config-self-healing-migration", "OC#6 slug: title → stable coverage id");
+  assert(coverageIdFromTitle("F#30: cost / TPS") === "f-30-cost-tps", "OC#6 slug: # becomes a separator");
+
+  // 2. Evidence mode: live only for real-provider/key/network signals.
+  assert(inferEvidenceMode("TP#6 requires real API key") === "live", "OC#6 evidence: real API key → live");
+  assert(inferEvidenceMode("live provider bench") === "live", "OC#6 evidence: live provider bench → live");
+  assert(inferEvidenceMode("pure deterministic parser tests") === "mock", "OC#6 evidence: pure tests → mock");
+
+  // 3. Registry is derived from the live smoke source (never drifts).
+  const reg = loadCoverageRegistry(fileURLToPath(new URL("./smoke.js", import.meta.url)));
+  assert(reg.length >= 40, `OC#6 registry: derived ≥40 coverage groups (got ${reg.length})`);
+  const ids = new Set(reg.map((i) => i.id));
+  assert(ids.size === reg.length, "OC#6 registry: coverage ids are unique");
+
+  // 4. Profile selection: smoke-ci excludes live; release includes everything.
+  const live = reg.filter((i) => i.evidence === "live");
+  const smokeSel = selectForProfile(reg, "smoke-ci");
+  assert(smokeSel.every((i) => i.evidence === "mock"), "OC#6 profile: smoke-ci runs only mock groups");
+  if (live.length > 0) {
+    assert(smokeSel.length < reg.length, "OC#6 profile: smoke-ci is a strict subset when live groups exist");
+    const relSel = selectForProfile(reg, "release");
+    assert(relSel.length === reg.length, "OC#6 profile: release runs every group");
+    assert(smokeSel.length < relSel.length, "OC#6 profile: release ⊃ smoke-ci when live groups exist");
+  }
+
+  // 5. Stats + format are well-formed.
+  const st = profileStats(reg, "smoke-ci");
+  assert(st.total === smokeSel.length && st.mock === smokeSel.length && st.live === 0, "OC#6 stats: smoke-ci counts");
+  const fmt = formatCoverage(reg, "smoke-ci");
+  assert(fmt.includes("smoke-ci") && (st.total === 0 || fmt.includes(st.total + " groups selected")), "OC#6 format: matrix header + totals");
+
+  console.log("ok: OC#6 maturity scorecard — coverage-ID + evidence-mode classification");
+}

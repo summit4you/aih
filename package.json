@@ -21,6 +21,7 @@
     "test:cli": "node cli/dist/smoke.js",
     "cli": "node cli/dist/index.js",
     "bench": "bash scripts/bench",
+    "eval:quality": "node cli/dist/index.js coverage --profile release",
     "eval": "bash scripts/eval"
   },
   "devDependencies": {

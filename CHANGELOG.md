@@ -70,6 +70,15 @@ the versions listed here (`scripts/package` derives the version from
   Idempotent (a second run is a no-op); unparseable files are left for the user
   to fix. The top-level flat `model`/`baseUrl` are still a valid current shape
   and are deliberately NOT touched. (`cli/src/migrate.ts`, `cli/src/index.ts`)
+- **Maturity scorecard / coverage-ID + evidence-mode classification (OC#6,
+  OpenClaw taxonomy.yaml borrow)**: `aih coverage [--profile NAME]` derives a
+  STABLE coverage registry directly from the smoke test's section headers (so
+  it never drifts from the tests), tags each group with an evidence mode (`mock`
+  / `live`), and selects a subset per profile — `smoke-ci` runs only mock
+  groups, `release` additionally runs `live` groups (real provider/channel,
+  currently TP#6's API-key bench), and `personal-agent` sits in between.
+  `npm run eval:quality` runs the release coverage matrix. (`cli/src/coverage.ts`,
+  `cli/src/index.ts` `cmdCoverage`, `package.json` `eval:quality`)
 
 ## [0.4.0] - 2026-08-29
 
