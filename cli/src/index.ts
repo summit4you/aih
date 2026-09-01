@@ -191,9 +191,12 @@ import {
   cliSubjectAdapter,
   externalSubjectAdapter,
   resultsPath,
+  loadQualitySuite,
+  compareToBaseline,
   type EvalTask,
   type EvalModelSpec,
   type SubjectAdapter,
+  type CellResult,
 } from "./eval.js";
 import {
   distance,
@@ -229,6 +232,7 @@ aih session <list|show|rm|export|import|fork> [args]
   aih stats                       token usage across saved sessions
   aih scorecard [--format json]   harness health scorecard (6 metrics, PE#3)
   aih coverage [--profile NAME]   maturity scorecard: coverage-ID + evidence-mode matrix (OC#6)
+  aih quality [--mock] [--json]   BuffBench-style quality eval: run evals/quality.tasks.json, compare to baseline (FB#4)
   aih team <list|add-agent|add-task|claim|dispatch|mail|inbox> [args]
                                Agent Teams: roster + task board + mailbox (D#15)
   aih skills <list|find|install|show|registry> [args]
@@ -3748,6 +3752,91 @@ function cmdCoverage(flags: Record<string, string | boolean>): void {
 }
 
 /**
+ * FB#4 — BuffBench-style quality eval: `aih quality [--mock] [--json]`.
+ *
+ * Loads the committed quality task suite (evals/quality.tasks.json), runs it
+ * against the subject (bundled CLI; live model from env/config unless --mock),
+ * then compares pass/fail against evals/quality.baseline.json to catch
+ * regressions ("改 A 坏 B"). With --mock (or no API key) it still runs the
+ * deterministic rule-judged cells and the baseline compare — CI-safe — and
+ * reports that live scoring needs an API key. Reuses the P#46 runExperiment
+ * runner and the FB#2 judgePanel ecosystem (rule judge here; LLM judge via
+ * experiment's subject when a real model is configured).
+ */
+async function cmdQuality(flags: Record<string, string | boolean>): Promise<void> {
+  const cwd = process.cwd();
+  const tasksFile = join(cwd, "evals", "quality.tasks.json");
+  const baselineFile = join(cwd, "evals", "quality.baseline.json");
+  const suite = loadQualitySuite(tasksFile);
+  if (!suite) {
+    console.error(`quality: no task suite at ${tasksFile} (build has no evals/?)`);
+    process.exit(1);
+  }
+  const reps = 1;
+  // --mock is authoritative: force the deterministic mock subject.
+  const model = bool(flags, "mock")
+    ? "mock"
+    : str(flags, "model") ?? process.env.AIH_MODEL ?? "";
+  const models: EvalModelSpec[] = model ? [{ model }] : [{ model: "mock" }];
+  const expId = str(flags, "exp-id") ?? "quality";
+
+  const resultsDir = join(cwd, ".aih", "eval");
+  const cliEntry = dirname(dirname(fileURLToPath(import.meta.url)));
+  const subject = cliSubjectAdapter(cliEntry, { timeoutMs: 90_000 });
+
+  const report = await runExperiment(suite.tasks, models, reps, subject, {
+    outDir: join(resultsDir, "cells"),
+    budget: { concurrency: 4 },
+    expId,
+    resultsDir,
+  });
+
+  // baseline compare (deterministic; works in mock/CI)
+  let baseline: string[] = [];
+  let baselineMeta = "";
+  if (existsSync(baselineFile)) {
+    try {
+      const raw = JSON.parse(readFileSync(baselineFile, "utf8")) as { expectPass?: string[] };
+      baseline = raw.expectPass ?? [];
+      baselineMeta = ` (baseline ${baseline.length} pattern(s))`;
+    } catch {
+      baselineMeta = " (baseline unreadable)";
+    }
+  }
+  const fresh: Record<string, CellResult> = {};
+  for (const r of report.results) fresh[r.cellId] = r;
+  const delta = compareToBaseline(fresh, baseline);
+  const t = report.totals;
+
+  console.log(`quality eval "${expId}"${baselineMeta}`);
+  console.log(`  suite:    ${suite.tasks.length} task(s) · ${models.length} model(s) · ${reps} rep(s)`);
+  console.log(`  cells:    ${report.results.length}  (passed ${t.passed} · failed ${t.failed} · error ${t.errors})`);
+  if (report.skippedCells.length > 0) console.log(`  skipped:  ${report.skippedCells.length}  (${report.skippedCells.join(", ")})`);
+  if (model === "mock") {
+    console.log("  mode:     mock subject — cells judged deterministically; live scoring requires an API key");
+  }
+  console.log(`  baseline: ${delta.stable.length} stable · ${delta.unbaselined.length} unbaselined · ${delta.regressions.length} regression(s)`);
+  if (delta.regressions.length > 0) {
+    for (const r of delta.regressions) {
+      console.log(`    ${model === "mock" ? "not-passed" : "REGRESSION"}  ${r.cellId}  expected ${r.expected}, got ${r.actual}`);
+    }
+    // The regression gate is only meaningful on a LIVE run (real model): mock
+    // subjects cannot demonstrate real quality, so a mock run is CI-safe and
+    // informational. A live run failing a baseline cell is a REAL regression.
+    if (model !== "mock" && !bool(flags, "json")) {
+      console.log("  note:     baseline compare is a gate on LIVE runs only; mock runs are CI smoke");
+    }
+  }
+  if (bool(flags, "json")) {
+    console.log(JSON.stringify({ expId, totals: t, delta, cells: report.results }, null, 2));
+  } else {
+    console.log(`  results:  ${resultsPath(resultsDir, expId)}`);
+  }
+  // Exit non-zero only for a real (live) regression — mock/CI smoke passes.
+  if (model !== "mock" && delta.regressions.length > 0) process.exit(1);
+}
+
+/**
  * E#17 — non-interactive distill: `aih distill [--format json]`.
  * Deterministic repeated-flow extraction over the recent sessions (the same
  * pure functions /distill uses in the TUI). Non-interactive so it can run as
@@ -4892,6 +4981,8 @@ async function main() {
       return cmdScorecard(flags);
     case "coverage":
       return cmdCoverage(flags);
+    case "quality":
+      return cmdQuality(flags);
     case "team":
       return cmdTeam(positionals, flags);
     case "tidy":

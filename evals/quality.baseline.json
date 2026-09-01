@@ -1,0 +1,10 @@
+{
+  "description": "Quality eval baseline (BuffBench-style regression gate). Lists the cellIds that MUST pass in a release run. A cell expected here that fails in a live run is a REGRESSION (改 A 坏 B). Baseline is per task × model; with a real API key present, `npm run eval:quality` runs the suite and diffs against this.",
+  "expectPass": [
+    "tool-call-shape__*__r1",
+    "read-then-summarize__*__r1",
+    "multi-tool-compose__*__r1",
+    "search-then-report__*__r1",
+    "follow-exact-instructions__*__r1"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "description": "AIH quality eval suite (BuffBench-style). Fixed quality tasks with expected products, auto-scored. Runs every release via `npm run eval:quality` (mock subject for CI-safe determinism). A previously-passing cell that now fails is a regression.",
+  "tasks": [
+    {
+      "id": "tool-call-shape",
+      "prompt": "Call the list_todos tool and tell me how many open todos there are.",
+      "expect": ["list_todos"],
+      "category": "tool-use"
+    },
+    {
+      "id": "read-then-summarize",
+      "prompt": "Read the file README.md and summarize in one sentence what this project does.",
+      "expect": ["README.md", "summar"],
+      "category": "read-reasoning"
+    },
+    {
+      "id": "multi-tool-compose",
+      "prompt": "List the directory cli/src, then read the file cli/src/index.ts and state how many lines it has.",
+      "expect": ["cli/src/index.ts"],
+      "category": "multi-tool"
+    },
+    {
+      "id": "search-then-report",
+      "prompt": "Search the codebase for 'schemaVersion' and report which files reference it.",
+      "expect": ["schemaVersion"],
+      "category": "search"
+    },
+    {
+      "id": "follow-exact-instructions",
+      "prompt": "Do NOT call any tool. Just reply with the exact text: ACK-eval-ok",
+      "expect": ["ACK-eval-ok"],
+      "category": "instruction-following"
+    }
+  ]
+}

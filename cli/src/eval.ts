@@ -555,3 +555,104 @@ export async function runExperiment(
   }
   return { results: done, skippedCells: [...new Set(skipped)], totals };
 }
+
+// ---------------------------------------------------------------------------
+// FB#4 — BuffBench-style quality eval: baseline comparison (regression gate)
+// ---------------------------------------------------------------------------
+
+/**
+ * A task-suite manifest: fixed quality tasks + an expected-cell baseline.
+ * Loaded from `evals/*.tasks.json` (BuffBench-style). The baseline records
+ * which cells MUST pass; a cell that passed in the baseline but fails in a
+ * new run is a REGRESSION.
+ */
+export interface QualitySuite {
+  description?: string;
+  tasks: EvalTask[];
+}
+
+/** Load a quality suite from an evals tasks file (missing/file-bad → undefined). */
+export function loadQualitySuite(path: string): QualitySuite | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as QualitySuite;
+    if (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Compare a fresh run's results against a baseline expectation (an array of
+ * cellIds or `task__*__rN` wildcard patterns that MUST pass). Pure: no I/O.
+ * A cell the baseline expects to pass but the new run marks non-passed is a
+ * REGRESSION. Cells with no baseline expectation are reported but never count
+ * as a regression (unbaselined = informational).
+ */
+export interface BaselineDelta {
+  /** cells that regressed: baseline expected pass, new run did not pass. */
+  regressions: { cellId: string; expected: string; actual: string }[];
+  /** cells whose status is unchanged from the baseline (passed→passed). */
+  stable: string[];
+  /** cells with no baseline expectation (informational only). */
+  unbaselined: string[];
+  /** true iff zero regressions. */
+  ok: boolean;
+}
+
+/** Escape a literal for use inside a RegExp constructor (wildcard expansion). */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function compareToBaseline(
+  results: Record<string, CellResult> | CellResult[],
+  expectedPass: Record<string, "passed"> | string[],
+): BaselineDelta {
+  const list = Array.isArray(results) ? results : Object.values(results);
+  const byId = new Map<string, CellResult>(list.map((r) => [r.cellId, r]));
+  const patterns = Array.isArray(expectedPass) ? expectedPass : Object.keys(expectedPass);
+  // Expand wildcard patterns (`task__*__r1`) against the actual cell ids so the
+  // baseline can target "every model for this task" without knowing model ids.
+  const expectedSet = new Set<string>();
+  for (const p of patterns) {
+    if (!p.includes("*")) {
+      expectedSet.add(p);
+      continue;
+    }
+    const re = new RegExp(`^${p.split("*").map(escapeRegExp).join(".*")}$`);
+    let matched = false;
+    for (const id of byId.keys()) {
+      if (re.test(id)) {
+        expectedSet.add(id);
+        matched = true;
+      }
+    }
+    if (!matched) expectedSet.add(p); // no cell matched — the pattern itself counts as a (failing) expectation
+  }
+
+  const regressions: BaselineDelta["regressions"] = [];
+  const stable: string[] = [];
+  const unbaselined: string[] = [];
+
+  for (const [cellId, r] of byId) {
+    if (!expectedSet.has(cellId)) {
+      unbaselined.push(cellId);
+      continue;
+    }
+    if (r.status === "passed") stable.push(cellId);
+    else regressions.push({ cellId, expected: "passed", actual: r.status });
+  }
+  // Cells the baseline expects but that never produced a result count as
+  // regressions too (they were expected to pass, now absent/failed).
+  for (const id of expectedSet) {
+    if (!byId.has(id)) regressions.push({ cellId: id, expected: "passed", actual: "absent" });
+  }
+  return { regressions, stable, unbaselined, ok: regressions.length === 0 };
+}

@@ -79,6 +79,17 @@ the versions listed here (`scripts/package` derives the version from
   currently TP#6's API-key bench), and `personal-agent` sits in between.
   `npm run eval:quality` runs the release coverage matrix. (`cli/src/coverage.ts`,
   `cli/src/index.ts` `cmdCoverage`, `package.json` `eval:quality`)
+- **BuffBench-style quality eval suite + baseline regression gate (FB#4)**:
+  `aih quality [--mock] [--json]` runs the committed quality task suite
+  (`evals/quality.tasks.json` — fixed tasks with expected products, auto-scored
+  against `expect` substrings), then compares pass/fail against
+  `evals/quality.baseline.json` (cellId / `task__*__rN` wildcard patterns that
+  MUST pass) to catch "改 A 坏 B" regressions. Reuses the P#46 `runExperiment`
+  runner. A `live` run (real model) gates on regressions; a `--mock`/CI run is
+  deterministic and informational (mock subjects can't demonstrate real
+  quality). `npm run eval:quality` runs the suite (mock) then the coverage
+  matrix. (`cli/src/eval.ts` `loadQualitySuite`+`compareToBaseline`,
+  `cli/src/index.ts` `cmdQuality`, `evals/`)
 
 ## [0.4.0] - 2026-08-29
 

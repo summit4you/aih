@@ -5999,3 +5999,46 @@ console.log("══════════════════════�
 
   console.log("ok: OC#6 maturity scorecard — coverage-ID + evidence-mode classification");
 }
+
+// --- FB#4: BuffBench-style quality eval — baseline regression gate ----------
+{
+  const { compareToBaseline, loadQualitySuite } = await import("./eval.js");
+  const { writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const cell = (id: string, status: "passed" | "failed" | "error") =>
+    ({ cellId: id, taskId: id.split("__")[0], model: id.split("__")[1] ?? "mock", repetition: 1, status, durationMs: 1, outputTail: "" });
+
+  // 1. Exact cellIds in baseline.
+  let d = compareToBaseline([cell("a__m__r1", "passed"), cell("b__m__r1", "failed")], ["a__m__r1", "b__m__r1"]);
+  assert(d.ok === false && d.regressions.length === 1, "FB#4 baseline: exact failing cell is a regression");
+  assert(d.regressions[0].cellId === "b__m__r1" && d.regressions[0].actual === "failed", "FB#4 baseline: regression names the cell + actual status");
+  assert(d.stable.includes("a__m__r1"), "FB#4 baseline: passing cell is stable");
+
+  // 2. Wildcard patterns expand against the actual cells.
+  d = compareToBaseline([cell("task-x__mock__r1", "passed"), cell("task-x__mock__r1", "passed")], ["task-x__mock__r1"]);
+  d = compareToBaseline([cell("a__mock__r1", "passed"), cell("b__mock__r1", "failed")], ["*__mock__r1"]);
+  assert(d.regressions.length === 1 && d.regressions[0].cellId === "b__mock__r1", "FB#4 baseline: wildcard matches all cells of the model");
+  assert(d.stable.length === 1 && d.stable[0] === "a__mock__r1", "FB#4 baseline: wildcard marks passing cells stable");
+
+  // 3. Baseline expected but never-run cell → absent regression.
+  d = compareToBaseline([cell("a__m__r1", "passed")], ["a__m__r1", "missing__m__r1"]);
+  assert(d.regressions.some((r) => r.cellId === "missing__m__r1" && r.actual === "absent"), "FB#4 baseline: expected-but-absent cell is a regression");
+
+  // 4. Unbaselined cells are informational, never regressions.
+  d = compareToBaseline([cell("x__m__r1", "failed")], []);
+  assert(d.ok === true && d.regressions.length === 0 && d.unbaselined.length === 1, "FB#4 baseline: unbaselined cell is not a regression");
+
+  // 5. loadQualitySuite parses a committed evals task file (metadata ignored).
+  const dir = mkdtempSync(join(tmpdir(), "aih-fb4-"));
+  const suitePath = join(dir, "tasks.json");
+  writeFileSync(suitePath, JSON.stringify({ description: "suite", tasks: [{ id: "t1", prompt: "p", expect: ["x"] }] }));
+  const suite = loadQualitySuite(suitePath);
+  assert(suite !== undefined && suite.tasks.length === 1 && suite.tasks[0].id === "t1", "FB#4 suite: loads tasks.json");
+  assert(loadQualitySuite(join(dir, "nope.json")) === undefined, "FB#4 suite: missing file → undefined");
+  writeFileSync(join(dir, "bad.json"), "{ not json");
+  assert(loadQualitySuite(join(dir, "bad.json")) === undefined, "FB#4 suite: unparseable → undefined");
+
+  console.log("ok: FB#4 BuffBench-style quality eval — baseline regression gate");
+}

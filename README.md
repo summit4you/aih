@@ -338,6 +338,24 @@ runExperiment(tasks, models, reps, subject, { outDir, budget })
   停机、外部 echo subject 判定、**FA#6 持久化 + 失败单题重跑（只跑失败 cell、passed 保留）
   + status 分布检视**
 
+### 质量评测集 + 回归基线（FB#4，BuffBench 式）
+
+把「agent 在真实任务上的表现」变成可重复评测集——固定任务 + 期望产物 + 自动判分，防止改 A
+坏 B：
+
+```sh
+npm run eval:quality      # aih quality --mock && aih coverage --profile release
+aih quality [--mock] [--json]   # 跑 evals/quality.tasks.json + 对基线做回归对比
+```
+
+- **任务套件**（`evals/quality.tasks.json`）：5 条固定质量任务（工具调用 / 读后总结 / 多工具
+  组合 / 搜索汇报 / 指令遵循），各带 `expect` 期望产物，按子串自动判分（复用 P#46 runner）
+- **回归基线**（`evals/quality.baseline.json`）：cellId / `task__*__rN` 通配符模式，列出
+  **必须通过**的 cell；`compareToBaseline`（纯函数）把新跑通过集与此 diff——基线期望但新跑
+  未通过 → **REGRESSION**（改 A 坏 B）
+- **回归门语义**：live run（真模型）有回归 → 退出 1（gate）；`--mock`/CI run 确定性、信息性、
+  退出 0（mock subject 无法证明真实质量，只验证套件+基线机制不漂移）
+
 ### 成本与吞吐（cost / TPS）
 
 会话级成本与吞吐统计（roadmap F#30，对齐 MiMo context sidebar）：
