@@ -95,3 +95,4 @@
 1. 新增/修改 Action 或 Context 时，必须同步更新：本文件第 4 节、`mcp-server/src/app-adapter.ts`、冒烟测试。
 2. 破坏性变更需先在 `docs/decisions.md` 记录决策。
 3. 完成任务前运行 `npm run eval` 作为交接门禁。
+4. **核心每调用税（OC#2）**：core 里的每个工具/prompt 行/config key 都到达**每个算子的每次模型请求**，进 core 的边际成本远高于插件层——**加严审查**，默认不轻易进 core；一次性/领域特定逻辑放技能（`.aih/skills`）或扩展（`.aih/extensions`），它们无此税、鼓励扩张。**重复需求→seam**：同一能力被 ≥2 处独立 wire-in 时，正确回应是**契约不是一串 merge**——把 seam 落进 core/SDK 作稳定接口，bundled 实现迁上去，其余作插件/skill 挂上去，不要各处复制粘贴。判定标尺：①到达每次模型请求？（是→core 税，慎入）②被 ≥2 处独立需要？（是→提取 seam）③领域/一次性？（是→skill/extension）。详见 `docs/decisions.md` OC#2 条目。

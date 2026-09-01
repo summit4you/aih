@@ -42,6 +42,16 @@ the versions listed here (`scripts/package` derives the version from
   BRIEF gate for an existing OSS library / installed skill / already-shipped
   capability (a brief gate, not a research assignment). (`core/src/prompts.ts`
   `LIVE_VERIFY_DISCIPLINE`, injected in `loadSystemPrompt()`)
+- **Core per-call tax + repeat-demand→seam governance (OC#2, OpenClaw "Two
+  layers, two bars" borrow)**: an explicit decision heuristic — every core
+  tool/prompt line/config key reaches EVERY operator's EVERY model request, so
+  core admission is reviewed strictly (default: don't); one-off / domain logic
+  goes to skills (`.aih/skills`) or extensions (`.aih/extensions`) which carry
+  no such tax and are encouraged to grow. When the same capability is
+  independently wired in ≥2 places, the right response is a CONTRACT not a
+  string of merges: land the seam in core/SDK, migrate the bundled impl onto
+  it, hang the rest as plugins. Decision rule in `docs/decisions.md` + `APP.md`
+  §6 rule 4.
 - **Trust model statement (OC#4, OpenClaw "trust boundary" borrow)**: AIH is a
   LOCAL SINGLE-OPERATOR trust model — the trust boundary is the host OS user,
   session ownership/visibility is an availability feature NOT a security
