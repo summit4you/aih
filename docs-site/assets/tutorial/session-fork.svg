@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="360" viewBox="0 0 840 360" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="sf" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="840" height="360" fill="#ffffff"/>
+  <text x="20" y="30" font-size="16" font-weight="700" fill="#1a1a1a">SessionLog：append-only 事件流 + 分叉 / 检查点 / 回滚</text>
+
+  <!-- 主时间线 -->
+  <text x="20" y="66" font-size="12" font-weight="700" fill="#334155">主时间线（append-only）</text>
+  <line x1="60" y1="92" x2="790" y2="92" stroke="#2563eb" stroke-width="2" marker-end="url(#sf)"/>
+  <g font-size="11" fill="#1e40af" text-anchor="middle">
+    <rect x="60" y="72" width="46" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/>
+    <rect x="130" y="72" width="46" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/>
+    <rect x="200" y="72" width="46" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/>
+    <rect x="300" y="72" width="150" height="24" rx="5" fill="#fef3c7" stroke="#d97706"/>
+    <rect x="490" y="72" width="46" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/>
+    <rect x="560" y="72" width="46" height="24" rx="5" fill="#eff6ff" stroke="#2563eb"/>
+  </g>
+  <g font-size="10" fill="#0f172a">
+    <text x="83" y="90">e1</text>
+    <text x="153" y="90">e2</text>
+    <text x="223" y="90">e3</text>
+    <text x="375" y="90">checkpoint#1</text>
+    <text x="513" y="90">e4</text>
+    <text x="583" y="90">e5</text>
+  </g>
+  <text x="20" y="130" font-size="10" fill="#475569">“只追加”：e1→e5 只会不断往后加，绝不会被原地改写。checkpoint#1 是当前状态的“存档点”。</text>
+
+  <!-- 分叉 -->
+  <text x="20" y="166" font-size="12" font-weight="700" fill="#334155">从 checkpoint#1 分叉 / 回滚（prefix fork）</text>
+  <line x1="375" y1="96" x2="375" y2="176" stroke="#9333ea" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#sf)"/>
+  <line x1="375" y1="196" x2="640" y2="196" stroke="#9333ea" stroke-width="2" marker-end="url(#sf)"/>
+  <g font-size="11" text-anchor="middle">
+    <rect x="375" y="176" width="120" height="24" rx="5" fill="#fdf4ff" stroke="#9333ea"/>
+    <rect x="495" y="176" width="46" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a"/>
+    <rect x="541" y="176" width="46" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a"/>
+  </g>
+  <g font-size="10" fill="#0f172a">
+    <text x="435" y="194">checkpoint#1</text>
+    <text x="518" y="194">e6</text>
+    <text x="564" y="194">e7</text>
+  </g>
+  <text x="20" y="240" font-size="10" fill="#475569">fork()：从指定前缀创建新分支（e1..checkpoint#1 → e6 → e7），原时间线不受影响。</text>
+  <text x="20" y="258" font-size="10" fill="#475569">restoreTo()：回滚 = 找到最近的 checkpoint，只保留“到它为止”的前缀事件，当作新的起点继续追加。</text>
+
+  <!-- coverageDigest -->
+  <rect x="20" y="280" width="790" height="56" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="4 3"/>
+  <text x="32" y="302" font-size="12" font-weight="700" fill="#334155">压缩后的可验证性：coverageDigest</text>
+  <text x="32" y="320" font-size="10" fill="#0f172a">压缩把旧事件折叠成摘要时，会用 SHA-256 对“它声称覆盖的前缀事件”算出一个摘要（coverageDigest）。</text>
+  <text x="32" y="336" font-size="10" fill="#475569">回放时若摘要对不上，说明压缩与日志不一致——这条压缩会被当作“从未发生”，保证“模型可见的 = 可重放的”。</text>
+</svg>

@@ -9,6 +9,7 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **Docs-site tutorial refinement (zh + en)**: index ("导读 / How to read") table of contents now lists every chapter on its own line instead of merging several `·`-joined entries; repeated "three integration shapes" content is de-duplicated into a single canonical home in Ch.8 with cross-references from Ch.1/Ch.3/Ch.16; all bare `(chNN)` / `(../page)` cross-references converted to real clickable links. Deepened Ch.4 (session system) and Ch.9 (permission system) with beginner-friendly primers, real code walkthroughs (append/fork/restoreTo/coverageDigest; PolicyGate request), and two new SVG logic diagrams (`session-fork.svg`, `permission-floor.svg`). Added a Runoob-style "first use" beginner case to Ch.1 that exercises the real offline `--mock` pipeline.
 - **Docs-site tutorial book (`docs-site`)**: a five-part, eighteen-chapter bilingual
   (zh + en) "AIH: A Learner's Guide & Source Deep-Dive" modeled chapter-by-chapter on
   opencodebook.xyz, from install to kernel and mechanisms to ecosystem/practice. Added

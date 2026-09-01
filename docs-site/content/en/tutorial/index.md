@@ -48,15 +48,21 @@ point.
   - [Ch.2 · Project structure & development environment](ch02)
   - [Ch.3 · Overall architecture design](ch03)
 - Part II · Core Architecture
-  - [Ch.4 · The session system](ch04) · [Ch.5 · The tool system](ch05)
-  - [Ch.6 · The agent system](ch06) · [Ch.7 · The provider layer](ch07)
+  - [Ch.4 · The session system](ch04)
+  - [Ch.5 · The tool system](ch05)
+  - [Ch.6 · The agent system](ch06)
+  - [Ch.7 · The provider layer](ch07)
   - [Ch.8 · MCP & integration shapes](ch08)
 - Part III · Key Mechanisms
-  - [Ch.9 · The permission control system](ch09) · [Ch.10 · Snapshots & the file system](ch10)
-  - [Ch.11 · Event stream & scheduling](ch11) · [Ch.12 · CLI & TUI](ch12)
+  - [Ch.9 · The permission control system](ch09)
+  - [Ch.10 · Snapshots & the file system](ch10)
+  - [Ch.11 · Event stream & scheduling](ch11)
+  - [Ch.12 · CLI & TUI](ch12)
 - Part IV · Ecosystem
-  - [Ch.13 · Plugin & extension system](ch13) · [Ch.14 · The skill system](ch14)
-  - [Ch.15 · Community & reusable skills](ch15) · [Ch.16 · IDE & headless access](ch16)
+  - [Ch.13 · Plugin & extension system](ch13)
+  - [Ch.14 · The skill system](ch14)
+  - [Ch.15 · Community & reusable skills](ch15)
+  - [Ch.16 · IDE & headless access](ch16)
 - Part V · Practice
   - [Ch.17 · Hands-on: integrate an app end-to-end](ch17)
   - [Ch.18 · Design philosophy & best practices](ch18)
