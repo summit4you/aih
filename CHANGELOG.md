@@ -9,6 +9,13 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **Docs-site tutorial book (`docs-site`)**: a five-part, eighteen-chapter bilingual
+  (zh + en) "AIH: A Learner's Guide & Source Deep-Dive" modeled chapter-by-chapter on
+  opencodebook.xyz, from install to kernel and mechanisms to ecosystem/practice. Added
+  grouped sidebar navigation (build.mjs / check.mjs now support nested nav groups and
+  nested `tutorial/*` pages, with depth-aware relative links and assets) plus three SVG
+  diagrams (layered architecture, tool guard pipeline, agent loop). Served from the
+  existing GitHub Pages `docs.yml` workflow.
 - **Rules loading (opencode `rules` parity)**: AIH now reads and injects project
   `AGENTS.md` (falling back to `CLAUDE.md` walking up from cwd), global
   `~/.claude/CLAUDE.md` (Claude-Code compat, disable via

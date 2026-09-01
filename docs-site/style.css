@@ -114,6 +114,30 @@ body {
   font-weight: 600;
 }
 
+/* grouped nav (tutorial book): section heading + indented children */
+.nav-group { margin: 10px 0 2px; }
+.nav-group-label,
+.nav-subgroup-label {
+  display: block;
+  padding: 8px 10px 2px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-muted);
+}
+.nav-subgroup { margin: 2px 0; }
+.nav-subgroup .nav-subgroup-label {
+  padding: 6px 10px 2px 18px;
+  font-size: 11px;
+}
+.nav-group .nav-group-label,
+.nav-group a,
+.nav-subgroup .nav-subgroup-label,
+.nav-subgroup a { margin-left: 0; }
+.nav-group a { padding-left: 18px; }
+.nav-subgroup a { padding-left: 26px; font-size: 13px; }
+
 /* language switcher (pinned to sidebar bottom) */
 .nav-lang {
   margin-top: auto;

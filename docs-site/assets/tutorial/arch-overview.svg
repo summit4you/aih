@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="820" height="460" fill="#ffffff"/>
+  <!-- Title -->
+  <text x="20" y="28" font-size="16" font-weight="700" fill="#1a1a1a">AIH 分层架构（L0 接入 → L3 技能 + 横切面）</text>
+
+  <!-- L3 -->
+  <rect x="20" y="46" width="780" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="36" y="68" font-size="13" font-weight="700" fill="#1e40af">L3 技能层</text>
+  <text x="36" y="86" font-size="11" fill="#374151">skills/ 按需加载 · SKILL.md 三级（project &gt; user &gt; builtin）· BM25 自动建议 · 自进化</text>
+
+  <!-- L2 -->
+  <rect x="20" y="110" width="780" height="52" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="36" y="132" font-size="13" font-weight="700" fill="#166534">L2 规程层</text>
+  <text x="36" y="150" font-size="11" fill="#374151">APP.md（契约）· harness.yml · scripts/（doctor / check / eval）· docs/decisions.md</text>
+
+  <!-- L1 -->
+  <rect x="20" y="174" width="780" height="90" rx="8" fill="#fdf4ff" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="36" y="196" font-size="13" font-weight="700" fill="#6b21a8">L1 内核层（core/）</text>
+  <rect x="36" y="208" width="172" height="42" rx="6" fill="#ffffff" stroke="#9333ea"/><text x="46" y="225" font-size="11" font-weight="600" fill="#111">SessionLog</text><text x="46" y="241" font-size="10" fill="#444">append-only JSONL</text>
+  <rect x="220" y="208" width="172" height="42" rx="6" fill="#ffffff" stroke="#9333ea"/><text x="230" y="225" font-size="11" font-weight="600" fill="#111">ToolRegistry</text><text x="230" y="241" font-size="10" fill="#444">守卫管线 + 权限</text>
+  <rect x="404" y="208" width="172" height="42" rx="6" fill="#ffffff" stroke="#9333ea"/><text x="414" y="225" font-size="11" font-weight="600" fill="#111">AgentLoop</text><text x="414" y="241" font-size="10" fill="#444">turn / step</text>
+  <rect x="588" y="208" width="172" height="42" rx="6" fill="#ffffff" stroke="#9333ea"/><text x="598" y="225" font-size="11" font-weight="600" fill="#111">Seams（接缝）</text><text x="598" y="241" font-size="10" fill="#444">LLM / 审批 / 沙箱</text>
+
+  <!-- L0 -->
+  <rect x="20" y="276" width="780" height="74" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="36" y="298" font-size="13" font-weight="700" fill="#92400e">L0 接入层（mcp-server/ · AppAdapter）</text>
+  <rect x="36" y="310" width="180" height="30" rx="6" fill="#ffffff" stroke="#d97706"/><text x="46" y="329" font-size="11" fill="#111">descriptor 描述</text>
+  <rect x="228" y="310" width="180" height="30" rx="6" fill="#ffffff" stroke="#d97706"/><text x="238" y="329" font-size="11" fill="#111">context(query) 读</text>
+  <rect x="420" y="310" width="180" height="30" rx="6" fill="#ffffff" stroke="#d97706"/><text x="430" y="329" font-size="11" fill="#111">actions 写（带权限）</text>
+  <rect x="612" y="310" width="148" height="30" rx="6" fill="#ffffff" stroke="#d97706"/><text x="622" y="329" font-size="11" fill="#111">Event 流</text>
+
+  <!-- cross-cutting -->
+  <rect x="20" y="362" width="780" height="52" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="36" y="384" font-size="13" font-weight="700" fill="#334155">横切面</text>
+  <text x="36" y="402" font-size="11" fill="#374151">权限三档 allow / ask / deny · append-only 审计（.aih/tool-audit.jsonl）· eval 交接门禁 · 项目信任门</text>
+
+  <!-- data flow arrow -->
+  <path d="M410 276 L410 266" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="420" y="258" font-size="10" fill="#2563eb">动作/事件向上，指令向下</text>
+  <text x="20" y="440" font-size="10" fill="#6b7280">三种接入形态复用同一 L0 契约：MCP 外挂 / CLI（aih、aih run、aih chat）/ 内嵌 SDK（@aih/core）</text>
+</svg>

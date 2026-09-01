@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="360" viewBox="0 0 840 360" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="aa" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="840" height="360" fill="#ffffff"/>
+  <text x="20" y="28" font-size="16" font-weight="700" fill="#1a1a1a">AgentLoop：turn / step 执行循环</text>
+
+  <!-- turn start -->
+  <rect x="60" y="55" width="150" height="46" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="75" y="78" font-size="12" font-weight="700" fill="#1e40af">turn 开始</text>
+  <text x="75" y="93" font-size="10" fill="#374151">注入系统提示 + 会话</text>
+
+  <!-- request -->
+  <rect x="330" y="55" width="170" height="46" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="345" y="78" font-size="12" font-weight="700" fill="#1e40af">LLM 请求</text>
+  <text x="345" y="93" font-size="10" fill="#374151">onPromptInput 调试钩子</text>
+
+  <!-- response -->
+  <rect x="600" y="55" width="170" height="46" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="615" y="78" font-size="12" font-weight="700" fill="#166534">模型响应</text>
+  <text x="615" y="93" font-size="10" fill="#374151">文本 / 工具调用 / 停止</text>
+
+  <line x1="210" y1="78" x2="330" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#aa)"/>
+  <line x1="500" y1="78" x2="600" y2="78" stroke="#2563eb" stroke-width="1.5" marker-end="url(#aa)"/>
+
+  <!-- tool call branch -->
+  <rect x="600" y="150" width="170" height="70" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="615" y="173" font-size="12" font-weight="700" fill="#92400e">工具调用（重复 N 次）</text>
+  <text x="615" y="191" font-size="10" fill="#374151">ToolRegistry 守卫管线</text>
+  <text x="615" y="207" font-size="10" fill="#374151">结果回填 → 再次 LLM</text>
+  <line x1="685" y1="101" x2="685" y2="150" stroke="#d97706" stroke-width="1.5" marker-end="url(#aa)"/>
+  <line x1="610" y1="185" x2="415" y2="78" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#aa)"/>
+
+  <!-- stop branch -->
+  <rect x="60" y="150" width="190" height="70" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="75" y="173" font-size="12" font-weight="700" fill="#166534">停止 / 结束 turn</text>
+  <text x="75" y="191" font-size="10" fill="#374151">empty retry（≤2）</text>
+  <text x="75" y="207" font-size="10" fill="#374151">stall resume（≤1）</text>
+  <line x1="600" y1="78" x2="250" y2="150" stroke="#16a34a" stroke-width="1.5" marker-end="url(#aa)"/>
+
+  <!-- guards bar -->
+  <rect x="20" y="250" width="800" height="80" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="4 3"/>
+  <text x="34" y="272" font-size="12" font-weight="700" fill="#334155">每 step 后的守卫</text>
+  <text x="34" y="292" font-size="10.5" fill="#374151">预算（BudgetTracker）：hard 停止 turn · soft tripwire 提示 · costOf 转美元</text>
+  <text x="34" y="310" font-size="10.5" fill="#374151">传感器（写后验证循环）红判据注入反馈，重试有界，最终 escalate · /goal 每轮独立 LLM 裁判</text>
+  <text x="34" y="328" font-size="10.5" fill="#374151">上下文溢出 → 主动压缩（append-only 前缀 + coverageDigest 校验）· 配额 429 → 等待后重试（有界）</text>
+</svg>

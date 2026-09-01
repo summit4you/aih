@@ -14,5 +14,60 @@
   { "href": "architecture", "label": "架构" },
   { "href": "troubleshooting", "label": "故障排查" },
   { "href": "development", "label": "开发" },
-  { "href": "changelog", "label": "更新日志" }
+  { "href": "changelog", "label": "更新日志" },
+  {
+    "type": "group",
+    "label": "教程",
+    "children": [
+      { "href": "tutorial/index", "label": "导读：写给新读者的入门书" },
+      {
+        "type": "group",
+        "label": "第 I 部分 · 基础",
+        "children": [
+          { "href": "tutorial/ch01", "label": "第 1 章 · AI 编程助手时代与 AIH 的定位" },
+          { "href": "tutorial/ch02", "label": "第 2 章 · 项目结构与开发环境" },
+          { "href": "tutorial/ch03", "label": "第 3 章 · 总体架构设计" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "第 II 部分 · 核心架构",
+        "children": [
+          { "href": "tutorial/ch04", "label": "第 4 章 · 会话系统" },
+          { "href": "tutorial/ch05", "label": "第 5 章 · 工具系统" },
+          { "href": "tutorial/ch06", "label": "第 6 章 · 智能体系统" },
+          { "href": "tutorial/ch07", "label": "第 7 章 · Provider 多模型适配层" },
+          { "href": "tutorial/ch08", "label": "第 8 章 · MCP 与接入形态" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "第 III 部分 · 关键机制",
+        "children": [
+          { "href": "tutorial/ch09", "label": "第 9 章 · 权限控制系统" },
+          { "href": "tutorial/ch10", "label": "第 10 章 · 快照与文件系统" },
+          { "href": "tutorial/ch11", "label": "第 11 章 · 事件流与调度" },
+          { "href": "tutorial/ch12", "label": "第 12 章 · CLI 与 TUI" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "第 IV 部分 · 生态",
+        "children": [
+          { "href": "tutorial/ch13", "label": "第 13 章 · 插件与扩展系统" },
+          { "href": "tutorial/ch14", "label": "第 14 章 · 技能系统" },
+          { "href": "tutorial/ch15", "label": "第 15 章 · 社区与可复用技能" },
+          { "href": "tutorial/ch16", "label": "第 16 章 · IDE 与无头接入（serve/attach/MCP）" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "第 V 部分 · 实践",
+        "children": [
+          { "href": "tutorial/ch17", "label": "第 17 章 · 动手实践：端到端接入一个应用" },
+          { "href": "tutorial/ch18", "label": "第 18 章 · 设计哲学与最佳实践" }
+        ]
+      }
+    ]
+  }
 ]

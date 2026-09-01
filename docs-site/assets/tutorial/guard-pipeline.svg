@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="300" viewBox="0 0 840 300" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="ga" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#2563eb"/></marker>
+  </defs>
+  <rect width="840" height="300" fill="#ffffff"/>
+  <text x="20" y="28" font-size="16" font-weight="700" fill="#1a1a1a">ToolRegistry 守卫管线（一次工具调用的完整路径）</text>
+
+  <!-- stages -->
+  <rect x="20" y="60" width="170" height="64" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="30" y="84" font-size="12" font-weight="700" fill="#1e40af">1 解析权限</text>
+  <text x="30" y="102" font-size="10" fill="#374151">def.permission（静态/函数）</text>
+  <text x="30" y="116" font-size="10" fill="#374151">deny → 直接拒绝</text>
+
+  <rect x="210" y="60" width="200" height="64" rx="8" fill="#fef3c7" stroke="#d97706"/>
+  <text x="220" y="84" font-size="12" font-weight="700" fill="#92400e">2 ask / doom-loop 守卫</text>
+  <text x="220" y="102" font-size="10" fill="#374151">重复相同调用 ≥3 次 → 触发 ask</text>
+  <text x="220" y="116" font-size="10" fill="#374151">≥6 次 → 硬拒绝（防死循环）</text>
+
+  <rect x="430" y="60" width="200" height="64" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="440" y="84" font-size="12" font-weight="700" fill="#166534">3 before 钩子</text>
+  <text x="440" y="102" font-size="10" fill="#374151">脱敏 / 计时 / 审计</text>
+  <text x="440" y="116" font-size="10" fill="#374151">AskError → 强制人工确认</text>
+
+  <rect x="650" y="60" width="170" height="64" rx="8" fill="#fdf4ff" stroke="#9333ea"/>
+  <text x="660" y="84" font-size="12" font-weight="700" fill="#6b21a8">4 执行 def.execute</text>
+  <text x="660" y="102" font-size="10" fill="#374151">读类可并行，写类串行</text>
+  <text x="660" y="116" font-size="10" fill="#374151">结果按原序落盘</text>
+
+  <!-- arrows -->
+  <line x1="190" y1="92" x2="210" y2="92" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga)"/>
+  <line x1="410" y1="92" x2="430" y2="92" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga)"/>
+  <line x1="630" y1="92" x2="650" y2="92" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga)"/>
+
+  <!-- after hooks + audit bar -->
+  <rect x="300" y="170" width="360" height="52" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="4 3"/>
+  <text x="312" y="192" font-size="12" font-weight="700" fill="#334155">5 after 钩子（回写结果 / 审计）</text>
+  <text x="312" y="210" font-size="10" fill="#374151">扩展钩子最后入水，改写结果并落 .aih/tool-audit.jsonl</text>
+  <line x1="735" y1="124" x2="735" y2="170" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ga)"/>
+  <text x="20" y="240" font-size="11" fill="#475569">未知工具：plan 只读模式隐藏写工具，错误信息引导切换 build 模式（Tab / /mode build）。</text>
+  <text x="20" y="260" font-size="11" fill="#475569">并行只读：同一 step 内连续只读工具并发 &le; AIH_TOOL_CONCURRENCY（默认 4），结果按输入序返回。</text>
+</svg>

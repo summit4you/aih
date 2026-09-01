@@ -64,6 +64,7 @@ aih
 
 ## Next steps
 
+- Want to learn AIH properly? → **"AIH: A Learner's Guide & Source Deep-Dive"** (a five-part, eighteen-chapter tutorial; [start with the reader's guide](tutorial/index))
 - Install → [Installation](install)
 - Three integration forms → [Quick start](quickstart)
 - Configure providers & models → [Configuration](config)

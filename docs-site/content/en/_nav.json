@@ -14,5 +14,60 @@
   { "href": "architecture", "label": "Architecture" },
   { "href": "troubleshooting", "label": "Troubleshooting" },
   { "href": "development", "label": "Development" },
-  { "href": "changelog", "label": "Changelog" }
+  { "href": "changelog", "label": "Changelog" },
+  {
+    "type": "group",
+    "label": "Tutorial",
+    "children": [
+      { "href": "tutorial/index", "label": "How to read this book" },
+      {
+        "type": "group",
+        "label": "Part I · Foundations",
+        "children": [
+          { "href": "tutorial/ch01", "label": "Ch.1 · From coding assistants to the AIH positioning" },
+          { "href": "tutorial/ch02", "label": "Ch.2 · Project structure & development environment" },
+          { "href": "tutorial/ch03", "label": "Ch.3 · Overall architecture design" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "Part II · Core Architecture",
+        "children": [
+          { "href": "tutorial/ch04", "label": "Ch.4 · The session system" },
+          { "href": "tutorial/ch05", "label": "Ch.5 · The tool system" },
+          { "href": "tutorial/ch06", "label": "Ch.6 · The agent system" },
+          { "href": "tutorial/ch07", "label": "Ch.7 · The provider layer" },
+          { "href": "tutorial/ch08", "label": "Ch.8 · MCP & integration shapes" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "Part III · Key Mechanisms",
+        "children": [
+          { "href": "tutorial/ch09", "label": "Ch.9 · The permission control system" },
+          { "href": "tutorial/ch10", "label": "Ch.10 · Snapshots & the file system" },
+          { "href": "tutorial/ch11", "label": "Ch.11 · Event stream & scheduling" },
+          { "href": "tutorial/ch12", "label": "Ch.12 · CLI & TUI" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "Part IV · Ecosystem",
+        "children": [
+          { "href": "tutorial/ch13", "label": "Ch.13 · Plugin & extension system" },
+          { "href": "tutorial/ch14", "label": "Ch.14 · The skill system" },
+          { "href": "tutorial/ch15", "label": "Ch.15 · Community & reusable skills" },
+          { "href": "tutorial/ch16", "label": "Ch.16 · IDE & headless access (serve/attach/MCP)" }
+        ]
+      },
+      {
+        "type": "group",
+        "label": "Part V · Practice",
+        "children": [
+          { "href": "tutorial/ch17", "label": "Ch.17 · Hands-on: integrate an app end-to-end" },
+          { "href": "tutorial/ch18", "label": "Ch.18 · Design philosophy & best practices" }
+        ]
+      }
+    ]
+  }
 ]
