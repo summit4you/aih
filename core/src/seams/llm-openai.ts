@@ -253,8 +253,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       body.tools = req.tools.map(toOpenAITool);
       body.tool_choice = "auto";
     }
-    if (this.#options.maxTokens !== undefined) {
-      body.max_tokens = this.#options.maxTokens;
+    const maxTokens = req.maxTokens ?? this.#options.maxTokens;
+    if (maxTokens !== undefined) {
+      body.max_tokens = maxTokens;
     }
     if (req.thinking) {
       body.thinking = { type: "enabled" };

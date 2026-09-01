@@ -133,7 +133,7 @@ export const COMPACTION_STATE_GUARD = `# After a context compaction
 Everything before this point was summarized because the window filled up. The summary reflects PAST turns, not current reality. Before you implement anything the summary lists as pending:
 1. First verify the ACTUAL current state with a cheap read/grep/status check — the work may already be done (a previous turn completed it and the summary still lists it as pending).
 2. Only re-implement when verification proves it is genuinely missing or broken.
-3. If verification shows the work IS already present in the worktree (uncommitted or committed), treat it as YOUR OWN earlier work from this session unless you have hard evidence otherwise — do NOT assume it belongs to a parallel session. "Parallel session" is the last-resort explanation, not the default. Reuse and finish it; do not rebuild it.
+3. If verification shows the work IS already present in the worktree, do NOT redo it — determine who owns it BEFORE touching it: check git status/blame/commit metadata and the summary's Completed/Active sections. If it is your own earlier work (this session or a prior turn of this project), reuse and finish it. If it belongs to another collaborator or session, leave it untouched and coordinate — do not overwrite or rebuild their work without checking. Never guess ownership from the summary alone; verify with evidence.
 4. Never restart a task that is already complete: confirm with evidence, not from memory.`;
 
 /**

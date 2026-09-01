@@ -1136,8 +1136,8 @@ assert(
   "state-guard forbids re-implementing verified-complete work",
 );
 assert(
-  req.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("do NOT assume it belongs to a parallel session")),
-  "state-guard steers against parallel-session misattribution",
+  req.some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("determine who owns it BEFORE touching it")),
+  "state-guard checks ownership before touching existing work (multi-agent safe)",
 );
 // Freebuff ③ — the compaction prompt must tell the model the summary is
 // HISTORICAL MEMORY ONLY: not dialogue, not an output template, not a
@@ -1188,9 +1188,8 @@ assert(
 
 // Rolling compaction must tell the summarizer to drop finished work from
 // "Objective" — otherwise a stale Objective duplicates a Completed item and
-// the agent re-does finished work after compaction, misattributing its own
-// earlier edits to a parallel session (observed: FB#5/#6 implemented, then
-// re-implemented "by a parallel session" after compaction).
+// the agent re-does finished work after compaction (observed: FB#5/#6 were
+// implemented, then re-implemented after compaction).
 {
   const { AgentLoop: Loop } = await import("./agent-loop.js");
   const rLog = new SessionLog();
@@ -1228,16 +1227,12 @@ assert(
     updatePrompt.includes("never keep an item in \"Objective\" that is already done"),
     "rolling summary instructions forbid keeping finished work in Objective",
   );
-  assert(
-    updatePrompt.includes("misattributing its own earlier work to a parallel session"),
-    "summary guidance steers clear of the parallel-session misattribution trap",
-  );
-  console.log("ok: rolling compaction warns against re-doing finished work / parallel-session misattribution");
+  console.log("ok: rolling compaction warns against re-doing finished work after compaction");
 }
 
 // compactContext — an authoritative state snapshot (e.g. todo list) must be
 // folded into EVERY compaction summary prompt so a compacted agent cannot
-// forget what is done vs pending (the FB#5/#6 "re-did by a parallel session"
+// forget what is done vs pending (the FB#5/#6 "re-did after compaction"
 // bug). The summarizer must see "done, do NOT redo" as authoritative truth.
 {
   const { AgentLoop: Loop } = await import("./agent-loop.js");
@@ -1246,9 +1241,10 @@ assert(
   const cTools = new ToolRegistry(cGate);
   cTools.register(echo);
   const cReq: ChatMessage[][] = [];
+  const cReqTokens: Array<number | undefined> = [];
   const cScripted = new MockLLM([{ text: "SNAPSHOT-SUMMARY" }]);
   const cLoop = new Loop({
-    llm: { complete: (req) => { cReq.push(req.messages); return cScripted.complete(req); } },
+    llm: { complete: (req) => { cReq.push(req.messages); cReqTokens.push(req.maxTokens); return cScripted.complete(req); } },
     tools: cTools,
     log: cLog,
     systemPrompt: "sys",
@@ -1273,6 +1269,10 @@ assert(
   assert(
     prompt.includes("FB#7"),
     "compactContext: pending todos carried into the summary",
+  );
+  assert(
+    cReqTokens.some((t) => t === 4096),
+    "compaction summary LLM request carries maxTokens=4096 (opencode parity, bounded output)",
   );
   console.log("ok: compactContext folds authoritative todo state into every compaction summary");
 }

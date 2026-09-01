@@ -109,8 +109,8 @@ export interface AgentLoopOptions {
    * compactContext — optional state snapshot appended to every compaction
    * summary prompt (auto and manual). The CLI wires this to the current todo
    * state so a compacted agent does not forget which items are done vs
-   * pending (observed: after compaction the agent re-did finished work,
-   * misattributing its own earlier edits to a "parallel session"). The string
+   * pending (observed: after compaction the agent re-did finished work). The
+   * string
    * is folded into the summary request as an "Authoritative current state"
    * block the summarizer must carry forward verbatim.
    */
@@ -219,6 +219,10 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000;
 const MAX_RECENT_TOKENS = 15_000;   // opencode: MAX_PRESERVE_RECENT_TOKENS
 const MIN_RECENT_TOKENS = 500;      // floor for the verbatim recent tail
 const RESERVED_RATIO = 0.2;         // fraction of the window reserved for output
+/** Summary output bound (opencode SUMMARY_OUTPUT_TOKENS parity). Prevents the
+ *  summary LLM from emitting unbounded output; aih also slices to 12K chars as
+ *  a belt-and-braces guard, but the token bound stops the generation early. */
+const SUMMARY_OUTPUT_TOKENS = 4_096;
 
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
@@ -263,7 +267,7 @@ When combining:
 - Move completed work from "Active" to "Completed".
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
 - Update "Objective" and "Next Move" to reflect the current work state.
-- CRITICAL — never keep an item in "Objective" that is already done. Once the conversation shows a task was implemented, tested, or delivered (even if uncommitted), move it OUT of "Objective" and into "Completed"/"Active" with its verification state. "Objective" lists only what is genuinely NOT yet done. A stale Objective that duplicates a Completed item is the #1 cause of the agent re-doing finished work after compaction and misattributing its own earlier work to a parallel session.
+- CRITICAL — never keep an item in "Objective" that is already done. Once the conversation shows a task was implemented, tested, or delivered (even if uncommitted), move it OUT of "Objective" and into "Completed"/"Active" with its verification state. "Objective" lists only what is genuinely NOT yet done. A stale Objective that duplicates a Completed item is the #1 cause of the agent re-doing finished work after compaction.
 - Keep the summary in the SAME language as the conversation — match the user's language exactly.`;
 
 export class AgentLoop {
@@ -1299,6 +1303,7 @@ export class AgentLoop {
       const response = await this.#llm.complete({
         messages: [{ role: "user", content: fullPrompt }],
         tools: [],
+        maxTokens: SUMMARY_OUTPUT_TOKENS,
         ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
       });
       return { text: response.text, usage: response.usage };
@@ -1316,6 +1321,7 @@ export class AgentLoop {
       const response = await this.#llm.complete({
         messages: [{ role: "user", content: prompt }],
         tools: [],
+        maxTokens: SUMMARY_OUTPUT_TOKENS,
         ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
       });
       if (response.text.trim()) partials.push(response.text.trim());
@@ -1326,6 +1332,7 @@ export class AgentLoop {
     const merged = await this.#llm.complete({
       messages: [{ role: "user", content: this.#mergePrompt(partials, previousSummary) }],
       tools: [],
+      maxTokens: SUMMARY_OUTPUT_TOKENS,
       ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
     });
     return { text: merged.text, usage: addUsage(usage, merged.usage) };

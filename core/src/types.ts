@@ -322,6 +322,13 @@ export interface LLMRequest {
    * stays clean.
    */
   sessionId?: string;
+  /**
+   * Per-request max output tokens. Overrides the adapter's configured
+   * maxTokens for this call (opencode compaction parity: the summary LLM is
+   * bounded by SUMMARY_OUTPUT_TOKENS so it can never blow past the window).
+   * Absent → the adapter's configured maxTokens (or provider default) applies.
+   */
+  maxTokens?: number;
 }
 
 export interface LLMResponse {
