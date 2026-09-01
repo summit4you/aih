@@ -42,6 +42,14 @@ the versions listed here (`scripts/package` derives the version from
   BRIEF gate for an existing OSS library / installed skill / already-shipped
   capability (a brief gate, not a research assignment). (`core/src/prompts.ts`
   `LIVE_VERIFY_DISCIPLINE`, injected in `loadSystemPrompt()`)
+- **Trust model statement (OC#4, OpenClaw "trust boundary" borrow)**: AIH is a
+  LOCAL SINGLE-OPERATOR trust model — the trust boundary is the host OS user,
+  session ownership/visibility is an availability feature NOT a security
+  boundary, and a prompt-injection-only chain is not a security bug unless it
+  crosses a hard boundary (allow/ask/deny gate, credential redaction + owner
+  isolation, sandbox seam, tool `deny` red line). Documented in `APP.md`
+  §3 (capability boundary → new "trust model" subsection) and `README.md`
+  (permissions section).
 
 ## [0.4.0] - 2026-08-29
 

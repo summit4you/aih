@@ -654,6 +654,22 @@ TUI 内联确认：`⚠ approval requested: <tool> <args>` → `[y] once · [n] 
 [a] always <scope>`；`scope` 由目标路径自动推导为父目录，选 `a` 按 last-match-wins
 持久化到 aih.json（项目 > 全局）。
 
+### 信任模型（OC#4 — 本地单算子，非多租户安全边界）
+
+AIH 的威胁模型是**本地单算子**：
+
+- **信任边界 = 宿主 OS 用户**。能操作该 agent 的人就能让 agent 做任何 agent 能做的事。
+  session 的所有权/可见性是**可用性特性，不是安全边界**——不要把它当隔离手段。
+- **prompt-injection-only 链不算安全 bug**：仅靠「模型被诱导」而**没有**越过下列任一硬边界的
+  路径不在威胁模型内。硬边界 = `allow/ask/deny` 权限门（`ApprovalGate`）、凭据脱敏与
+  owner 隔离（`redactCredential` / 降级而非 fallback）、sandbox seam（默认 local，可切
+  bwrap/remote）、工具注册表的 `deny` 红线。越过其中任一才算安全事件。
+- **需要真隔离时**：用独立 agent / 独立宿主（独立 OS 用户或容器）建立新信任边界，而不是
+  指望 prompt 或 session 隔离。
+- **对手模型**：默认对手是「同宿主用户」与「不可信的外部内容（网页/工具输出）」；外部内容
+  只能影响模型意图，不能直接触达 deny 红线或凭据——除非它诱导模型主动调用一个被 allow/ask
+  放行的工具，而那属于用户对权限配置的决策。
+
 ### TUI（交互终端）
 
 opencode / MiMo-Code 风格全屏 TUI：
@@ -1089,7 +1105,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）；checkpoint 回滚（✅ F#28 `/checkpoint`+`/restore`）。
 - **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS ✅ F#30；side-by-side diff ✅ F#31（双色单元格 + 行号列 + 窄屏回退）。
 - **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。
-- **OpenClaw**（openclaw/openclaw，多渠道 AI 助手网关）→ 只借判断层/工程纪律：修复教义（OC#1，root-cause-first / 生产 LOC 一等约束 / 禁止 consumer-only guard 掩盖根因 ✅）、**live-verify 默认 + 先查现成方案**（OC#3，用户可见行为落地前走真实生产路径 + 自定义前先做简短现成方案门 ✅，`core/src/prompts.ts` `LIVE_VERIFY_DISCIPLINE`）、凭据所有者隔离（OC#7，降级 owner 而非 fallback 凭据 ✅，见专章）、版本化状态守卫（OC#5，schemaVersion + 拒绝开更新版本 ✅）；明确不借：多渠道网关 / 伴随应用 / ClawHub 市场 / OTel 遥测 / Crabbox 云沙箱 / pnpm monorepo（撞"本地单算子"定位）。
+- **OpenClaw**（openclaw/openclaw，多渠道 AI 助手网关）→ 只借判断层/工程纪律：修复教义（OC#1，root-cause-first / 生产 LOC 一等约束 / 禁止 consumer-only guard 掩盖根因 ✅）、**live-verify 默认 + 先查现成方案**（OC#3，用户可见行为落地前走真实生产路径 + 自定义前先做简短现成方案门 ✅，`core/src/prompts.ts` `LIVE_VERIFY_DISCIPLINE`）、**信任模型澄清**（OC#4，本地单算子边界 + prompt-injection-only 链不算安全 bug ✅，见权限模型章节后「信任模型」段 + APP.md §3）、凭据所有者隔离（OC#7，降级 owner 而非 fallback 凭据 ✅，见专章）、版本化状态守卫（OC#5，schemaVersion + 拒绝开更新版本 ✅）；明确不借：多渠道网关 / 伴随应用 / ClawHub 市场 / OTel 遥测 / Crabbox 云沙箱 / pnpm monorepo（撞"本地单算子"定位）。
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **Apache Maka**（apache/maka，local-first agent workspace）→ 借 **事实层纪律**：append-only 事件即唯一事实源、UI/模型调用只是投影。已落地：compaction coverage digest（✅ MK#42，摘要必须证明覆盖范围，否则 fail-open）、tool/dispatch T1 事实 + RecoveryResolver 四态分类 + park 稳定码（✅ MK#44/45）、工具结果修剪 + archive_read 惰性归档（✅ MK#43）、工作区身份 UUID（✅ MK#47）、models.dev 快照 fail-closed 同步（✅ P#48）、steering/follow-up 双队列（✅ P#35）；明确不借 SQLite/Electron、Phase3/4 文件级 reconcile、provider-native 远程压缩。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
