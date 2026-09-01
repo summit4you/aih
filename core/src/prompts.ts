@@ -48,6 +48,19 @@ export const REPAIR_DOCTRINE = `# Repair doctrine (how to fix, not just that it'
 - Before calling a fix done, state: root cause, architectural owner, the canonical fix, paths removed, production-LOC delta, sibling coverage, and the observed behavior.`;
 
 /**
+ * OC#3 — two prompt disciplines (OpenClaw AGENTS.md "Start" borrow):
+ * ① live-verify-by-default: a user-visible behavior must be exercised through
+ *    the REAL production path before it is claimed done — skipping requires
+ *    stating a concrete infeasibility, never "to save effort".
+ * ② check-existing-first: before proposing/building anything custom, do a
+ *    BRIEF gate for an OSS library / existing skill / already-shipped
+ *    capability. A brief gate, not a research assignment.
+ */
+export const LIVE_VERIFY_DISCIPLINE = `# Live-verify & check-existing-first (two default disciplines)
+- Live-verify by default: before claiming any user-visible behavior is done, exercise it through the REAL production path (the actual command, API, file, or service a user would touch). "It compiles", "the preview looks right", or "the draft is ready" are NOT evidence. If you cannot run the real path, state the CONCRETE infeasibility (what is missing and why) — never skip it to save effort or tokens.
+- Check-existing-first: before proposing or building any custom mechanism, do a BRIEF gate for an existing OSS library, an already-installed skill, or a capability this application already ships. This is a short, bounded check — a brief gate, not a research assignment. If a fit exists, prefer it and say why; only build custom when the check shows a real gap.`;
+
+/**
  * Structured goal contract shape used by /goal and the judge. Deliberately
  * mirrors the compaction SUMMARY_TEMPLATE sections so a compacted summary can
  * be lifted into a contract without reformatting.

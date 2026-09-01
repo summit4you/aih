@@ -30,6 +30,7 @@ import {
   GOAL_CONTRACT_TEMPLATE,
   TASK_CONTRACT_RULES,
   REPAIR_DOCTRINE,
+  LIVE_VERIFY_DISCIPLINE,
   DECISION_QUESTION_RULE,
   TOOL_OUTPUT_NOTES,
   buildGoalJudgePrompt,
@@ -721,7 +722,7 @@ export function loadSystemPrompt(): string {
   // compaction summary can never bury it (observed: after compaction the
   // English summary pushed the mid-prompt language rule out of reach and the
   // agent reverted to English notes). Nothing else is appended after it.
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${LIVE_VERIFY_DISCIPLINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
   // opencode `rules` parity — AGENTS.md / CLAUDE.md / config `instructions`
   // are merged in as mandatory project rules.
   const rules = renderRules(collectRulesSync());

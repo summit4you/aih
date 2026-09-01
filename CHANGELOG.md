@@ -34,6 +34,14 @@ the versions listed here (`scripts/package` derives the version from
   Hard-fail still blocks: missing key / unknown provider / policy-denied
   providers throw at resolve time. (`cli/src/owner-state.ts`,
   `core/src/seams/llm-openai.ts`)
+- **Live-verify & check-existing-first disciplines (OC#3, OpenClaw "Start"
+  borrow)**: two default working rules injected into the system prompt —
+  ① a user-visible behavior must be exercised through the REAL production
+  path before it is claimed done (skipping requires a concrete infeasibility,
+  never "to save effort"); ② before proposing/building anything custom, do a
+  BRIEF gate for an existing OSS library / installed skill / already-shipped
+  capability (a brief gate, not a research assignment). (`core/src/prompts.ts`
+  `LIVE_VERIFY_DISCIPLINE`, injected in `loadSystemPrompt()`)
 
 ## [0.4.0] - 2026-08-29
 

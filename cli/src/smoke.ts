@@ -4674,6 +4674,7 @@ import {
   FINAL_STATE_GUARD,
   TASK_CONTRACT_RULES,
   REPAIR_DOCTRINE,
+  LIVE_VERIFY_DISCIPLINE,
   DECISION_QUESTION_RULE,
 } from "@aih/core";
 
@@ -4850,6 +4851,24 @@ import {
   assert(sys.includes("Repair doctrine"), "TP#3.16 injection: main system prompt carries REPAIR_DOCTRINE");
   assert(sys.includes("Root-cause repair is the default"), "TP#3.16 injection: doctrine text is the real constant, not a stub");
   console.log("ok: TP#3.16 REPAIR_DOCTRINE present + injected");
+}
+
+{
+  // OC#3 — LIVE_VERIFY_DISCIPLINE (OpenClaw AGENTS.md "Start" borrow):
+  // live-verify-by-default + check-existing-first, present AND injected into
+  // the main system prompt (loadSystemPrompt).
+  assert(typeof LIVE_VERIFY_DISCIPLINE === "string", "OC#3 prompts: LIVE_VERIFY_DISCIPLINE is string");
+  assert(LIVE_VERIFY_DISCIPLINE.length > 200, "OC#3 prompts: LIVE_VERIFY_DISCIPLINE is substantial");
+  assert(/live.?verify/i.test(LIVE_VERIFY_DISCIPLINE), "OC#3 prompts: discipline names live-verify");
+  assert(/real production path|real path/i.test(LIVE_VERIFY_DISCIPLINE), "OC#3 prompts: live-verify requires the REAL production path");
+  assert(/never skip it to save effort|concrete infeasibility/i.test(LIVE_VERIFY_DISCIPLINE), "OC#3 prompts: skipping requires a concrete infeasibility, not saving effort");
+  assert(/check.?existing/i.test(LIVE_VERIFY_DISCIPLINE), "OC#3 prompts: discipline names check-existing-first");
+  assert(/brief gate|brief, bounded check/i.test(LIVE_VERIFY_DISCIPLINE), "OC#3 prompts: existing-check is a brief gate, not a research assignment");
+  const { loadSystemPrompt: lsp3 } = await import("./index.js");
+  const sys3 = lsp3();
+  assert(sys3.includes("Live-verify & check-existing-first"), "OC#3 injection: main system prompt carries LIVE_VERIFY_DISCIPLINE");
+  assert(sys3.includes("Live-verify by default"), "OC#3 injection: discipline text is the real constant, not a stub");
+  console.log("ok: OC#3 LIVE_VERIFY_DISCIPLINE present + injected");
 }
 
 {
