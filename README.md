@@ -1116,6 +1116,8 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 模型元数据快照同步（models.dev） | — | ✅ refresh | — | — | ✅ fail-closed 刷新脚本 + 27 模型快照（P#48） |
 | Session 树 / 分支导航 + 分支蒸馏 | — | ◐→✅ | ✅ Pi | — | ✅ parentId 链 + `/tree` 视图 + `distill-branch` branch_summary（P#37） |
 | Eval 实验框架（cells/预算/subject seam） | — | ◐ | — | ✅ Maka | ✅ runExperiment 有界并发 + 墙钟/成本预算 + CLI/外部命令/HTTP 三 subject（P#46） |
+| 深度代码评审（多维 fanout + verify 回环） | ✅ code-review | ✅ | — | — | ✅ AC#1：4 维并行审查 + finding 去重 + 独立 verify KEEP/DROP + JSONL 审计（`review-pipeline.ts`） |
+| 轻量 LSP 代码图谱（符号/签名/引用） | ✅ 内置 | ✅ | — | — | ✅ AC#2：list_symbols / read_symbol / find_references 三只读工具，按需 tsserver/标准 LSP 池化，零新依赖，优雅降级（`codeintel.ts`） |
 
 **相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
 
@@ -1128,8 +1130,9 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **Apache Maka**（apache/maka，local-first agent workspace）→ 借 **事实层纪律**：append-only 事件即唯一事实源、UI/模型调用只是投影。已落地：compaction coverage digest（✅ MK#42，摘要必须证明覆盖范围，否则 fail-open）、tool/dispatch T1 事实 + RecoveryResolver 四态分类 + park 稳定码（✅ MK#44/45）、工具结果修剪 + archive_read 惰性归档（✅ MK#43）、工作区身份 UUID（✅ MK#47）、models.dev 快照 fail-closed 同步（✅ P#48）、steering/follow-up 双队列（✅ P#35）；明确不借 SQLite/Electron、Phase3/4 文件级 reconcile、provider-native 远程压缩。
 - **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
 - **Intelligent Terminal**（终端 UX 参考）→ 借 **shell 上下文感知**（agent 主动取用 shell 输出/退出码，✅ IT#1：`/shell` + `shell_context` 工具 + `AIH_SHELL_CONTEXT=auto`）+ **确定性 error-detect→一键送 agent**（✅ IT#2：`error-detect.ts` + 状态栏 `⚠ N failed` + `/fix`）+ **`?` 前缀快捷任务 + 上下文注入**（✅ IT#3：`question.ts` + TUI 输入行识别）+ **多 agent 会话管理面板**（✅ IT#4：`sessions.ts` + TUI `/sessions` dashboard/kill/view）+ **run-or-copy 命令批准**（✅ IT#5：`clipboard.ts` + `askRunOrCopy`）。
+- **AtomCode**（atomgit.com/atomgit_atomcode/atomcode，Rust 编码 agent）→ 借 **深度代码评审流水线**（✅ AC#1：4 维并行 fanout + finding 结构化 + 去重 + 独立 verify 回环 + diff 推导 impact plan + JSONL 审计，见 `docs/review-atomcode.md`）+ **轻量 LSP 代码图谱**（✅ AC#2：`list_symbols`/`read_symbol`/`find_references` 按需语言服务池，零依赖 LSP+tsserver 双适配，见 `codeintel.ts`）；余：执行策略位掩码（AC#3，待排期）；明确不借 WebUI/移动端远程访问、匿名遥测、闭源 CodingPlan 签名、Rust 迁移。
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore` + worktree 摘要；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅。
+**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore` + worktree 摘要；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅；⑨ 深度代码评审 fanout+verify（AtomCode）✅ AC#1；⑩ 轻量 LSP 代码图谱（AtomCode）✅ AC#2。
 
 一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
 

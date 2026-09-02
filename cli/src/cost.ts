@@ -115,6 +115,60 @@ function snapshotPrices(): Record<string, ModelPrice> {
   return out;
 }
 
+/**
+ * Context window for a model from the committed models.dev snapshot (P#48).
+ * Keys are provider-scoped ("openai/gpt-4o"); resolution order:
+ *   1. `providerHint` matches the snapshot's provider segment exactly
+ *      (catalog/config provider id ↔ models.dev id, e.g. "opencode-go").
+ *   2. bare-model exact match across providers → the MODE value (tie →
+ *      smaller). Claiming more than the model supports would hard-fail
+ *      requests at the provider, while under-claiming only compacts
+ *      earlier — so disagreement resolves conservatively, not maximally.
+ *   3. substring both ways → longest key wins.
+ * Returns undefined when the snapshot does not know the model — callers
+ * fall back to the default window. (Window fix: the resolver previously
+ * never consulted the snapshot, so models declared only in models.dev
+ * landed on the 128k default.)
+ */
+export function snapshotContextWindow(modelId: string, providerHint?: string): number | undefined {
+  if (!modelId) return undefined;
+  const bare = modelId.split("/").pop() ?? modelId;
+  const entries: Array<{ key: string; provider: string; bareKey: string; window: number }> = [];
+  for (const [k, v] of Object.entries(MODEL_METADATA)) {
+    const w = v.contextWindow;
+    if (typeof w !== "number" || w <= 0) continue;
+    entries.push({ key: k, provider: k.split("/")[0] ?? "", bareKey: k.split("/").pop() ?? k, window: w });
+  }
+  if (providerHint) {
+    const scoped = entries.find((e) => e.provider === providerHint && e.bareKey === bare);
+    if (scoped) return scoped.window;
+  }
+  const exact = entries.filter((e) => e.bareKey === bare);
+  if (exact.length === 1) return exact[0].window;
+  if (exact.length > 1) {
+    const tally = new Map<number, number>();
+    for (const e of exact) tally.set(e.window, (tally.get(e.window) ?? 0) + 1);
+    let best: { window: number; count: number } | undefined;
+    for (const [window, count] of tally) {
+      if (
+        !best ||
+        count > best.count ||
+        (count === best.count && window < best.window)
+      ) {
+        best = { window, count };
+      }
+    }
+    return best?.window;
+  }
+  let match: { key: string; window: number } | undefined;
+  for (const e of entries) {
+    if (bare.includes(e.bareKey) || e.bareKey.includes(bare)) {
+      if (!match || e.key.length > match.key.length) match = e;
+    }
+  }
+  return match?.window;
+}
+
 /** Cost (USD) of a single usage record at a given price. */
 export function costForUsage(usage: TokenUsage, price: ModelPrice): number {
   return (

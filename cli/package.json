@@ -1,6 +1,6 @@
 {
   "name": "@aih/cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "AIH command line: run/chat with any AIH app over MCP, opencode-style",
   "type": "module",
   "license": "MIT",

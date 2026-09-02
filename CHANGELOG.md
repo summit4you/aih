@@ -6,6 +6,48 @@ All notable changes to AIH are documented in this file. The format is based on
 the versions listed here (`scripts/package` derives the version from
 `cli/src/index.ts` → `VERSION`).
 
+## [0.5.1] - 2026-09-02
+
+### Added
+- **Deep code-review pipeline (AC#1, AtomCode borrow)**: the `code-review` skill now
+  supports a deep mode — four parallel read-only review dimensions
+  (correctness / security / performance / tests-contracts) each reviewing the full
+  diff through its own lens → deterministic `mergeFindings` dedup (file + line
+  overlap + title similarity, high-priority wins, cross-dimension credit) → an
+  **independent verify agent per candidate finding** (KEEP/DROP, diff is
+  authoritative) → human-readable report by priority + append-only JSONL audit trail
+  (`.aih/reviews/`). Also derives a deterministic **impact plan** from the diff
+  (changed files + high-risk symbols) to bound reviewer exploration.
+  (`cli/src/review-pipeline.ts`, `.aih/skills/code-review/SKILL.md`)
+- **Lightweight code-intel tools (AC#2, AtomCode borrow)**: three read-only tools —
+  `list_symbols` (per-file outline), `read_symbol` (signature + docs), and
+  `find_references` (workspace-wide, cross-file) — backed by an on-demand language
+  server pool (`cli/src/codeintel.ts`). Zero new dependencies: a minimal JSON-RPC
+  2.0 / stdio LSP client (`Content-Length` framing, bounded parser) plus a
+  `tsserver` native-protocol adapter (1-based coordinate normalization, serialized
+  `open` handshake that waits for project load, identifier-hit positioning via
+  `navtoLocate` — quickinfo/references return nothing at the span start).
+  Servers resolve per workspace (local `node_modules/typescript` first, real PATH
+  `tsserver` second; npm-lifecycle `.bin` shims are excluded as false positives);
+  child processes get the same secret-filtered env as run_cmd and are `unref`ed so
+  a live server never keeps the agent hanging on exit. Missing servers degrade to
+  a clear error; all three tools join the parallel read-only class (F#29).
+  (`cli/src/codeintel.ts`, `cli/src/dev-tools.ts`)
+
+### Fixed
+- **Context window fell back to 131072 for models known only to models.dev
+  (P#48 gap)**: `resolveContextWindow` never consulted the committed snapshot —
+  a model whose window was not declared in `aih.json` (e.g. `glm-5.3-flash`
+  on a catalog-connected provider) landed on the hardcoded 128k default even
+  though models.dev reports 1M. The snapshot is now the last data-driven tier
+  (flag > env > live probe > config > **snapshot** > default), matched on the
+  bare model name with an optional provider-scoped pin; when providers
+  disagree on a window the MODE wins (tie → smaller) — claiming more than the
+  model supports hard-fails requests, under-claiming only compacts earlier.
+  Also refreshed the committed snapshot (27 → 7408 entries, adds
+  glm-5.3*/deepseek-v4* windows and prices). (`cli/src/cost.ts`,
+  `cli/src/index.ts`, `scripts/model-metadata.snapshot.json`)
+
 ## [0.5.0] - 2026-09-02
 
 ### Added

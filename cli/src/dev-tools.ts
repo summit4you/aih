@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { ToolRegistry } from "@aih/core";
 import { lineDiff } from "./diff.js";
 import { publishFile } from "./atomic.js";
 import { buildChildEnv } from "./env-policy.js";
 import { formatAfterWrite } from "./formatter.js";
 import { resolveSandboxBackend } from "./sandbox.js";
+import { CodeIntelPool, flattenDocumentSymbols, navtoLocate, navtreeToSymbols, pathToUri, uriToPath, openDocument } from "./codeintel.js";
 
 const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
@@ -217,4 +218,265 @@ export function registerDevTools(
       };
     },
   });
+
+  // AC#2 — code-intelligence tools (on-demand LSP, degraded-gracefully).
+  registerCodeIntelTools(registry, cwd);
+}
+
+/**
+ * AC#2 — Code-intelligence tools (on-demand LSP, AtomCode borrow).
+ *
+ * Tools are `kind: "read"` / `permission: "allow"` → they join the parallel
+ * read-only tool class (F#29). A missing language server degrades to a
+ * clear error, never a crash. The pool is held for the lifetime of the
+ * registry (one process per project root + server command, reused across
+ * compatible extensions, sticky-failure after a bad startup).
+ */
+export function registerCodeIntelTools(
+  registry: ToolRegistry,
+  cwd = process.cwd(),
+  pool?: CodeIntelPool,
+): void {
+  const intel = pool ?? new CodeIntelPool(cwd);
+  // Keep the pool reachable so tools don't re-create it per call.
+  (registry as unknown as { __aihCodeIntel?: CodeIntelPool }).__aihCodeIntel = intel;
+
+  const fileArg = (desc: string) => ({
+    type: "object",
+    properties: {
+      path: { type: "string", description: desc },
+      symbol: { type: "string", description: "symbol name to look up" },
+    },
+    required: [],
+  });
+
+  // ---- list_symbols: all top-level symbols in a file ---------------------
+  registry.register({
+    name: "list_symbols",
+    description:
+      "List top-level symbols (functions, classes, interfaces, types, consts) declared in a file, with locations. Requires a language server for the file's extension.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: "file path relative to workspace" } },
+      required: ["path"],
+    },
+    execute: async (args) => {
+      const a = args as { path?: unknown };
+      const p = String(a.path ?? "");
+      if (!p) throw new Error("path is required");
+      const abs = intel.resolveInWorkspace(p);
+      if (!existsSync(abs)) throw new Error(`not found: ${abs}`);
+      const unavailable = intel.unavailableFor(abs);
+      if (unavailable) throw new Error(`code intel unavailable: ${unavailable}`);
+      const { spec, lsp, ts } = await intel.clientFor(abs);
+      let symbols: Array<Record<string, unknown>> = [];
+      if (ts) {
+        // navtree = per-file outline. navto with an empty searchValue searches
+        // the WHOLE project (and picks up ambient globals like __dirname), so
+        // it is the wrong primitive for "symbols declared in this file".
+        await ts.ensureOpen(abs);
+        const tree = await ts.command<{ childItems?: unknown[] }>("navtree", { file: abs });
+        symbols = navtreeToSymbols(tree, intel.root, abs) as unknown as Array<Record<string, unknown>>;
+      } else if (lsp) {
+        const text = readFileSync(abs, "utf8");
+        await openDocument(lsp, abs, text);
+        const items = await lsp.request<unknown>("textDocument/documentSymbol", {
+          textDocument: { uri: pathToUri(abs) },
+        });
+        symbols = normalizeSymbols(items);
+      }
+      return { file: relative(intel.root, abs).split("\\").join("/"), count: symbols.length, symbols };
+    },
+  });
+
+  // ---- read_symbol: definition + signature of a symbol --------------------
+  registry.register({
+    name: "read_symbol",
+    description:
+      "Get the definition location and signature of a symbol (function/class/type) in a file. Requires a language server.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "file path relative to workspace" },
+        symbol: { type: "string", description: "symbol name" },
+      },
+      required: ["path", "symbol"],
+    },
+    execute: async (args) => {
+      const a = args as { path?: unknown; symbol?: unknown };
+      const p = String(a.path ?? "");
+      const symbol = String(a.symbol ?? "");
+      if (!p || !symbol) throw new Error("path and symbol are required");
+      const abs = intel.resolveInWorkspace(p);
+      const unavailable = intel.unavailableFor(abs);
+      if (unavailable) throw new Error(`code intel unavailable: ${unavailable}`);
+      const { ts, lsp } = await intel.clientFor(abs);
+      if (ts) {
+        // Locate the identifier first: quickinfo at the declaration span
+        // start (often line start) returns "No content available." — it must
+        // hit INSIDE the identifier. navtoLocate resolves the real position.
+        const at = await navtoLocate(ts, abs, symbol);
+        if (!at) {
+          return { symbol, signature: "", doc: `symbol not found in ${p} (navto)` };
+        }
+        const q = await ts.command<{ displayString?: string; documentation?: string }>("quickinfo", {
+          file: abs,
+          line: at.line,
+          offset: at.offset,
+        });
+        return {
+          symbol,
+          line: at.line - 1,
+          character: at.offset - 1,
+          signature: q?.displayString ?? "",
+          doc: q?.documentation ?? "",
+        };
+      }
+      if (lsp) {
+        // Standard LSP: document symbols to locate, then hover at its selection.
+        const text = readFileSync(abs, "utf8");
+        await openDocument(lsp, abs, text);
+        const items = await lsp.request<unknown>("textDocument/documentSymbol", {
+          textDocument: { uri: pathToUri(abs) },
+        });
+        const flat = flattenDocumentSymbols(items);
+        const hit = flat.find((s) => s.name === symbol) ?? flat.find((s) => s.name.includes(symbol));
+        if (!hit) return { symbol, signature: "", doc: `symbol not found in ${p}` };
+        const hover = await lsp.request<unknown>("textDocument/hover", {
+          textDocument: { uri: pathToUri(abs) },
+          position: { line: hit.line, character: hit.character },
+        });
+        const h = hover as { contents?: unknown } | null;
+        const content =
+          typeof h?.contents === "string"
+            ? h.contents
+            : Array.isArray(h?.contents)
+              ? (h.contents as Array<{ value?: string } | string>).map((c) => (typeof c === "string" ? c : c.value ?? "")).join("\n")
+              : (h?.contents as { value?: string } | undefined)?.value ?? "";
+        return { symbol, line: hit.line, character: hit.character, signature: content, doc: "" };
+      }
+      return { symbol, signature: "", doc: "no language server available for this file type" };
+    },
+  });
+
+  // ---- find_references: where a symbol is referenced -----------------------
+  registry.register({
+    name: "find_references",
+    description:
+      "Find all references to a symbol across the workspace. Requires a language server; returns up to 100 hits.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "file containing the symbol" },
+        symbol: { type: "string", description: "symbol name" },
+        line: { type: "number", description: "0-based line of the symbol (optional)" },
+      },
+      required: ["path", "symbol"],
+    },
+    execute: async (args) => {
+      const a = args as { path?: unknown; symbol?: unknown; line?: unknown; character?: unknown };
+      const p = String(a.path ?? "");
+      const symbol = String(a.symbol ?? "");
+      if (!p || !symbol) throw new Error("path and symbol are required");
+      const abs = intel.resolveInWorkspace(p);
+      const unavailable = intel.unavailableFor(abs);
+      if (unavailable) throw new Error(`code intel unavailable: ${unavailable}`);
+      const { ts, lsp } = await intel.clientFor(abs);
+      if (ts) {
+        // Locate the declaration first (navto), then ask for references at
+        // that position. tsserver's `references` returns { refs: [...] } with
+        // 1-based line/offset; normalize to 0-based for the model.
+        let line: number;
+        let offset: number;
+        if (a.line !== undefined && a.line !== null && Number(a.line) > 0) {
+          // explicit 0-based position from the caller → 1-based tsserver
+          line = Number(a.line) + 1;
+          offset = Number(a.character ?? 0) + 1;
+        } else {
+          const at = await navtoLocate(ts, abs, symbol);
+          if (!at) return { symbol, count: 0, references: [], note: `symbol not found in ${p} (navto)` };
+          line = at.line;
+          offset = at.offset;
+        }
+        const res = await ts.command<{ refs?: Array<{ file?: string; start?: { line?: number; offset?: number }; isDefinition?: boolean }> }>("references", {
+          file: abs,
+          line,
+          offset,
+        });
+        const refs = res?.refs ?? [];
+        return {
+          symbol,
+          count: refs.length,
+          references: refs.slice(0, 100).map((r) => ({
+            file: r.file ? relative(intel.root, r.file).split("\\").join("/") : "",
+            line: (r.start?.line ?? 1) - 1,
+            isDefinition: !!r.isDefinition,
+          })),
+        };
+      }
+      if (lsp) {
+        const text = readFileSync(abs, "utf8");
+        await openDocument(lsp, abs, text);
+        let line = Number(a.line ?? 0);
+        let character = 0;
+        if (!a.line) {
+          const items = await lsp.request<unknown>("textDocument/documentSymbol", {
+            textDocument: { uri: pathToUri(abs) },
+          });
+          const flat = flattenDocumentSymbols(items);
+          const hit = flat.find((s) => s.name === symbol) ?? flat.find((s) => s.name.includes(symbol));
+          if (!hit) return { symbol, count: 0, references: [], note: `symbol not found in ${p}` };
+          line = hit.line;
+          character = hit.character;
+        } else {
+          character = Number(a.character ?? 0);
+        }
+        const res = await lsp.request<unknown>("textDocument/references", {
+          textDocument: { uri: pathToUri(abs) },
+          position: { line, character },
+          context: { includeDeclaration: true },
+        });
+        const locs = Array.isArray(res) ? res : [];
+        const refs = locs.map((l) => {
+          const o = l as { uri?: string; range?: { start?: { line?: number; character?: number } } };
+          return {
+            file: o.uri ? relative(intel.root, uriToPath(o.uri)) : "",
+            line: o.range?.start?.line ?? 0,
+          };
+        });
+        return { symbol, count: refs.length, references: refs.slice(0, 100) };
+      }
+      return { symbol, count: 0, references: [] };
+    },
+  });
+}
+
+// ---- internal helpers exported for tests ---------------------------------
+export function normalizeSymbols(items: unknown): Array<Record<string, unknown>> {
+  // LSP DocumentSymbol[] (hierarchical) or SymbolInformation[].
+  const out: Array<Record<string, unknown>> = [];
+  const push = (s: Record<string, unknown>, depth: number): void => {
+    out.push({
+      name: s.name,
+      kind: s.kind,
+      detail: s.detail ?? "",
+      line: (s.range as { start?: { line?: number } } | undefined)?.start?.line ?? 0,
+      children: (s.children as Record<string, unknown>[] | undefined)?.length ?? 0,
+    });
+    if (depth < 4 && Array.isArray(s.children)) {
+      for (const c of s.children as Record<string, unknown>[]) push(c, depth + 1);
+    }
+  };
+  if (Array.isArray(items)) {
+    for (const it of items) {
+      if (it && typeof it === "object") push(it as Record<string, unknown>, 0);
+    }
+  }
+  return out;
 }

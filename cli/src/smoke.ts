@@ -1,8 +1,22 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, appendFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
+import {
+  REVIEW_DIMENSIONS,
+  extractImpactTargets,
+  mergeFindings,
+  parseReviewerOutput,
+  renderImpactPlan,
+  renderVerifyTask,
+  renderFindingsReport,
+  verifyReconfirms,
+  writeReviewReport,
+  annotateDiffLineNumbers,
+  parseDiff,
+} from "./review-pipeline.js";
+import type { Finding, DimensionReview } from "./review-pipeline.js";
 import {
   resolvePrice,
   totalCost,
@@ -1156,6 +1170,51 @@ assert(
 
   rmSync(catDir, { recursive: true, force: true });
   delete process.env.AIH_TRUST_ALL_PROJECTS;
+}
+
+{
+  // Window-fix regression — the resolver previously never consulted the
+  // committed models.dev snapshot, so a model whose window is declared only
+  // there (catalog-connected providers like glm-5.3-flash) fell through to
+  // the hardcoded 128k default.
+  const { snapshotContextWindow } = await import("./cost.js");
+  const { resolveContextWindow } = await import("./index.js");
+  // bare-name match resolves to the MODE of provider-reported windows
+  // (tie → smaller): claiming more than the model supports would hard-fail
+  // at the provider, under-claiming only compacts earlier.
+  const w = snapshotContextWindow("glm-5.3-flash");
+  assert(
+    w !== undefined && w >= 1_000_000,
+    `window-fix: snapshot knows glm-5.3-flash >=1M (got ${w})`,
+  );
+  assert(snapshotContextWindow("totally-unknown-model-xyz") === undefined, "window-fix: unknown model → undefined (default stays)");
+  // provider hint pins the provider-scoped entry
+  const hint = snapshotContextWindow("glm-5.3-flash", "opencode-go");
+  assert(hint === 1_000_000, `window-fix: provider hint resolves scoped entry (got ${hint})`);
+  // full resolver path: catalog-style config (no window declared anywhere)
+  // no longer lands on the 131072 default when the snapshot knows the model
+  const mkd = (await import("node:fs")).mkdtempSync;
+  const jn = (await import("node:path")).join;
+  const dir = mkd(jn(tmpdir(), "aih-win-"));
+  process.env.AIH_TRUST_ALL_PROJECTS = "1";
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  writeFileSync(
+    `${dir}/aih.json`,
+    JSON.stringify({
+      defaultProvider: "cat",
+      providers: { cat: { baseUrl: "http://c.example/v1", model: "glm-5.3-flash", keyless: true } },
+    }),
+  );
+  const resolvedWin = resolveContextWindow({ model: "glm-5.3-flash", provider: "" });
+  assert(
+    resolvedWin >= 1_000_000,
+    `window-fix: catalog-style config gets the real window, not 131072 (got ${resolvedWin})`,
+  );
+  process.chdir(prevCwd);
+  rmSync(dir, { recursive: true, force: true });
+  delete process.env.AIH_TRUST_ALL_PROJECTS;
+  console.log("ok: window-fix — models.dev snapshot tier in resolveContextWindow");
 }
 
 // `/connect` — interactive provider connect (opencode parity, OpenAI-compatible):
@@ -6245,4 +6304,290 @@ console.log("══════════════════════�
   assert(loadQualitySuite(join(dir, "bad.json")) === undefined, "FB#4 suite: unparseable → undefined");
 
   console.log("ok: FB#4 BuffBench-style quality eval — baseline regression gate");
+}
+
+{
+  // AC#1 — Deep code-review pipeline (atomcode-review fanout borrow).
+  // Pure-function primitives: impact plan, diff parse, finding merge,
+  // verify re-confirm, report render + JSONL audit trail.
+
+  // ---- impact plan: changed files + symbols from added lines --------------
+  const diff1 = [
+    "diff --git a/src/util.ts b/src/util.ts",
+    "index abc..def 100644",
+    "--- a/src/util.ts",
+    "+++ b/src/util.ts",
+    "@@ -10,3 +10,4 @@ export function helper() {",
+    " export function helper() {",
+    "   // unchanged",
+    "+  const x = 1;",
+    " }",
+    "diff --git a/src/api.ts b/src/api.ts",
+    "index 123..456 100644",
+    "--- a/src/api.ts",
+    "+++ b/src/api.ts",
+    "@@ -1,2 +1,3 @@",
+    "+export async function newEndpoint() {",
+    "+  return { ok: true };",
+    "+}",
+  ].join("\n");
+
+  const impact = extractImpactTargets(diff1);
+  assert(
+    impact.changedFiles.includes("src/util.ts") && impact.changedFiles.includes("src/api.ts"),
+    "AC#1 impact plan: changed files parsed from diff --git lines",
+  );
+  assert(
+    impact.symbols.includes("newEndpoint") && !impact.symbols.includes("helper"),
+    `AC#1 impact plan: only added-line symbols extracted (got ${impact.symbols.join(",")})`,
+  );
+  const plan = renderImpactPlan(diff1);
+  assert(
+    plan.includes("src/api.ts") && plan.includes("newEndpoint"),
+    "AC#1 impact plan: rendered plan lists files + high-risk symbols",
+  );
+
+  // ---- parseDiff: new-side line numbers -----------------------------------
+  const parsed = parseDiff(diff1);
+  const util = parsed.find((f) => f.path === "src/util.ts");
+  assert(util !== undefined, "AC#1 parseDiff: src/util.ts found");
+  // The added `const x = 1;` lands on new-side line 12 (hunk +10,3 +10,4):
+  assert(util!.newLines.includes(12), `AC#1 parseDiff: added line maps to new-side 12 (got ${util!.newLines.join(",")})`);
+  const api = parsed.find((f) => f.path === "src/api.ts");
+  assert(api!.newLines.includes(3), `AC#1 parseDiff: new file lines 1-3 (got ${api!.newLines.join(",")})`);
+
+  // ---- merge: same-location + similar-title findings dedupe ----------------
+  const dims: DimensionReview[] = [
+    {
+      dimension: "correctness",
+      notes: "",
+      findings: [
+        {
+          dimension: "correctness",
+          priority: "high",
+          confidence: 0.9,
+          file_path: "src/api.ts",
+          line_start: 2,
+          line_end: 3,
+          title: "Missing null check on response",
+          body: "response may be undefined",
+        },
+      ],
+    },
+    {
+      dimension: "security",
+      notes: "",
+      findings: [
+        {
+          dimension: "security",
+          priority: "high",
+          confidence: 0.8,
+          file_path: "src/api.ts",
+          line_start: 2,
+          line_end: 4,
+          title: "Null response not validated",
+          body: "same issue, security angle",
+        },
+        {
+          dimension: "security",
+          priority: "low",
+          confidence: 0.4,
+          file_path: "src/util.ts",
+          line_start: 12,
+          line_end: 12,
+          title: "Unused local variable",
+          body: "minor",
+        },
+      ],
+    },
+  ];
+  const merged = mergeFindings(dims);
+  assert(merged.length === 2, `AC#1 merge: 2 distinct findings survive (got ${merged.length})`);
+  const apiMerged = merged.find((m) => m.finding.file_path === "src/api.ts");
+  assert(
+    apiMerged !== undefined && apiMerged.dimensions.includes("correctness") && apiMerged.dimensions.includes("security"),
+    `AC#1 merge: cross-dimension credit accumulates (got ${apiMerged?.dimensions.join("+")})`,
+  );
+  assert(
+    merged.every((m) => m.finding.priority === "high" || m.finding.priority === "low"),
+    "AC#1 merge: high-priority winner preserved in merged finding",
+  );
+
+  // ---- merge: distinct locations never dedupe ------------------------------
+  const dims2: DimensionReview[] = [
+    { dimension: "correctness", notes: "", findings: [mkFinding("a.ts", 1, 1, "Bug A")] },
+    { dimension: "security", notes: "", findings: [mkFinding("b.ts", 5, 5, "Bug B")] },
+  ];
+  assert(mergeFindings(dims2).length === 2, "AC#1 merge: different files stay separate");
+
+  // ---- verify re-confirm: overlapping + shared token → keep ----------------
+  const candidate = mkFinding("src/api.ts", 2, 3, "Missing null check on response");
+  const confirming = mkFinding("src/api.ts", 2, 4, "Response null check missing");
+  assert(verifyReconfirms(candidate, [confirming]) === true, "AC#1 verify: overlapping + shared tokens re-confirm");
+  const nonConfirming = mkFinding("src/api.ts", 20, 21, "Unrelated UI issue");
+  assert(verifyReconfirms(candidate, [nonConfirming]) === false, "AC#1 verify: unrelated finding does not re-confirm");
+  assert(verifyReconfirms(candidate, []) === false, "AC#1 verify: no reported findings → not confirmed");
+
+  // ---- verify task render includes the annotated diff ----------------------
+  const annotated = annotateDiffLineNumbers(diff1);
+  assert(annotated.includes("12 | +  const x = 1;"), `AC#1 annotate: new-side line numbers prefixed (got: ${annotated.split("\n").find((l) => l.includes("const x = 1"))})`);
+  const vtask = renderVerifyTask({ finding: candidate, dimensions: ["correctness"] }, annotated);
+  assert(vtask.includes("VERIFY ONE CANDIDATE FINDING") && vtask.includes("src/api.ts:2-3"), "AC#1 verify task: candidate + lens included");
+
+  // ---- report render + JSONL audit trail ----------------------------------
+  const report = {
+    diffCommand: "git diff a...HEAD",
+    createdAt: new Date().toISOString(),
+    dimensions: dims,
+    findings: merged,
+    dropped: [
+      {
+        finding: { finding: mkFinding("src/util.ts", 12, 12, "Unused local variable"), dimensions: ["security"] },
+        keep: false,
+        reason: "false positive — variable used later",
+      },
+    ],
+  };
+  const rendered = renderFindingsReport(report);
+  assert(rendered.includes("HIGH") && rendered.includes("Missing null check"), "AC#1 report: renders priority groups + findings");
+  assert(rendered.includes("Dropped (1") && rendered.includes("false positive"), "AC#1 report: dropped candidates audited");
+
+  const jdir = mkdtempSync(join(tmpdir(), "aih-ac1-"));
+  const jfile = writeReviewReport(report, jdir);
+  const jl = readFileSync(jfile, "utf8").trim().split("\n");
+  assert(
+    jl.some((l) => l.includes('"kind":"review"')) &&
+      jl.some((l) => l.includes('"kind":"finding"')) &&
+      jl.some((l) => l.includes('"kind":"dropped"')),
+    "AC#1 JSONL audit: review/finding/dropped records persisted",
+  );
+
+  // ---- parseReviewerOutput: structured JSON blocks extraction --------------
+  const parsedOut = parseReviewerOutput(
+    'Some notes.\n```json\n[{"file_path":"x.ts","line_start":1,"line_end":2,"title":"T","priority":"high","confidence":0.9,"body":"b"}]\n```',
+    "correctness",
+  );
+  assert(
+    parsedOut.findings.length === 1 && parsedOut.findings[0].file_path === "x.ts" && parsedOut.findings[0].priority === "high",
+    "AC#1 parse: reviewer JSON block extracted into finding",
+  );
+
+  assert(REVIEW_DIMENSIONS.length === 4, "AC#1: four review dimensions defined");
+
+  console.log("ok: AC#1 deep code-review pipeline (impact/merge/verify/report) passed");
+}
+
+function mkFinding(file: string, start: number, end: number, title: string): Finding {
+  return {
+    dimension: "correctness",
+    priority: "high",
+    confidence: 0.8,
+    file_path: file,
+    line_start: start,
+    line_end: end,
+    title,
+    body: "",
+  };
+}
+
+{
+  // AC#2 — Lightweight code intel (on-demand tsserver, AtomCode borrow).
+  // Pure-function primitives first (no server needed), then a live tsserver
+  // round-trip when a TypeScript install is present.
+
+  // ---- navtreeToSymbols: tsserver 1-based → 0-based normalization ----------
+  const { navtreeToSymbols, flattenDocumentSymbols, resolveTsServerCommand, navtoLocate } = await import("./codeintel.js");
+  const tree = {
+    childItems: [
+      {
+        text: "Outer",
+        kind: "class",
+        nameSpan: { start: { line: 3, offset: 7 } },
+        childItems: [
+          { text: "method", kind: "method", nameSpan: { start: { line: 4, offset: 3 } } },
+        ],
+      },
+      { text: "topFn", kind: "function", nameSpan: { start: { line: 7, offset: 16 } } },
+    ],
+  };
+  const syms = navtreeToSymbols(tree as never, "/repo", "/repo/src/a.ts");
+  assert(syms.length === 3, `AC#2 navtreeToSymbols: flattens nested items (got ${syms.length})`);
+  assert(syms[0].line === 2 && syms[0].character === 6, `AC#2 navtreeToSymbols: 1-based → 0-based (got ${syms[0].line},${syms[0].character})`);
+  assert(syms[1].containerName === "Outer", "AC#2 navtreeToSymbols: nested container tracked");
+  assert(syms[0].path === "src/a.ts", "AC#2 navtreeToSymbols: path relative to root");
+
+  // ---- flattenDocumentSymbols: hierarchical LSP response → flat rows -------
+  const flat = flattenDocumentSymbols([
+    {
+      name: "Class",
+      kind: 5,
+      selectionRange: { start: { line: 1, character: 6 } },
+      children: [{ name: "m", kind: 6, selectionRange: { start: { line: 2, character: 2 } } }],
+    },
+    { name: "Loose", kind: 12, location: { range: { start: { line: 9, character: 0 } } } },
+  ]);
+  assert(flat.length === 3, `AC#2 flattenDocumentSymbols: 3 rows (got ${flat.length})`);
+  assert(flat[1].line === 2 && flat[1].container === "Class", "AC#2 flattenDocumentSymbols: child row with container");
+  assert(flat[2].line === 9 && flat[2].container === undefined, "AC#2 flattenDocumentSymbols: SymbolInformation location fallback");
+
+  // ---- resolveTsServerCommand: PATH miss falls back to local install -------
+  const { mkdtempSync, writeFileSync: wfs, rmSync: rmS } = await import("node:fs");
+  const { join: jn } = await import("node:path");
+  const tmpRoot = mkdtempSync(jn(tmpdir(), "aih-intel-"));
+  const resolved = resolveTsServerCommand(tmpRoot);
+  assert(resolved === null, "AC#2 resolveTsServerCommand: null when nothing resolvable");
+  mkdirSync(jn(tmpRoot, "node_modules/typescript/lib"), { recursive: true });
+  wfs(jn(tmpRoot, "node_modules/typescript/lib/tsserver.js"), "// stub");
+  const resolved2 = resolveTsServerCommand(tmpRoot);
+  assert(
+    resolved2 !== null && resolved2.command === process.execPath && String(resolved2.args[0]).endsWith("tsserver.js"),
+    "AC#2 resolveTsServerCommand: falls back to node + local tsserver.js",
+  );
+  rmS(tmpRoot, { recursive: true, force: true });
+
+  // ---- live tsserver round-trip (skipped when no TS install) ---------------
+  const live = resolveTsServerCommand(process.cwd());
+  if (live) {
+    const { ToolRegistry: TR } = await import("@aih/core");
+    const { registerDevTools: rdt } = await import("./dev-tools.js");
+    const workdir = mkdtempSync(jn(tmpdir(), "aih-intel-live-"));
+    mkdirSync(jn(workdir, "src"), { recursive: true });
+    wfs(
+      jn(workdir, "src/lib.ts"),
+      'export interface User { id: number; name: string }\nexport function greet(u: User): string { return "hi " + u.name; }\n',
+    );
+    wfs(
+      jn(workdir, "src/main.ts"),
+      'import { greet, User } from "./lib.js";\nconst u: User = { id: 1, name: "x" };\nconsole.log(greet(u));\n',
+    );
+    wfs(
+      jn(workdir, "tsconfig.json"),
+      JSON.stringify({ compilerOptions: { target: "es2022", module: "esnext", moduleResolution: "bundler", strict: true, noEmit: true }, include: ["src"] }),
+    );
+    mkdirSync(jn(workdir, "node_modules"), { recursive: true });
+    try {
+      symlinkSync(process.cwd() + "/node_modules/typescript", jn(workdir, "node_modules/typescript"));
+    } catch { /* exists */ }
+    const gate2 = { async decide() { return "allow" as const; }, async ask() { throw new Error("no ask"); } };
+    const registry2 = new TR(gate2 as never);
+    rdt(registry2 as never, workdir);
+    const call2 = async (name: string, args: unknown): Promise<Record<string, unknown>> => {
+      const r = await registry2.invoke(name, args, { turnId: "smoke", inject: () => {} } as never);
+      if (!r.ok) throw new Error(`${name}: ${r.error}`);
+      return r.result as Record<string, unknown>;
+    };
+    const ls = await call2("list_symbols", { path: "src/lib.ts" });
+    assert(Number(ls.count) >= 2, `AC#2 live list_symbols: >=2 symbols (got ${ls.count})`);
+    const rs = await call2("read_symbol", { path: "src/lib.ts", symbol: "greet" });
+    assert(String(rs.signature).includes("greet"), `AC#2 live read_symbol: signature (got ${rs.signature})`);
+    const fr = await call2("find_references", { path: "src/lib.ts", symbol: "greet" });
+    const refs = fr.references as Array<{ file: string }>;
+    assert(Number(fr.count) >= 2, `AC#2 live find_references: >=2 refs (got ${fr.count})`);
+    assert(refs.some((x) => String(x.file).includes("main.ts")), "AC#2 live find_references: cross-file hit");
+    rmS(workdir, { recursive: true, force: true });
+    console.log("ok: AC#2 live tsserver round-trip (list_symbols / read_symbol / find_references)");
+  } else {
+    console.log("ok: AC#2 live tsserver round-trip SKIPPED (no typescript install)");
+  }
+  console.log("ok: AC#2 code-intel primitives passed");
 }

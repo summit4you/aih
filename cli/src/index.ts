@@ -106,6 +106,7 @@ import {
   lastContextTokens,
   resolvePrice,
   sanePromptTokens,
+  snapshotContextWindow,
   streamingTps,
   tokensPerSecond,
   totalCost,
@@ -214,7 +215,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -486,6 +487,12 @@ export function resolveContextWindow(flags: Record<string, string | boolean>): n
   if (live) return live;
   const fromConfig = num(resolved.contextWindow.value);
   if (fromConfig) return fromConfig;
+  // P#48 — committed models.dev snapshot as the last data-driven tier: a
+  // model whose window is not declared in aih.json (e.g. a catalog-connected
+  // provider) still gets its real window when models.dev knows it. Only the
+  // hardcoded default remains below this line.
+  const fromSnapshot = snapshotContextWindow(resolved.model.value ?? "", resolved.provider);
+  if (fromSnapshot) return fromSnapshot;
   return DEFAULT_CONTEXT_WINDOW;
 }
 
