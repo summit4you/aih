@@ -1531,6 +1531,36 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     (patchRes.applied as string[]).length === 2 && readFileSync(`${workdir}/src/app.ts`, "utf8").includes("const b = 3;"),
     "apply_patch adds and updates files",
   );
+  // apply_patch robustness (opencode Patch engine parity) — the old parser
+  // dropped space-prefixed context lines and threw "empty hunk" on legitimate
+  // pure-insertion hunks, forcing the model onto run_cmd heredoc detours.
+  {
+    // 1) pure insertion with NO scope hint → appended at EOF (was: "empty hunk")
+    await call("apply_patch", {
+      patch: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n+// appended tail\n*** End Patch",
+    });
+    assert(
+      readFileSync(`${workdir}/src/app.ts`, "utf8").trimEnd().endsWith("// appended tail"),
+      "apply_patch pure-insertion hunk appends at EOF (no more 'empty hunk')",
+    );
+    // 2) space-prefixed context line participates in matching AND survives
+    await call("apply_patch", {
+      patch: "*** Begin Patch\n*** Update File: src/app.ts\n@@ const a = 9;\n-const a = 9;\n+const a = 9; // kept\n*** End Patch",
+    });
+    const afterCtx = readFileSync(`${workdir}/src/app.ts`, "utf8");
+    assert(
+      afterCtx.includes("const a = 9; // kept"),
+      "apply_patch space-prefixed context lines match and survive",
+    );
+    // 3) *** End of File anchors the match at the tail
+    await call("apply_patch", {
+      patch: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n // appended tail\n+// eof anchored\n*** End of File\n*** End Patch",
+    });
+    assert(
+      readFileSync(`${workdir}/src/app.ts`, "utf8").trimEnd().endsWith("// eof anchored"),
+      "apply_patch *** End of File anchors the hunk at the file tail",
+    );
+  }
   await call("remember", { action: "append", text: "smoke memory entry" });
   assert(
     readFileSync(`${workdir}/.aih/memory.md`, "utf8").includes("smoke memory entry"),

@@ -255,6 +255,37 @@ export async function fetchWithRetry(url: string, opts: FetchWithRetryOptions): 
   return res;
 }
 
+/**
+ * Line-array pattern seek for apply_patch hunks (opencode `seek()` parity):
+ * try exact match first, then fall back through trimEnd and full-trim
+ * comparisons so trailing whitespace and indent drift still match. Returns
+ * the line index of the first match at/after `start` (or the last
+ * `pattern.length` window when `eof` pins the match to the file tail), else -1.
+ */
+function seekLines(
+  lines: readonly string[],
+  pattern: readonly string[],
+  start: number,
+  eof = false,
+): number {
+  if (pattern.length === 0) return -1;
+  const compares: Array<(l: string, r: string) => boolean> = [
+    (l, r) => l === r,
+    (l, r) => l.trimEnd() === r.trimEnd(),
+    (l, r) => l.trim() === r.trim(),
+  ];
+  for (const cmp of compares) {
+    if (eof) {
+      const offset = lines.length - pattern.length;
+      if (offset >= start && pattern.every((p, k) => cmp(lines[offset + k] ?? "", p))) return offset;
+    }
+    for (let at = start; at <= lines.length - pattern.length; at += 1) {
+      if (pattern.every((p, k) => cmp(lines[at + k] ?? "", p))) return at;
+    }
+  }
+  return -1;
+}
+
 function readToolFile(cwd: string, p: unknown): { file: string; text: string } {
   const file = resolve(cwd, String(p ?? ""));
   if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`not found: ${file}`);
@@ -731,36 +762,86 @@ export function registerGeneralTools(
             moveTo = resolve(cwd, move[1].trim());
             i += 1;
           }
-          const ops: Array<{ anchor?: string; remove: string[]; add: string[] }> = [];
-          let op: { anchor?: string; remove: string[]; add: string[] } | undefined;
+          // Hunk shape (codex/opencode apply_patch format):
+          //   @@ [scope hint]      ← optional inline anchor ("change context")
+          //    context line        ← leading SPACE: matches as-is, kept in output
+          //   -removed line
+          //   +added line
+          //   *** End of File      ← optional: anchor this hunk at EOF
+          // The scope hint, context lines, and removed lines together form the
+          // search pattern; replacement = context + added lines.
+          type Hunk = { context?: string; oldLines: string[]; newLines: string[]; endOfFile?: boolean };
+          const ops: Hunk[] = [];
+          let op: Hunk | undefined;
           while (i < lines.length && !lineIsHeader(lines[i])) {
             const l = lines[i];
             if (l.startsWith("@@")) {
-              op = { anchor: l.slice(2).trim(), remove: [], add: [] };
+              op = { context: l.slice(2).trim() || undefined, oldLines: [], newLines: [] };
               ops.push(op);
+            } else if (l === "*** End of File") {
+              if (op) op.endOfFile = true;
             } else if (l.startsWith("-")) {
               if (!op) throw new Error(`'-' line outside a hunk at line ${i + 1}`);
-              op.remove.push(l.slice(1));
+              op.oldLines.push(l.slice(1));
             } else if (l.startsWith("+")) {
               if (!op) throw new Error(`'+' line outside a hunk at line ${i + 1}`);
-              op.add.push(l.slice(1));
+              op.newLines.push(l.slice(1));
+            } else if (l.startsWith(" ")) {
+              // Context line: participates in the search pattern AND survives
+              // into the replacement (codex/opencode parity). Previously these
+              // lines were silently dropped, which broke standard-format patches
+              // and made pure-insertion hunks impossible.
+              if (!op) throw new Error(`context line outside a hunk at line ${i + 1}`);
+              op.oldLines.push(l.slice(1));
+              op.newLines.push(l.slice(1));
             }
             i += 1;
           }
           if (!ops.length) throw new Error("Update File section has no hunks");
           const { file, text } = readToolFile(cwd, path);
-          let updated = text;
+          // Apply hunks in order over a line array; each hunk searches FROM the
+          // previous hunk's match (forward-only, so repeated blocks match in
+          // document order), with a 3-tier match fallback (exact → trimEnd →
+          // trim) mirroring opencode's seek() tolerance for trailing-space and
+          // indent drift. A hunk with no old lines is a PURE INSERTION: after
+          // its scope context when one is given, else appended at EOF
+          // (opencode computeReplacements parity). This fixes the observed
+          // "empty hunk" failure on a legitimate pure-append patch.
+          let fileLines = text.split("\n");
+          let searchFrom = 0;
           for (const o of ops) {
-            const searchParts = [o.anchor, ...o.remove].filter((p) => p !== undefined && p !== "");
-            if (!searchParts.length) throw new Error("empty hunk");
-            const search = searchParts.join("\n");
-            const idx = updated.indexOf(search);
-            if (idx < 0) {
-              throw new Error(`hunk not found in ${file}:\n${search.slice(0, 240)}`);
+            // Scope hint: locate it first, matching starts after it.
+            if (o.context) {
+              const ctxIdx = seekLines(fileLines, [o.context], searchFrom);
+              if (ctxIdx < 0) {
+                throw new Error(`hunk context not found in ${file}: ${o.context.slice(0, 160)}`);
+              }
+              searchFrom = ctxIdx + 1;
             }
-            const replace = [o.anchor ?? "", ...o.add].filter((p) => p !== undefined).join("\n");
-            updated = updated.slice(0, idx) + replace + updated.slice(idx + search.length);
+            if (o.oldLines.length === 0) {
+              // Pure insertion: context hint position, else EOF (opencode parity).
+              const at = o.endOfFile || !o.context ? fileLines.length : searchFrom;
+              fileLines.splice(at, 0, ...o.newLines);
+              searchFrom = at + o.newLines.length;
+              continue;
+            }
+            const found = seekLines(fileLines, o.oldLines, searchFrom, o.endOfFile);
+            let resolved = found;
+            if (resolved < 0 && o.context) {
+              // Tolerate the model repeating the scope hint as the first old
+              // line (context "const a = 9;" + old "const a = 9;"): retry the
+              // search from the context line itself.
+              resolved = seekLines(fileLines, o.oldLines, searchFrom > 0 ? searchFrom - 1 : 0, o.endOfFile);
+            }
+            if (resolved < 0) {
+              throw new Error(
+                `hunk not found in ${file}:\n${o.oldLines.join("\n").slice(0, 240)}`,
+              );
+            }
+            fileLines.splice(resolved, o.oldLines.length, ...o.newLines);
+            searchFrom = resolved + o.newLines.length;
           }
+          const updated = fileLines.join("\n");
           if (moveTo) {
             mkdirSync(dirname(moveTo), { recursive: true });
             writeFileSync(moveTo, updated);
