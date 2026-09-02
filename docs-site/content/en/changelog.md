@@ -1,11 +1,23 @@
 ---
 title: Changelog
-description: AIH release notes — key changes in 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0.
+description: AIH release notes — key changes in 0.5.0 / 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0.
 ---
 
 # Changelog
 
 The full itemized record lives in the repo [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md) (Keep a Changelog format, SemVer). This page is a per-version summary.
+
+## 0.5.0 (2026-09-02)
+
+**Added**
+
+- **Provider catalog + `/connect` interactive login (opencode `/connect` parity, OpenAI-compatible scope)** — `connectCatalog()` returns a curated catalog of OpenAI-compatible providers (popular first; native-SDK Anthropic/Google excluded). TUI `/connect` and `aih connect [<id>]` walk provider selection → API key entry (persisted to the env file chmod 600, NEVER into aih.json) → `saveProvider()` writes config (`apiKeyEnv` names the env var, the key itself never stored) → model applied immediately. Unconfigured providers appear as "+ connect" entries at the bottom of the `/model` picker.
+- **Docs-site tutorial extension (batch 3 + Ch.19 HemaGuide case)**, **rules loading (opencode `rules` parity)**, **provider policies**, **configurable keybinds**, **credential owner isolation (OC#7)**, **live-verify / check-existing-first disciplines (OC#3)**, **core per-call tax governance (OC#2)**, **trust model statement (OC#4)**, **`aih doctor --fix` config self-healing (OC#5)**, **maturity scorecard (OC#6)**, **BuffBench-style quality eval + baseline regression gate (FB#4)**.
+
+**Fixed**
+
+- **Overlay picker scroll highlight drift ("chose one, got another")**: the `/model` / ctrl-p palette compared a window-relative loop index against the global `sel`, so scrolling long lists highlighted a different row than the one actually selected; `paletteWindow()` now returns the window-relative highlight.
+- **Phantom near-full context / false compaction on model switch**: free-tier gateways (opencode zen go) report CUMULATIVE `prompt_tokens` (949K / 3.2M observed on a ~78K-token conversation); the old `prompt_tokens ≤ 2×window` gate admitted those once the window grew to 1M (deepseek-v4-flash), flashing "949K ≥ 800K compact needed" when switching big-pickle (200k) → deepseek-v4-flash (1M). Plausibility now cross-checks the local chars÷4 estimate both directions — report ≫ estimate = cumulative garbage (estimate wins), estimate ≫ report = stale sample (estimate wins). Fixed in `agent-loop.ts` and `cost.ts`.
 
 ## 0.4.0 (2026-08-29)
 

@@ -1,11 +1,23 @@
 ---
 title: 更新日志
-description: AIH 版本更新日志 —— 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0 的主要变更。
+description: AIH 版本更新日志 —— 0.5.0 / 0.4.0 / 0.3.0 / 0.2.0 / 0.1.0 的主要变更。
 ---
 
 # 更新日志
 
 完整逐条记录见仓库 [`CHANGELOG.md`](https://github.com/summit4you/aih/blob/main/CHANGELOG.md)（Keep a Changelog 格式，SemVer 版本）。本页为各版本要点摘要。
+
+## 0.5.0（2026-09-02）
+
+**新增**
+
+- **Provider 目录 + `/connect` 交互式接入（对齐 opencode `/connect`，仅 OpenAI 兼容）**——`connectCatalog()` 精选 OpenAI 兼容 provider（热门优先，native-SDK 的 Anthropic/Google 排除）；TUI `/connect` 与 `aih connect [<id>]` 引导选择 provider → 输入 API key（写入 env 文件 chmod 600，**绝不落 aih.json**）→ `saveProvider()` 存入配置（`apiKeyEnv` 命名环境变量，密钥本身不入库）→ 立即应用模型。未配置的 provider 以 "+ connect" 条目出现在 `/model` 选择器底部。
+- **双语文档站教程扩展（第 3 批 + 第 19 章 HemaGuide 案例）**、**规则加载（opencode `rules` 对齐）**、**Provider 策略（`policies`）**、**可配置按键（`keybinds`）**、**凭据所有者隔离（OC#7）**、**live-verify / check-existing-first 纪律（OC#3）**、**core 每调用税治理（OC#2）**、**信任模型声明（OC#4）**、**`aih doctor --fix` 配置自愈（OC#5）**、**成熟度记分卡（OC#6）**、**BuffBench 式质量评估 + 基线回归门（FB#4）**。
+
+**修复**
+
+- **模型选择器滚动高亮错位（"选的和显示的不一定"）**：`/model` / ctrl-p 选择器用窗口内循环索引对比全局选中索引，列表超过可见行滚动后高亮与实际选中项漂移；抽取 `paletteWindow()` 返回窗口内高亮位置修齐。
+- **切换模型后幻影"上下文爆满/需要压缩"**：免费网关（opencode zen go）报告**累计** `prompt_tokens`（~78K 会话实测 949K / 3.2M）；旧判据 `prompt_tokens ≤ 2×窗口` 在窗口涨到 1M（deepseek-v4-flash）后放行垃圾值，切 big-pickle(200k) → deepseek-v4-flash(1M) 误报"949K ≥ 800K 需压缩"。可信度现在双向对照本地 chars÷4 估算——报告≫估算=累计垃圾（估算胜）、估算≫报告=样本过期（估算胜）。`agent-loop.ts` 与 `cost.ts` 同步修复。
 
 ## 0.4.0（2026-08-29）
 

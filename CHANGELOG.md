@@ -6,9 +6,21 @@ All notable changes to AIH are documented in this file. The format is based on
 the versions listed here (`scripts/package` derives the version from
 `cli/src/index.ts` → `VERSION`).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-02
 
 ### Added
+- **Provider catalog + `/connect` interactive login (opencode `/connect` parity,
+  OpenAI-compatible scope)**: `connectCatalog()` returns a curated catalog of
+  OpenAI-compatible providers (popular first, then alphabetical; native-SDK
+  providers like Anthropic/Google excluded) with stable baseUrl / apiKeyEnv /
+  default model. `/connect` (TUI) and `aih connect [<id>]` walk the user through
+  provider selection → API key entry (persisted to the AIH env file chmod 600,
+  NEVER written into aih.json) → provider saved into aih.json via
+  `saveProvider()` (credential-safe: `apiKeyEnv` names the env var, key itself
+  never stored) → model applied immediately. Providers not yet configured
+  surface as "+ connect" entries at the bottom of the `/model` picker.
+  (`cli/src/provider-catalog.ts`, `cli/src/config.ts` `saveProvider`,
+  `cli/src/index.ts` `/connect` + `openConnectPicker`, `cli/src/slash.ts`)
 - **Docs-site tutorial extension, batch 3 (zh + en)**: applied the same "beginner primer + real code walkthrough + logic diagram" treatment to the remaining mechanism chapters — Ch.2 (project structure & dev env: monorepo layer map + root `package.json` walkthrough, reuses `arch-overview.svg`), Ch.6 (agent system: bounded-retry fallback constants + `StallError`/`QuotaError` handling walkthrough, reuses `agent-loop.svg`), Ch.12 (CLI & TUI: `main()` dispatch walkthrough — trust gate → TTY default → `switch` routing, new `cli-dispatch.svg`), Ch.14 (skill system: `discoverSkills` name-dedup + `parseSkillMd` + BM25 `tokenize` CJK-bigram walkthrough, new `skill-load.svg`), Ch.15 (community & reusable skills: `installRemoteSkill` staging + atomic-rename + version-aware no-op walkthrough). Added two new SVG logic diagrams (`cli-dispatch.svg`, `skill-load.svg`); now 9 tutorial SVG diagrams total. Build/check PASS, all chapters + diagrams served with correct depth-aware paths (200).
 - **Docs-site tutorial extension (zh + en)**: extended the same "beginner primer + real code walkthrough + logic diagram" treatment to more mechanism chapters — Ch.5 (tool system: `ToolDefinition`/`register`/`invoke` five-stage guard, reuses `guard-pipeline.svg`), Ch.10 (snapshots & file system: sandbox-backend resolution priority, env-policy), Ch.11 (event stream: observer `LoopObserver` code + `goal/judge` three-state verdict), Ch.13 (plugin/extension: `ExtensionApi` code + load-order + hook-waterfall placement). Added two new SVG logic diagrams (`event-stream.svg`, `extension-hooks.svg`) alongside the earlier `session-fork.svg`/`permission-floor.svg`. Build/check PASS, all 7 tutorial SVG diagrams served and embedded with correct depth-aware paths.
 - **Docs-site tutorial refinement (zh + en)**: index ("导读 / How to read") table of contents now lists every chapter on its own line instead of merging several `·`-joined entries; repeated "three integration shapes" content is de-duplicated into a single canonical home in Ch.8 with cross-references from Ch.1/Ch.3/Ch.16; all bare `(chNN)` / `(../page)` cross-references converted to real clickable links. Deepened Ch.4 (session system) and Ch.9 (permission system) with beginner-friendly primers, real code walkthroughs (append/fork/restoreTo/coverageDigest; PolicyGate request), and two new SVG logic diagrams (`session-fork.svg`, `permission-floor.svg`). Added a Runoob-style "first use" beginner case to Ch.1 that exercises the real offline `--mock` pipeline.
@@ -100,6 +112,25 @@ the versions listed here (`scripts/package` derives the version from
   quality). `npm run eval:quality` runs the suite (mock) then the coverage
   matrix. (`cli/src/eval.ts` `loadQualitySuite`+`compareToBaseline`,
   `cli/src/index.ts` `cmdQuality`, `evals/`)
+
+### Fixed
+- **Overlay picker scroll highlight drift ("chose one, got another")**: the
+  `/model` / ctrl-p palette rendered its selection mark by comparing a
+  window-relative loop index against the GLOBAL `sel`, so once the list
+  exceeded the visible rows the highlighted row and the actually-selected
+  entry drifted apart. Extracted `paletteWindow(sel, len, maxRows)` returning
+  `{ top, highlight }` and render with the window-relative `highlight`.
+  (`cli/src/tui.ts`)
+- **Phantom near-full context / false compaction on model switch**: free-tier
+  gateways (opencode zen go) report CUMULATIVE/garbage `prompt_tokens`
+  (observed 949K / 3.2M on a ~78K-token conversation). The old plausibility
+  gate (`prompt_tokens ≤ 2×window`) admitted those once the window grew to 1M
+  (deepseek-v4-flash), so switching big-pickle (200k) → deepseek-v4-flash
+  (1M) flashed "949K / compact needed" (949K ≥ 0.8×1M). Plausibility now also
+  cross-checks the local chars÷4 estimate in BOTH directions — report ≫
+  estimate → cumulative garbage (estimate wins); estimate ≫ report → stale
+  sample (estimate wins). Mirror guard in `agent-loop.ts` (`plausible`) and
+  `cost.ts` `lastContextTokens`. (`core/src/agent-loop.ts`, `cli/src/cost.ts`)
 
 ## [0.4.0] - 2026-08-29
 
