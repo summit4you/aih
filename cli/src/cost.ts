@@ -170,14 +170,26 @@ export function lastContextTokens(
     if (e.type !== "turn/end") continue;
     const p = e.usage?.promptTokens;
     if (!sanePromptTokens(p, window)) continue;
-    // Free-tier gateways report cumulative/garbage prompt_tokens (observed
-    // 28M on a ~500k-token conversation) — handled by the gate above. A sane
-    // sample can still be STALE in the other direction (content accrued after
-    // that turn); when the local estimate clearly outgrew it, estimate wins.
+    const pnum = p as number;
     const est = estimateContextTokens(events);
-    return est > (p as number) * 1.25
-      ? { tokens: est, source: "estimate" }
-      : { tokens: p as number, source: "usage" };
+    // Trust a server-reported prompt count only while it stays in a sane band
+    // around the local estimate. Free-tier gateways report CUMULATIVE/garbage
+    // prompt_tokens (observed 949K / 3.2M on a ~78K-token conversation), and
+    // the gateway's own window gate (2×window) wrongly green-lights those once
+    // the window grows to 1M — flashing a phantom near-full "compact needed".
+    // A report more than 3× the local estimate is a cumulative read, not the
+    // true request input; the local estimate wins in that direction too (the
+    // existing `est > p*1.25` branch already covers the stale-downward case).
+    // The reverse guard engages only once the log has genuinely estimable
+    // content (est ≥ 100); synthetic/short logs (est≈0) carry no baseline, so
+    // the wire number stays the source of truth there. Both drift directions
+    // are covered: report ≫ estimate → cumulative/garbage (estimate wins);
+    // estimate ≫ report → the log grew past a stale sample (estimate wins).
+    return est >= 100 && pnum <= est * 3 && est <= pnum * 1.25 && est <= pnum * 1.25
+      ? { tokens: pnum, source: "usage" }
+      : est >= 100
+        ? { tokens: est, source: "estimate" }
+        : { tokens: pnum, source: "usage" };
   }
   if (events.length === 0) return { tokens: 0, source: "none" };
   if (compaction) {

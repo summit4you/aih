@@ -65,7 +65,8 @@
         "label": "第 V 部分 · 实践",
         "children": [
           { "href": "tutorial/ch17", "label": "第 17 章 · 动手实践：端到端接入一个应用" },
-          { "href": "tutorial/ch18", "label": "第 18 章 · 设计哲学与最佳实践" }
+          { "href": "tutorial/ch18", "label": "第 18 章 · 设计哲学与最佳实践" },
+          { "href": "tutorial/ch19", "label": "第 19 章 · 案例：HemaGuide 血液肿瘤决策支持" }
         ]
       }
     ]

@@ -236,6 +236,25 @@ export function cols(text: string): number {
   return n;
 }
 
+/**
+ * Overlay picker scrolling window: which rows of a long list are visible and
+ * where the highlight sits. `sel` is a 0-based index into the FULL list; the
+ * visible window is a `maxRows`-tall slice centered on `sel`. Returns the
+ * slice start `top` and the highlight offset WITHIN the window, so callers
+ * can render the highlight at the correct row (a classic bug is comparing a
+ * window-relative loop index against the global `sel` — that drifts once the
+ * list scrolls).
+ */
+export function paletteWindow(
+  sel: number,
+  len: number,
+  maxRows: number,
+): { top: number; highlight: number } {
+  const rows = Math.max(1, maxRows);
+  const top = Math.max(0, Math.min(sel - (rows >> 1), Math.max(0, len - rows)));
+  return { top, highlight: sel - top };
+}
+
 export function wrapStyled(s: string, limit: number): string[] {
   // CC#58 — hard cap on a pathological single line (base64 / minified diff).
   // Without it the wrap loop would be O(n·cols) and freeze rendering on
@@ -2285,7 +2304,7 @@ constructor(opts: TuiOptions) {
       rows.push(`${mark} ${label}${hint}`);
     }
     if (!rows.length) rows.push(dim("no matching entries"));
-    const top = Math.max(0, Math.min(ov.sel - (maxRows >> 1), Math.max(0, rows.length - maxRows)));
+    const { top, highlight } = paletteWindow(ov.sel, rows.length, maxRows);
     const visible = rows.slice(top, top + maxRows);
     // every row is exactly W display columns wide (border chars included)
     const box: string[] = [];
@@ -2320,7 +2339,13 @@ constructor(opts: TuiOptions) {
     );
     box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
     for (let i = 0; i < visible.length; i += 1) {
-      const isSel = i === ov.sel;
+      // `visible` is a slice of `rows` starting at `top`, while `ov.sel` is a
+      // global index into the full list — `highlight` (from paletteWindow) is
+      // the location of the selection WITHIN the window. Before this fix the
+      // highlight compared a window-relative loop index against the global
+      // `ov.sel`, so once the list scrolled the highlighted row and the
+      // actually-selected entry drifted apart ("chose one, got another").
+      const isSel = i === highlight;
       const line = visible[i];
      if (isSel) {
         // selection row: reverse video (theme-proof) with the same geometry as

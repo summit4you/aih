@@ -1187,6 +1187,45 @@ assert(
   );
 }
 
+// Cumulative/garbage provider prompt_tokens must NOT be trusted as the
+// context size, even inside a large window. Regression: a free-tier gateway
+// reported 949K prompt_tokens on a ~78K-token conversation; the old
+// plausibility gate (`promptTokens <= window*2`) green-lit it once the window
+// grew to 1M, falsely tripping the 80% compaction trigger (949K ≥ 0.8×1M) and
+// flashing a phantom "compact needed" on model switch. The wire number is
+// accepted only while it stays within a sane band of the local chars÷4
+// estimate.
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const gLog = new SessionLog();
+  const gTools = new ToolRegistry(gate);
+  gTools.register(echo);
+  // Single turn reporting a garbage cumulative promptTokens (949K) on a log
+  // whose local chars÷4 estimate is ~2K → must NOT become contextNow.
+  const garbageLlm = new MockLLM([
+    { text: "ok", stopReason: "end_turn", usage: { promptTokens: 949_390, completionTokens: 5, totalTokens: 949_395 } },
+  ]);
+  const gLoop = new Loop({
+    llm: garbageLlm,
+    tools: gTools,
+    log: gLog,
+    systemPrompt: "sys",
+    contextWindow: 1_000_000, // 1M window — the 2×window gate alone admits 949K
+    compactAt: 0.8,
+  });
+  gLog.append({ type: "user/message", turnId: "g1", text: "hello" });
+  const gRes = await gLoop.send("hi");
+  assert(gRes.stopReason === "end_turn", "garbage-promptTokens turn completes");
+  assert(
+    gRes.contextNow != null && gRes.contextNow < 10_000,
+    `garbage promptTokens rejected: contextNow stays at local-estimate scale (got ${gRes.contextNow})`,
+  );
+  assert(
+    !gLog.all().some((e) => e.type === "compaction"),
+    "garbage promptTokens must not falsely trigger compaction",
+  );
+}
+
 // Rolling compaction must tell the summarizer to drop finished work from
 // "Objective" — otherwise a stale Objective duplicates a Completed item and
 // the agent re-does finished work after compaction (observed: FB#5/#6 were

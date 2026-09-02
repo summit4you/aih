@@ -52,6 +52,7 @@ import { AutoApprove } from "@aih/core";
 
 import { connectBackend, connectMultiBackend } from "./mcp-backend.js";
 import type { McpBackend } from "./mcp-backend.js";
+import { connectCatalog, catalogEntry, type CatalogProvider } from "./provider-catalog.js";
 import { DenyGate, SessionGate } from "./gate.js";
 import {
   loadModelCatalog,
@@ -66,6 +67,7 @@ import {
   resolveLlm,
   resolveServers,
   savePermissionRule,
+  saveProvider,
   saveSkillRegistry,
   type ModelCatalogEntry,
 } from "./config.js";
@@ -135,6 +137,7 @@ import {
 import { tidyMemory, formatTidyReport } from "./memory-tidy.js";
 import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
+import type { PickerEntry } from "./tui.js";
 import {
   BUILTIN_SKILLS,
   discoverSkills,
@@ -242,6 +245,9 @@ aih session <list|show|rm|export|import|fork> [args]
                                    registry: aih skills registry [url]
   aih config                      print effective configuration and sources
   aih models                      list configured providers/models
+  aih connect [<id>] [--key <k>]  connect an API provider (catalog / save config)
+                                   --key <API_KEY> persists the key to the AIH env file
+                                   (AIH_ENV_PATH, default ~/.aih/env, chmod 600)
   aih init [dir]                  scaffold a new app harness
   aih workflow <list|run> [name]  deterministic multi-phase agent runs
                                    list: list .aih/workflows/*.mjs
@@ -370,6 +376,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     "note",
     "sender",
     "image",
+    "key",
+    "key-env",
     // FA#6 — `aih experiment` value flags
     "exp-id",
     "reps",
@@ -667,6 +675,66 @@ export function parseRetryEnv(v: string | undefined): number | undefined {
 function readMemoryFile(path: string): string {
   if (!existsSync(path)) return "";
   return readFileSync(path, "utf8").trim();
+}
+
+/**
+ * Path of the AIH env file that holds provider API keys, one `KEY=value` per
+ * line. Defaults to `~/.aih/env` (the user-level AIH dir); override with
+ * AIH_ENV_PATH. Keys are never written into aih.json — only the env var NAME
+ * is (providers.<name>.apiKeyEnv), and the value lives here with chmod 600.
+ */
+export function envFilePath(env: NodeJS.ProcessEnv = process.env): string {
+  const p = env.AIH_ENV_PATH?.trim();
+  if (p) return resolve(p);
+  return join(userAihDir(env), "env");
+}
+
+/** Append (or update) a KEY=value line in the env file; chmod 600. Returns the path. */
+export function persistEnvKey(key: string, value: string, env: NodeJS.ProcessEnv = process.env): string {
+  const path = envFilePath(env);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+    throw new Error(`invalid env var name "${key}"`);
+  }
+  if (/[\r\n]/.test(value)) {
+    throw new Error("API key must be a single line");
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  let body = "";
+  if (existsSync(path)) body = readFileSync(path, "utf8");
+  const lines = body.split("\n").filter((l) => l.length > 0 && !l.startsWith("#"));
+  const rest = lines.filter((l) => !l.startsWith(`${key}=`));
+  rest.push(`${key}=${value}`);
+  writeFileSync(path, `${rest.join("\n")}\n`, { mode: 0o600, encoding: "utf8" });
+  chmodSync(path, 0o600);
+  return path;
+}
+
+/**
+ * Load the AIH env file's KEY=value lines into `env` (process.env by default).
+ * Never overrides an existing variable (shell environment wins). Silently
+ * ignores a missing file, malformed lines, and keys that don't look like env
+ * var names.
+ */
+export function loadEnvFile(env: NodeJS.ProcessEnv = process.env): void {
+  const path = envFilePath(env);
+  if (!existsSync(path)) return;
+  let body: string;
+  try {
+    body = readFileSync(path, "utf8");
+  } catch {
+    return; // unreadable file — don't kill the CLI over a helper file
+  }
+  for (const line of body.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const eq = t.indexOf("=");
+    if (eq <= 0) continue;
+    const key = t.slice(0, eq).trim();
+    const value = t.slice(eq + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if (env[key] !== undefined) continue; // shell / existing env wins
+    env[key] = value;
+  }
 }
 
 function fitBudget(text: string, budget: number): string {
@@ -1734,6 +1802,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     type Command = { name: string; hint: string; run: () => void | Promise<void> };
     const commands: Command[] = [
       { name: "switch model", hint: "change provider/model", run: () => openModelPicker() },
+      { name: "connect provider", hint: "/connect — add/connect an API provider", run: () => handleLine("/connect") },
       { name: "mode build", hint: "full toolset (tab)", run: () => setMode("build") },
       { name: "mode plan", hint: "read-only planning (tab)", run: () => setMode("plan") },
       { name: "compact context", hint: "/compact — summarize earlier history", run: () => handleLine("/compact") },
@@ -1771,12 +1840,6 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       providerLabel === "custom" ? undefined : providerLabel,
       modelLabel,
     );
-    if (!catalog.length) {
-      tui.pushSystem(
-        'no models configured — add providers to aih.json:\n{\n  "providers": { "<name>": { "baseUrl": "...", "model": "..." } }\n}',
-      );
-      return;
-    }
     const short = (u?: string): string =>
       !u ? "" : u.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "") || u;
     const entries = catalog.map((e: ModelCatalogEntry) => ({
@@ -1784,14 +1847,158 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       ...(e.baseUrl ? { hint: short(e.baseUrl) } : {}),
       ...(e.active ? { active: true } : {}),
     }));
+    // opencode DialogModel parity: when a provider is NOT configured yet, list
+    // it as a "connect" entry at the bottom so the user can pick it right from
+    // the model picker (→ /connect flow) instead of only seeing a text hint.
+    const configured = new Set(catalog.map((e) => e.provider));
+    const connectable = connectCatalog().filter((p) => !configured.has(p.id));
+    const connectStart = entries.length;
+    for (const p of connectable.slice(0, 6)) {
+      entries.push({
+        label: `+ ${p.name}`,
+        hint: `${p.baseUrl.replace(/^https?:\/\//, "")} · connect (${p.apiKeyEnv})`,
+      });
+    }
+    if (!entries.length) {
+      tui.pushSystem(
+        'no models configured — add providers to aih.json:\n{\n  "providers": { "<name>": { "baseUrl": "...", "model": "..." } }\n}',
+      );
+      return;
+    }
     const outcome = await tui.pick("Switch model", entries);
     if (outcome.kind !== "select") return;
-    const entry = catalog[outcome.index];
+    const idx = outcome.index;
+    if (idx >= connectStart && idx < entries.length) {
+      // A "+ provider" connect entry → jump straight into /connect for it.
+      const target = connectable[idx - connectStart];
+      if (target) {
+        await openConnectPicker(target);
+        return;
+      }
+    }
+    const entry = catalog[idx];
     if (!entry || entry.active) return;
     await applyModel(entry.provider === "(default)" ? undefined : entry.provider, entry.model);
     tui.pushSystem(
       `switched model to ${entry.provider}/${entry.model} (context window ${resolveContextWindow(flags)})`,
     );
+  }
+
+  /**
+   * `/connect` — interactive provider login (opencode `/connect` parity, scoped
+   * to what AIH's OpenAI-compatible adapter can talk to).
+   *
+   * Flow: pick a provider (catalog or custom "Other") → enter the API key →
+   * save the provider into aih.json (key lives in the environment, never in
+   * the config file) → optionally persist the key to the AIH env file
+   * (~/.aih/env, chmod 600) → apply the model immediately.
+   *
+   * `preselect` skips the provider picker (used when entering from the model
+   * picker's "connect" entries) and connects that provider directly.
+   *
+   * Credential policy follows the confirmed plan: keys are NOT written into
+   * aih.json; `providers.<name>.apiKeyEnv` names the env var. The env-file
+   * persistence is opt-in (Enter without a key = skip; any non-empty key is
+   * persisted with restrictive permissions).
+   */
+  async function openConnectPicker(preselect?: CatalogProvider): Promise<void> {
+    if (busy) {
+      tui.pushSystem("finish the current turn before /connect");
+      return;
+    }
+    if (bool(flags, "mock")) {
+      tui.pushSystem("/connect unavailable in --mock mode");
+      return;
+    }
+    const catalog = connectCatalog();
+    let provider: CatalogProvider | undefined = preselect;
+    if (!provider) {
+      const entries: PickerEntry[] = [
+        ...catalog.map((p) => ({
+          label: p.name,
+          hint: `${p.baseUrl.replace(/^https?:\/\//, "")} · ${p.apiKeyEnv}`,
+        })),
+        { label: "Other (custom endpoint)", hint: "OpenAI-compatible baseUrl + model + key env" },
+      ];
+      const outcome = await tui.pick("Connect provider", entries);
+      if (outcome.kind !== "select") return;
+      const idx = outcome.index;
+      if (idx < catalog.length) {
+        provider = catalog[idx];
+      } else {
+        // Custom "Other" provider: ask baseUrl/model/apiKeyEnv inline.
+        const baseUrl = (await tui.askQuestion("base URL (OpenAI-compatible, e.g. https://api.example.com/v1)"))
+          .trim();
+        if (!baseUrl) return;
+        const model = (await tui.askQuestion("model id (e.g. gpt-4o-mini)")).trim();
+        if (!model) return;
+        const keyEnv = (await tui.askQuestion("env var name for the API key (e.g. MY_API_KEY)")).trim()
+          || "CUSTOM_API_KEY";
+        const id = (await tui.askQuestion("provider id (lowercase, e.g. my-provider)")).trim()
+          || "custom";
+        try {
+          const path = saveProvider(id, { baseUrl, model, apiKeyEnv: keyEnv });
+          tui.pushSystem(`saved provider "${id}" → ${path}`);
+        } catch (err) {
+          tui.pushError(err instanceof Error ? err.message : String(err));
+          return;
+        }
+        try {
+          await applyModel(id, model);
+          tui.pushSystem(`connected: ${id}/${model} — set ${keyEnv}=<key> (or /connect to add it)`);
+        } catch (err) {
+          tui.pushError(err instanceof Error ? err.message : String(err));
+        }
+        return;
+      }
+    }
+    if (!provider) return;
+
+    // Catalog provider: ask for the API key (optional; keyless/local skip).
+    const keyEnv = provider.apiKeyEnv;
+    const hasKey = Boolean(process.env[keyEnv] || process.env.AIH_API_KEY);
+    tui.pushSystem(
+      `provider: ${provider.name}\nendpoint: ${provider.baseUrl}\nkey env: ${keyEnv}${hasKey ? " (already set ✓)" : " (not set)"}`,
+    );
+    const key = (await tui.askQuestion(
+      `API key for ${provider.name} (Enter to keep existing / skip)`,
+    )).trim();
+    let persistedKey = false;
+    if (key) {
+      try {
+        await persistEnvKey(keyEnv, key);
+        process.env[keyEnv] = key;
+        persistedKey = true;
+      } catch (err) {
+        tui.pushError(`could not persist key to env file: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    try {
+      const path = saveProvider(provider.id, {
+        baseUrl: provider.baseUrl,
+        model: provider.defaultModel,
+        apiKeyEnv: keyEnv,
+        ...(provider.contextWindow ? { contextWindow: provider.contextWindow } : {}),
+        ...(provider.headers && Object.keys(provider.headers).length
+          ? { headers: provider.headers }
+          : {}),
+        ...(provider.models && provider.models.length
+          ? { models: provider.models as string[] }
+          : {}),
+      });
+      tui.pushSystem(
+        `saved provider "${provider.id}" → ${path}\nkey: ${persistedKey ? `stored in ${envFilePath()}` : (hasKey || key ? "in environment" : "NOT set — set " + keyEnv + " to use it")}`,
+      );
+    } catch (err) {
+      tui.pushError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    try {
+      await applyModel(provider.id, provider.defaultModel);
+      tui.pushSystem(`connected to ${provider.name} — model ${provider.defaultModel}`);
+    } catch (err) {
+      tui.pushError(err instanceof Error ? err.message : String(err));
+    }
   }
 
 
@@ -3046,6 +3253,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       }
       return;
     }
+    if (input === "/connect") {
+      void openConnectPicker();
+      return;
+    }
     if (input === "/model") {
       void openModelPicker();
       return;
@@ -3096,7 +3307,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /model /models /usage /compact /checkpoint /restore /fork /tree /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /connect /model /models /usage /compact /checkpoint /restore /fork /tree /skills /inject /events /clear /exit`,
       );
       return;
     }
@@ -4390,6 +4601,65 @@ function cmdModels(flags: Record<string, string | boolean>) {
   }
 }
 
+/**
+ * `aih connect` — non-interactive provider connect.
+ *
+ *   aih connect                    list the connectable provider catalog
+ *   aih connect <id>               show the config json + key instruction for one provider
+ *   aih connect <id> --key <k>     save the provider to aih.json AND persist the key
+ *                                  to the AIH env file (AIH_ENV_PATH, default ~/.aih/env)
+ *   aih connect <id> --base-url <u> --model <m> [--key-env <e>]  custom tweaks
+ *
+ * The API key NEVER lands in aih.json — only its env var name does
+ * (providers.<id>.apiKeyEnv). `--key` writes the value to the env file (chmod 600).
+ */
+function cmdConnect(positionals: string[], flags: Record<string, string | boolean>) {
+  const id = positionals[0];
+  if (!id) {
+    console.log("Connectable providers (OpenAI-compatible; add \"Other\" via /connect):\n");
+    console.log(`${"name".padEnd(26)} ${"id".padEnd(18)} ${"apiKeyEnv".padEnd(22)} base-url`);
+    for (const p of connectCatalog()) {
+      console.log(`${p.name.padEnd(26)} ${p.id.padEnd(18)} ${p.apiKeyEnv.padEnd(22)} ${p.baseUrl}`);
+    }
+    console.log("\nuse: aih connect <id> [--key <API_KEY>] [--base-url <url>] [--model <id>]");
+    return;
+  }
+  const entry = catalogEntry(id);
+  if (!entry) {
+    console.error(`error: unknown provider "${id}" (see: aih connect for the catalog)`);
+    process.exit(1);
+  }
+  const baseUrl = str(flags, "base-url") || entry.baseUrl;
+  const model = str(flags, "model") || entry.defaultModel;
+  const keyEnv = str(flags, "key-env") || entry.apiKeyEnv;
+  const key = str(flags, "key");
+  try {
+    const path = saveProvider(id, {
+      baseUrl,
+      model,
+      apiKeyEnv: keyEnv,
+      ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
+      ...(entry.headers && Object.keys(entry.headers).length ? { headers: entry.headers } : {}),
+      ...(entry.models && entry.models.length ? { models: entry.models as string[] } : {}),
+    });
+    console.log(`saved provider "${id}" → ${path}`);
+    if (key) {
+      const kp = persistEnvKey(keyEnv, key);
+      console.log(`stored ${keyEnv} → ${kp} (chmod 600)`);
+    } else {
+      const has = Boolean(process.env[keyEnv] || process.env.AIH_API_KEY);
+      console.log(
+        has
+          ? `${keyEnv} is set in the environment ✓`
+          : `set ${keyEnv}=<key> to use it (or: aih connect ${id} --key <API_KEY>)`,
+      );
+    }
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 function mergedConfig(layers: Array<{ config: any }>): any {
   const out: any = {};
   for (const { config } of layers) Object.assign(out, config);
@@ -4874,6 +5144,13 @@ async function cmdExperiment(positionals: string[], flags: Record<string, string
 async function main() {
   const { command, positionals, flags } = parseArgs(process.argv.slice(2));
 
+  // AIH env file (AIH_ENV_PATH, default ~/.aih/env; see persistEnvKey): load
+  // KEY=value lines into process.env at startup so a key stored by
+  // `aih connect <id> --key` / `/connect` is picked up on the NEXT run
+  // without the user sourcing anything. The file is AIH-managed (chmod 600);
+  // a line never overrides an already-set variable (shell env wins).
+  loadEnvFile(process.env);
+
   // P#40 — project trust gate: resolve trust for the working directory BEFORE
   // anything reads config/skills. One-shot flags win; TTY chat prompts once
   // (persisted per directory in the USER-level trust file); non-interactive
@@ -4995,6 +5272,8 @@ async function main() {
       return cmdConfig(flags);
     case "models":
       return cmdModels(flags);
+    case "connect":
+      return cmdConnect(positionals, flags);
     case "agents":
       return cmdAgents();
     case "init":

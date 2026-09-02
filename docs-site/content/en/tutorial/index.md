@@ -1,6 +1,6 @@
 ---
 title: How to read this book
-description: "AIH: A Learner's Guide & Source Deep-Dive — five parts, eighteen chapters, from install to kernel, mechanisms to ecosystem, practice to design philosophy. Modeled on opencodebook.xyz."
+description: "AIH: A Learner's Guide & Source Deep-Dive — five parts, nineteen chapters, from install to kernel, mechanisms to ecosystem, practice to design philosophy. Modeled on opencodebook.xyz."
 ---
 
 # How to read this book
@@ -24,7 +24,7 @@ chapter in AIH's real code, mechanisms, and design decisions.
 | **II · Core Architecture** | 4–8 | Session, tool, agent, provider, MCP |
 | **III · Key Mechanisms** | 9–12 | Permissions, snapshots, event stream, CLI/TUI |
 | **IV · Ecosystem** | 13–16 | Extensions, skills, community, IDE/headless |
-| **V · Practice** | 17–18 | End-to-end hands-on + design philosophy |
+| **V · Practice** | 17–19 | End-to-end hands-on + design philosophy + HemaGuide case study |
 
 ## Minimal reading paths
 
@@ -66,5 +66,6 @@ point.
 - Part V · Practice
   - [Ch.17 · Hands-on: integrate an app end-to-end](ch17)
   - [Ch.18 · Design philosophy & best practices](ch18)
+  - [Ch.19 · Case study: HemaGuide clinical decision support](ch19)
 
 Ready? Start with [Ch.1](ch01).

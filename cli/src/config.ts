@@ -511,6 +511,33 @@ export function loadSkillRegistry(): string[] {
   return [...new Set(out)];
 }
 
+/**
+ * Persist a provider definition into the first writable config file (project
+ * aih.json / .aih/config.json, else user ~/.aih/config.json). Returns the path.
+ *
+ * Credential policy (OC#4 trust model): the API key itself NEVER goes into the
+ * config file — `apiKeyEnv` names the environment variable that holds it, so
+ * the file stays free of secrets and the key can be rotated without touching
+ * provider config. `saveProvider` merges into `providers.<name>` (existing
+ * fields survive; a new `apiKeyEnv` wins).
+ */
+export function saveProvider(name: string, cfg: ProviderConfig): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new Error(`invalid provider id "${name}" (allowed: letters, digits, . _ -)`);
+  }
+  const candidates = [
+    join(process.cwd(), "aih.json"),
+    join(process.cwd(), ".aih", "config.json"),
+  ];
+  const path =
+    candidates.find((p) => existsSync(p)) ?? join(userAihDir(), "config.json");
+  const file = readConfig(path);
+  const existing = file.providers?.[name] ?? {};
+  file.providers = { ...(file.providers ?? {}), [name]: { ...existing, ...cfg } };
+  writeConfigFile(path, file);
+  return path;
+}
+
 export function savePermissionRule(rule: PermissionRule): string {
   const candidates = [
     join(process.cwd(), "aih.json"),

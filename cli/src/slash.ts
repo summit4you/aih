@@ -17,7 +17,7 @@ export function slashHeadOf(text: string): string {
 /** Builtin heads dispatched inside cmdChat's handleLine. */
 export const BUILTIN_SLASH_HEADS: ReadonlySet<string> = new Set([
   "help", "commands", "tools", "mode", "goal", "memory", "model", "models",
-  "usage", "compact", "checkpoint", "restore", "fork", "tree", "dream",
+  "connect", "usage", "compact", "checkpoint", "restore", "fork", "tree", "dream",
   "distill", "tidy", "find", "shell", "fix", "vivid", "bg", "sessions", "clear", "inject", "events",
   "skills", "exit", "quit",
 ]);

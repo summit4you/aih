@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -1156,6 +1156,117 @@ assert(
 
   rmSync(catDir, { recursive: true, force: true });
   delete process.env.AIH_TRUST_ALL_PROJECTS;
+}
+
+// `/connect` — interactive provider connect (opencode parity, OpenAI-compatible):
+// catalog list, saveProvider (key never in aih.json), env-file key persistence
+// (chmod 600) and startup auto-load. Pure functions shared by TUI /connect and
+// `aih connect`.
+{
+  const { connectCatalog, catalogEntry } = await import("./provider-catalog.js");
+  const { saveProvider, setProjectTrustState, loadModelCatalog } = await import("./config.js");
+  const { envFilePath, persistEnvKey, loadEnvFile } = await import("./index.js");
+  const { isKnownSlashCommand, BUILTIN_SLASH_HEADS } = await import("./slash.js");
+
+  assert(BUILTIN_SLASH_HEADS.has("connect"), "/connect is a known builtin slash head");
+  assert(isKnownSlashCommand("/connect"), "isKnownSlashCommand('/connect') → true");
+  assert(isKnownSlashCommand("/connect deepseek"), "/connect <id> is still the known head (falls into the /connect handler)");
+
+  const cat = connectCatalog();
+  assert(cat.length >= 20, `catalog has a curated set (got ${cat.length})`);
+  // opencode priority: the five popular providers come before the rest
+  const names = cat.map((p) => p.id);
+  const popular = ["opencode", "opencode-go", "openai", "openrouter", "github-copilot"];
+  const popularIdx = popular.map((id) => names.indexOf(id));
+  for (const [i, id] of popular.entries()) {
+    assert(popularIdx[i] >= 0, `popular provider ${id} present`);
+    if (i > 0) assert(popularIdx[i] > popularIdx[i - 1], `popular ordering: ${popular[i - 1]} before ${id}`);
+  }
+  // non-popular entries are alphabetical by (display) name
+  const tailNames = names
+    .slice(Math.max(...popularIdx) + 1)
+    .map((id) => cat.find((p) => p.id === id)!.name);
+  const sortedNames = [...tailNames].sort((a, b) => a.localeCompare(b));
+  assert(JSON.stringify(tailNames) === JSON.stringify(sortedNames), "non-popular catalog entries are alphabetical by name");
+  const openai = catalogEntry("openai");
+  assert(openai?.baseUrl === "https://api.openai.com/v1" && openai.apiKeyEnv === "OPENAI_API_KEY", "openai entry has correct baseUrl/env");
+  // Anthropic / Google are NOT catalog entries (native SDK, not OpenAI-compatible)
+  assert(catalogEntry("anthropic") === undefined && catalogEntry("google") === undefined, "native-SDK providers are excluded from the catalog");
+
+  // saveProvider: merges into providers.<name>, key never written, id validated
+  const scDir = ".aih-smoke-connect";
+  const scHome = mkdtempSync(join(tmpdir(), "aih-connect-home-"));
+  rmSync(scDir, { recursive: true, force: true });
+  mkdirSync(scDir, { recursive: true });
+  process.env.AIH_HOME = scHome;
+  const prevCwd = process.cwd();
+  const prevTrust = process.env.AIH_TRUST_ALL_PROJECTS;
+  process.env.AIH_TRUST_ALL_PROJECTS = "1";
+  setProjectTrustState("trusted"); // P#40: direct-call tests must init trust explicitly
+  process.chdir(scDir);
+  writeFileSync("aih.json", JSON.stringify({ schemaVersion: 1 }), "utf8");
+  const saved = saveProvider("deepseek", {
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    models: ["deepseek-chat", "deepseek-reasoner"],
+  });
+  assert(saved.endsWith("aih.json"), `saveProvider writes the project aih.json (got ${saved})`);
+  const onDisk = JSON.parse(readFileSync("aih.json", "utf8"));
+  assert(onDisk.providers.deepseek.baseUrl === "https://api.deepseek.com", "provider baseUrl persisted");
+  assert(onDisk.providers.deepseek.apiKeyEnv === "DEEPSEEK_API_KEY", "apiKeyEnv persisted (key itself never is)");
+  assert(JSON.stringify(onDisk).includes("sk-") === false, "no plaintext key ever lands in aih.json");
+  // merging: existing fields survive
+  saveProvider("deepseek", { model: "deepseek-chat-v2" });
+  const merged = JSON.parse(readFileSync("aih.json", "utf8")).providers.deepseek;
+  assert(merged.baseUrl === "https://api.deepseek.com" && merged.model === "deepseek-chat-v2", "saveProvider merges, keeps existing baseUrl");
+  // invalid id rejected
+  let threw = false;
+  try {
+    saveProvider("bad id!", { baseUrl: "http://x" });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "saveProvider rejects invalid provider ids");
+
+  // env-file key persistence: chmod 600 + auto-load round-trip
+  const envPath = ".aih-smoke.env";
+  process.env.AIH_ENV_PATH = join(process.cwd(), envPath);
+  const stored = persistEnvKey("SMOKE_KEY", "smoke-value-123abc");
+  const st = statSync(stored);
+  assert((st.mode & 0o777) === 0o600, `env file is chmod 600 (got ${st.mode & 0o777})`);
+  assert(readFileSync(stored, "utf8").includes("smoke-value-123abc"), "env file holds the key (that file is 0600)");
+  delete process.env.SMOKE_KEY; // simulate a fresh process
+  const loaded: Record<string, string> = {};
+  loaded.AIH_ENV_PATH = join(process.cwd(), envPath);
+  loadEnvFile(loaded);
+  assert(loaded.SMOKE_KEY === "smoke-value-123abc", "loadEnvFile restores the persisted key");
+  // existing env wins (never overrides)
+  const loaded2: Record<string, string> = { SMOKE_KEY: "shell-wins" };
+  loadEnvFile(loaded2);
+  assert(loaded2.SMOKE_KEY === "shell-wins", "loadEnvFile never overrides an existing env var");
+
+  // opencode DialogModel parity: the model picker lists NOT-yet-configured
+  // providers as "+ connect" entries; configured providers are excluded.
+  const pickerCatalog = loadModelCatalog(undefined, undefined);
+  const pickerConfigured = new Set(pickerCatalog.map((e) => e.provider));
+  const pickerConnectable = connectCatalog().filter((p) => !pickerConfigured.has(p.id));
+  assert(pickerConfigured.has("deepseek"), "saveProvider'd deepseek is a configured provider");
+  assert(!pickerConnectable.some((p) => p.id === "deepseek"), "configured provider is excluded from connect entries");
+  assert(pickerConnectable.length >= 10, `catalog keeps unconfigured connect candidates (got ${pickerConnectable.length})`);
+  const pickerHead = pickerConnectable.slice(0, 6).map((p) => p.id);
+  assert(pickerHead.includes("opencode"), "opencode is a top connect candidate when unconfigured");
+
+
+  process.chdir(prevCwd);
+  process.env.AIH_HOME = undefined;
+  setProjectTrustState("untrusted"); // restore module-level trust for later blocks
+  delete process.env.AIH_TRUST_ALL_PROJECTS;
+  delete process.env.AIH_ENV_PATH;
+  if (prevTrust === undefined) delete process.env.AIH_TRUST_ALL_PROJECTS;
+  else process.env.AIH_TRUST_ALL_PROJECTS = prevTrust;
+  rmSync(scDir, { recursive: true, force: true });
+  console.log("ok: /connect — provider catalog + saveProvider + env-file key store (chmod 600, auto-load)");
 }
 
 
@@ -2966,6 +3077,27 @@ await srv.connect(new StdioServerTransport());
   assert(width("—") === 1 && width("…") === 1 && width("→") === 1, "dashes/ellipsis/arrows (— … →) count 1 cell by default");
   assert(width("\ufe0f") === 0, "variation selector (U+FE0F) is zero-width");
   assert(width("组") === 2 && width("\u{1f600}") === 2, "true-wide (CJK, pictographic emoji) stay 2 cells");
+  const { paletteWindow } = await import("./tui.js");
+  // Overlay picker scroll window: highlight must track the GLOBAL sel even as
+  // the visible slice scrolls. Regression: rendering compared a window-relative
+  // loop index against the global sel, so with >maxRows entries the highlighted
+  // row and the actually-selected entry drifted apart ("chose one, got another").
+  {
+    const len = 25;
+    const maxRows = 8;
+    // sel sits in the window center once the list overflows
+    let { top, highlight } = paletteWindow(10, len, maxRows);
+    assert(top === 6 && highlight === 4 && 10 === top + highlight, "paletteWindow: mid-list sel centers the window");
+    // top edge: sel 0 → window at the very top, highlight row 0
+    ({ top, highlight } = paletteWindow(0, len, maxRows));
+    assert(top === 0 && highlight === 0, "paletteWindow: sel 0 pins the top, highlight 0");
+    // bottom edge: last sel → window bottom-pinned, highlight at last row
+    ({ top, highlight } = paletteWindow(len - 1, len, maxRows));
+    assert(top === 17 && highlight === 7, "paletteWindow: last sel pins the bottom, highlight at last visible row");
+    // degenerate: list shorter than the window → no scroll, top=0, highlight==sel
+    ({ top, highlight } = paletteWindow(2, 3, 8));
+    assert(top === 0 && highlight === 2, "paletteWindow: short list never scrolls; highlight == sel");
+  }
   const tuiUrl = pathToFileURL(fileURLToPath(new URL("./tui.js", import.meta.url))).href;
   const probe = (env: Record<string, string>) =>
     spawnSync(

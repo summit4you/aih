@@ -722,11 +722,17 @@ export class AgentLoop {
       const promptTokens = response.usage?.promptTokens ?? 0;
       // Free-tier gateways sometimes report cumulative/garbage prompt_tokens
       // (observed 28M on a ~500k-token conversation). Trust the wire number
-      // only when it is plausibly bounded by the window; otherwise keep the
-      // local chars÷4 estimate so compaction triggers and any UI stay sane.
+      // only when it is plausibly bounded by the window AND stays within a
+      // sane band of the local chars÷4 estimate; otherwise keep the local
+      // estimate so compaction triggers and any UI stay sane. The window check
+      // alone is NOT enough: a gateway's cumulative 949K read slips through a
+      // 2×window gate once the window grows to 1M, then falsely trips the
+      // 80% compaction trigger (949K ≥ 0.8×1M).
+      const est = this.#estimateContext();
       const plausible =
         promptTokens > 0 &&
-        (this.#contextWindow <= 0 || promptTokens <= this.#contextWindow * 2);
+        (this.#contextWindow <= 0 || promptTokens <= this.#contextWindow * 2) &&
+        promptTokens <= est * 3;
       const effectiveContext = plausible
         ? promptTokens
         : Math.max(contextNow, this.#estimateContext());

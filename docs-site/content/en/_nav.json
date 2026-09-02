@@ -65,7 +65,8 @@
         "label": "Part V · Practice",
         "children": [
           { "href": "tutorial/ch17", "label": "Ch.17 · Hands-on: integrate an app end-to-end" },
-          { "href": "tutorial/ch18", "label": "Ch.18 · Design philosophy & best practices" }
+          { "href": "tutorial/ch18", "label": "Ch.18 · Design philosophy & best practices" },
+          { "href": "tutorial/ch19", "label": "Ch.19 · Case study: HemaGuide clinical decision support" }
         ]
       }
     ]

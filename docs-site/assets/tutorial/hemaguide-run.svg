@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="560" viewBox="0 0 840 560" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+  <rect width="840" height="560" fill="#0f172a" rx="10"/>
+  <!-- title bar -->
+  <rect width="840" height="34" rx="10" fill="#1e293b"/>
+  <rect y="24" width="840" height="10" fill="#1e293b"/>
+  <circle cx="24" cy="17" r="6" fill="#ef4444"/>
+  <circle cx="44" cy="17" r="6" fill="#f59e0b"/>
+  <circle cx="64" cy="17" r="6" fill="#22c55e"/>
+  <text x="420" y="21" font-size="11" fill="#94a3b8" text-anchor="middle" font-family="system-ui, sans-serif">aih — hemaguide 真实运行实录（输出取自本仓库实测，个别长行截断）</text>
+
+  <g font-size="11.5" fill="#e2e8f0">
+    <!-- CLI score -->
+    <text x="20" y="62"><tspan fill="#4ade80">$</tspan> node examples/hemaguide/bin/hemaguide.mjs score '{"variants":[{"gene":"TP53","aa_change":"p.Arg273His"}]}'</text>
+    <text x="20" y="82" fill="#94a3b8">{</text>
+    <text x="36" y="100"><tspan fill="#7dd3fc">"ok"</tspan>: true,</text>
+    <text x="36" y="118"><tspan fill="#7dd3fc">"reports"</tspan>: [ {</text>
+    <text x="52" y="136"><tspan fill="#7dd3fc">"gene"</tspan>: <tspan fill="#fcd34d">"TP53"</tspan>,  <tspan fill="#7dd3fc">"aa_change"</tspan>: <tspan fill="#fcd34d">"p.Arg273His"</tspan>,</text>
+    <text x="52" y="154"><tspan fill="#7dd3fc">"criteria_met"</tspan>: [</text>
+    <text x="68" y="172">{ <tspan fill="#7dd3fc">"code"</tspan>: <tspan fill="#fcd34d">"OP4"</tspan>, <tspan fill="#7dd3fc">"points"</tspan>: 1, <tspan fill="#7dd3fc">"description"</tspan>: <tspan fill="#fcd34d">"Rare: MAF=0.000005 (&lt;0.01%)"</tspan> },</text>
+    <text x="68" y="190">{ <tspan fill="#7dd3fc">"code"</tspan>: <tspan fill="#fcd34d">"OS3"</tspan>, <tspan fill="#7dd3fc">"points"</tspan>: 4, <tspan fill="#7dd3fc">"description"</tspan>: <tspan fill="#fcd34d">"Hotspot evidence (OS3)"</tspan> },</text>
+    <text x="68" y="208">{ <tspan fill="#7dd3fc">"code"</tspan>: <tspan fill="#fcd34d">"OS2"</tspan>, <tspan fill="#7dd3fc">"points"</tspan>: 4, <tspan fill="#7dd3fc">"description"</tspan>: <tspan fill="#fcd34d">"Functional evidence for TP53"</tspan> },</text>
+    <text x="68" y="226">{ <tspan fill="#7dd3fc">"code"</tspan>: <tspan fill="#fcd34d">"OP1"</tspan>, <tspan fill="#7dd3fc">"points"</tspan>: 1, <tspan fill="#7dd3fc">"description"</tspan>: <tspan fill="#fcd34d">"Computational prediction supports TP53"</tspan> }</text>
+    <text x="52" y="244">],</text>
+    <text x="52" y="262"><tspan fill="#7dd3fc">"total_points"</tspan>: <tspan fill="#fcd34d" font-weight="700">10</tspan>,</text>
+    <text x="52" y="280"><tspan fill="#7dd3fc">"classification"</tspan>: <tspan fill="#4ade80" font-weight="700">"Oncogenic"</tspan></text>
+    <text x="36" y="298">] },</text>
+    <text x="36" y="316"><tspan fill="#7dd3fc">"summary"</tspan>: <tspan fill="#fcd34d">"TP53 p.Arg273His → Oncogenic (10)"</tspan></text>
+    <text x="20" y="334" fill="#94a3b8">}</text>
+
+    <!-- workflow -->
+    <text x="20" y="366"><tspan fill="#4ade80">$</tspan> node cli/dist/index.js workflow run hemaguide --dev --yes</text>
+    <text x="20" y="386"><tspan fill="#4ade80">✓</tspan> extract (1 attempt(s), 1 call(s), 27073ms)</text>
+    <text x="20" y="404"><tspan fill="#4ade80">✓</tspan> route (1 attempt(s), 1 call(s), 80031ms)</text>
+    <text x="20" y="422"><tspan fill="#4ade80">✓</tspan> evidence (1 attempt(s), 1 call(s), 11717ms)</text>
+    <text x="20" y="440"><tspan fill="#4ade80">✓</tspan> synthesize (1 attempt(s), 1 call(s), 30032ms)</text>
+    <text x="20" y="458" fill="#4ade80" font-weight="700">workflow ok — 4 phase(s), 148853ms</text>
+
+    <!-- PHI gate -->
+    <text x="20" y="490"><tspan fill="#4ade80">$</tspan> <tspan fill="#64748b"># extension 工具 + PHI 安全门（tool:before 钩子）</tspan></text>
+    <text x="20" y="510">&gt; hemaguide_retrieve { "query": "patient with SSN 123-45-6789 …" }</text>
+    <text x="20" y="528"><tspan fill="#f87171">✗ blocked</tspan> — PHI safety gate: direct patient identifiers (SSN / patient-id / DOB / email). De-identify first.</text>
+    <text x="20" y="546">&gt; hemaguide_retrieve { "query": "relapsed AML TP53 complex karyotype" }  <tspan fill="#4ade80">✓ AML-002 (12.98) · AML-001 (1.56) · AML-003 (1.48)</tspan></text>
+  </g>
+</svg>
