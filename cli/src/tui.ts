@@ -1162,7 +1162,15 @@ constructor(opts: TuiOptions) {
     }
     if (this.#question) {
       if (this.#inPaste && (ch === "\x1b" || this.#held)) {
-        // let the paste terminator sequence complete via the escape machine
+        // Mid-paste escape machinery: RUN the escape machine so the paste-end
+        // terminator (ESC [ 2 0 1 ~) is actually parsed and `#inPaste` clears.
+        // The old empty fall-through never invoked the machine, so the ESC
+        // byte was dropped and the remaining "[201~" bytes were treated as
+        // ordinary paste content — they leaked into the answer buffer AND
+        // `#inPaste` stayed true forever, which swallowed Enter (became a
+        // space) and Ctrl+C (ignored by #pasteChar) — a stuck prompt.
+        this.#escapeSeq(ch);
+        return;
       } else if (ch === "\x1b" || this.#held) {
         // Escape sequence (scroll keys, arrows, mouse) — do NOT swallow its
         // bytes as answer text; run the escape machine so the user can still

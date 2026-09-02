@@ -2408,6 +2408,48 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // Question prompt + bracketed paste (Ctrl+Shift+V) — the paste-end terminator
+  // must be parsed (clearing #inPaste) and must never leak "[201~" into the
+  // answer. Regression: the mid-paste ESC fell through an empty branch that
+  // never ran the escape machine, so "[201~" leaked into the answer, #inPaste
+  // stayed true forever, Enter became a space (could not submit) and Ctrl+C
+  // was swallowed by #pasteChar (could not cancel) — a stuck prompt.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const p = tui.askQuestion("API key:");
+  tui.feed("\x1b[200~sk-abc123\x1b[201~"); // bracketed paste of the key
+  tui.feed("\r"); // Enter submits
+  const answer = await Promise.race([
+    p,
+    new Promise((r) => setTimeout(() => r("TIMEOUT"), 400)),
+  ]);
+  assert(answer === "sk-abc123", `paste into question submits cleanly, no "[201~" leak (got "${answer}")`);
+  // Ctrl+C cancels after a paste (inPaste must have cleared).
+  const p2 = tui.askQuestion("API key:");
+  tui.feed("\x1b[200~sk-xyz\x1b[201~");
+  const o2 = await Promise.race([
+    p2.then(() => "resolved").catch(() => "cancelled"),
+    new Promise((r) => setTimeout(() => r("TIMEOUT"), 400)),
+  ]);
+  assert(o2 === "TIMEOUT", "paste alone does not resolve or reject the question");
+  tui.feed("\x03"); // Ctrl+C
+  const o3 = await Promise.race([
+    p2.then(() => "resolved").catch(() => "cancelled"),
+    new Promise((r) => setTimeout(() => r("TIMEOUT"), 400)),
+  ]);
+  assert(o3 === "cancelled", "Ctrl+C cancels the question after a bracketed paste");
+  console.log("ok: question + bracketed paste (Ctrl+Shift+V) submits/cancels cleanly");
+}
+
+{
   // P#35 — Alt+Up recalls the last queued message back into the editor.
   const { Tui } = await import("./tui.js");
   const lines: string[] = [];

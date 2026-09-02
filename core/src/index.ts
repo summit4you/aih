@@ -73,6 +73,7 @@ export {
   COMPACT_CONTINUE_PROMPT,
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
+  TRUNCATED_RETRY_PROMPT,
   STREAM_RESUME_PROMPT,
   buildGoalJudgePrompt,
   buildBranchDistillPrompt,

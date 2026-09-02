@@ -1,11 +1,15 @@
 import type { LLMAdapter } from "./seams/llm.js";
 import { QuotaError, StallError } from "./seams/llm-sse.js";
-import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT } from "./prompts.js";
+import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT, TRUNCATED_RETRY_PROMPT } from "./prompts.js";
 import type { LoopObserver } from "./observers.js";
 import { LoopAbort, notifyObservers } from "./observers.js";
 
 /** Max consecutive empty responses (no text + no tool call) we nudge the model to retry before ending the turn. */
 const MAX_EMPTY_RETRIES = 2;
+/** Bounded re-issues after a length-truncated response (repetition loop hit the
+ *  output ceiling). opencode parity: the turn survives a truncated call so the
+ *  model can correct itself; beyond this bound the turn ends with max_tokens. */
+const MAX_TRUNCATED_RETRIES = 2;
 
 /**
  * CC#49 — max stream-stall resumes per turn (partial content + "continue"
@@ -545,6 +549,8 @@ export class AgentLoop {
     // task mid-turn and return nothing; nudge them to continue a bounded
     // number of times before giving up (see MAX_EMPTY_RETRIES).
     let emptyRetries = 0;
+    // Bounded re-issues after a length-truncated response (see MAX_TRUNCATED_RETRIES).
+    let truncatedRetries = 0;
     // CC#49 — bounded stream-stall resumes for this turn.
     let stallResumes = 0;
     // CC#51 — bounded quota-exhaustion waits for this turn.
@@ -552,6 +558,11 @@ export class AgentLoop {
 
     while (steps < this.#maxSteps && !ac.signal.aborted) {
       steps += 1;
+      // `truncated` reflects the LAST response only: a mid-turn truncation that
+      // the model recovers from (bounded re-issue) must not poison the final
+      // stopReason — only a turn whose last response was cut short ends as
+      // "max_tokens".
+      truncated = false;
       // Pre-flight compact: if context is already above the threshold before
       // the first LLM call, compact now. This prevents sending oversized
       // prompts that cause provider 503/timeout (observed when context is
@@ -781,6 +792,19 @@ export class AgentLoop {
           const c = await this.#compactOrSkip(turnId);
           if (c.usage) usage = addUsage(usage, c.usage);
           if (c.applied) contextNow = this.#estimateContext();
+        }
+        // Bounded re-issue (opencode parity): inject a corrective nudge and
+        // let the model retry with shorter arguments instead of killing the
+        // whole turn. A repetition loop (e.g. a provider-list regex repeating
+        // one token thousands of times) should cost the model one correction,
+        // not the user's turn. Beyond the bound, fall through to ending the
+        // turn with stopReason "max_tokens" (truncated already true).
+        // Text-only truncations have no call to re-issue — the retry loop
+        // would only burn empty responses — so they end the turn directly.
+        if (response.toolCalls.length > 0 && truncatedRetries < MAX_TRUNCATED_RETRIES) {
+          truncatedRetries += 1;
+          this.#log.append({ type: "user/message", turnId, text: TRUNCATED_RETRY_PROMPT });
+          continue;
         }
         break;
       }

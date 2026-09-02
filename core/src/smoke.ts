@@ -21,6 +21,7 @@ import {
   COMPACT_CONTINUE_PROMPT,
   MAX_STEPS_PROMPT,
   EMPTY_RETRY_PROMPT,
+  TRUNCATED_RETRY_PROMPT,
   STREAM_RESUME_PROMPT,
   isQuotaExhaustion,
   QuotaError,
@@ -1622,14 +1623,22 @@ assert(genuineNudges.length === 0, "a non-empty final answer is not nudged");
 
 const truncTools = new ToolRegistry(gate);
 truncTools.register(echo);
+// Bounded re-issue (opencode parity): a length-truncated response injects a
+// corrective nudge and lets the model retry instead of killing the turn.
+// Script: attempt 1 truncates mid-call → rejected + nudge; attempt 2 issues a
+// clean call → executes → ends the turn normally.
+const truncLog = new SessionLog();
 const truncLoop = new AgentLoop({
   llm: new MockLLM([
     { text: "half", toolCalls: [toolCall("t1", "echo", { text: "x" })], stopReason: "tool_use", finishReason: "length" },
+    { text: "clean re-issue", toolCalls: [toolCall("t2", "echo", { text: "y" })], stopReason: "tool_use" },
+    { text: "done", stopReason: "end_turn" },
   ]),
   tools: truncTools,
+  log: truncLog,
 });
 const truncResult = await truncLoop.send("go");
-assert(truncResult.stopReason === "max_tokens", "finish_reason=length ends the turn as max_tokens");
+assert(truncResult.stopReason === "end_turn", "one truncation does not kill the turn — model re-issues and finishes");
 const truncEvents = truncLoop.log.all();
 const t1 = truncEvents.find((e) => e.type === "tool/result" && e.callId === "t1") as
   | Extract<SessionEvent, { type: "tool/result" }>
@@ -1637,6 +1646,14 @@ const t1 = truncEvents.find((e) => e.type === "tool/result" && e.callId === "t1"
 assert(
   !!t1 && t1.ok === false && String(t1.error).includes("re-issue"),
   "truncated step's tool call is failed with a re-issue hint (never executed)",
+);
+assert(
+  truncEvents.some((e) => e.type === "user/message" && e.text === TRUNCATED_RETRY_PROMPT),
+  "a corrective nudge is injected after the truncated response",
+);
+assert(
+  truncEvents.some((e) => e.type === "tool/result" && e.callId === "t2" && e.ok),
+  "the re-issued call executes normally after the nudge",
 );
 {
   // Pairing invariant: every tool/call in a log has exactly one tool/result.
@@ -1651,6 +1668,23 @@ assert(
     "length-truncation leaves no orphaned tool calls (call↔result pairing intact)",
   );
 }
+// Repetition loop: if the model keeps truncating, the re-issues are bounded —
+// after MAX_TRUNCATED_RETRIES nudges the turn ends with max_tokens.
+const loopLog = new SessionLog();
+const loopTrunc = await new AgentLoop({
+  llm: new MockLLM([
+    { text: "h1", toolCalls: [toolCall("r1", "echo", { text: "x" })], stopReason: "tool_use", finishReason: "length" },
+    { text: "h2", toolCalls: [toolCall("r2", "echo", { text: "x" })], stopReason: "tool_use", finishReason: "length" },
+    { text: "h3", toolCalls: [toolCall("r3", "echo", { text: "x" })], stopReason: "tool_use", finishReason: "length" },
+  ]),
+  tools: truncTools,
+  log: loopLog,
+}).send("go");
+assert(loopTrunc.stopReason === "max_tokens", "a persistent repetition loop still ends as max_tokens");
+assert(
+  loopLog.all().filter((e) => e.type === "user/message" && e.text === TRUNCATED_RETRY_PROMPT).length === 2,
+  "re-issue nudges are bounded to MAX_TRUNCATED_RETRIES (2)",
+);
 const plainTrunc = await new AgentLoop({
   llm: new MockLLM([{ text: "cut off mid-sentence", stopReason: "end_turn", finishReason: "length" }]),
   tools: truncTools,

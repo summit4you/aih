@@ -179,6 +179,21 @@ export const EMPTY_RETRY_PROMPT =
   "make progress, or reply with a short text answer.";
 
 /**
+ * Truncation retry — injected after a length-truncated response whose tool
+ * calls were rejected (arguments may have been cut mid-JSON). Tells the model
+ * to re-issue the call with compact arguments instead of ending the turn
+ * (opencode parity: the harness keeps the turn alive and lets the model
+ * correct itself; a repetition loop that hits the token ceiling should not
+ * abort the whole turn). Bounded by MAX_TRUNCATED_RETRIES in agent-loop.
+ */
+export const TRUNCATED_RETRY_PROMPT =
+  "[harness] Your previous response hit the output token limit mid-call, so its tool " +
+  "calls were rejected (arguments may have been truncated). The calls were NOT executed. " +
+  "Re-issue the call with SHORTER arguments: avoid huge literal lists/repetitions — " +
+  "use a broader pattern, pagination, or multiple smaller calls instead. " +
+  "Do not repeat the same oversized call.";
+
+/**
  * CC#49 — shown after a stream stall that cut off a partial assistant answer.
  * The partial text was already appended to the transcript; this asks the
  * model to continue WITHOUT repeating what it already said (honest resume,
