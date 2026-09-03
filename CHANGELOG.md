@@ -47,6 +47,12 @@ the versions listed here (`scripts/package` derives the version from
   Also refreshed the committed snapshot (27 → 7408 entries, adds
   glm-5.3*/deepseek-v4* windows and prices). (`cli/src/cost.ts`,
   `cli/src/index.ts`, `scripts/model-metadata.snapshot.json`)
+- **TUI side panel truncated the cost/throughput row**: the CONTEXT panel
+  joined cost + tok/s + stream tok/s + CH% into one dot-joined line that
+  overflowed the ~24-32 col panel and cut off mid-number. Layout is now:
+  cost on its own line, the two throughput figures sharing the next
+  (`N tok/s · stream M tok/s`), cache rate on its own line. Adds
+  `Tui.panelLinesForTest()` + 9 smoke assertions. (`cli/src/tui.ts`)
 
 ## [0.5.0] - 2026-09-02
 
