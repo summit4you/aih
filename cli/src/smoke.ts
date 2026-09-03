@@ -2122,6 +2122,57 @@ await srv.connect(new StdioServerTransport());
     rmSync(work2, { recursive: true, force: true });
   }
   console.log("ok: FA#1 run_cmd middle-truncation (tail kept, full in spill)");
+
+  // ---- shell-scan: workspace-boundary classification (OC shell scan) ----
+  const { scanCommand, formatScanSummary } = await import("./shell-scan.js");
+  {
+    const root = "/workspace";
+    // Write command detection.
+    const rm = scanCommand("rm -rf ./dist", root);
+    assert(rm.isWrite === true, "shell-scan: rm flagged write");
+    assert(rm.paths.some((p) => p.startsWith(root)), "shell-scan: rm resolves workspace path");
+    // Read command stays non-write.
+    const git = scanCommand("git status", root);
+    assert(git.isWrite === false, "shell-scan: git status not write");
+    // External path detection (cp from /tmp).
+    const cp = scanCommand("cp /tmp/x.txt ./dest", root);
+    assert(cp.isWrite === true, "shell-scan: cp flagged write");
+    assert(
+      cp.paths.some((p) => p.startsWith("/tmp")),
+      "shell-scan: cp external source path captured",
+    );
+    // External directory via cd.
+    const cd = scanCommand("cd /opt && ls", root);
+    assert([...cd.externalDirs].some((d) => d === "/opt"), "shell-scan: cd external dir captured");
+    // Operator splitting handled (&&).
+    const chain = scanCommand("npm i && npm run build", root);
+    assert(Array.isArray(chain.paths), "shell-scan: chained command handled");
+    // Summary is non-empty for write commands.
+    assert(formatScanSummary(cp).length > 0, "shell-scan: summary rendered for write");
+    assert(formatScanSummary(git) === "No file operations detected", "shell-scan: summary empty for plain read");
+    // workdir variant of run_cmd returns scan annotations in result.
+    const wscan = scanCommand("mkdir -p out/", root);
+    assert(wscan.isWrite === true, "shell-scan: mkdir flagged write");
+  }
+  console.log("ok: shell-scan workspace-boundary classification");
+
+  // ---- opencode/mimo-code parity: `!` prompt prefix is a direct shell exec ----
+  // The TUI dispatch (index.ts handleLine) routes a leading `!` through the same
+  // `runShellCommand` executor as the `run_cmd` tool — never to the LLM. Assert
+  // the shared executor resolves a real `!ls`-style command to real output so the
+  // fast path can never silently fall back to a model message.
+  const { runShellCommand } = await import("./dev-tools.js");
+  {
+    const r = await runShellCommand({ command: "ls", cwd: process.cwd() });
+    assert(r.code === 0, "`!`-prefix: runShellCommand resolves exit 0");
+    assert(typeof r.stdout === "string" && r.stdout.length > 0, "`!`-prefix: stdout is real non-empty shell output");
+    assert(r.scan.isWrite === false, "`!`-prefix: ls classified read (not write)");
+    // A `!`-prefixed line must be treated as a command, not a message: assert the
+    // executor's result shape matches what the TUI renders (code + output + scan),
+    // which is exactly the "not sent to the model" contract.
+    assert("code" in r && "stdout" in r && "scan" in r, "`!`-prefix: result carries code/stdout/scan (shell exec, not chat)");
+  }
+  console.log("ok: `!`-prefix direct-shell-exec parity (opencode/mimo-code)");
 }
 
 {

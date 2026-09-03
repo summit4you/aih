@@ -7,12 +7,23 @@ import { publishFile } from "./atomic.js";
 import { buildChildEnv } from "./env-policy.js";
 import { formatAfterWrite } from "./formatter.js";
 import { resolveSandboxBackend } from "./sandbox.js";
+import { scanCommand, formatScanSummary } from "./shell-scan.js";
+import { generateShellDescription } from "./shell-prompt.js";
 import { CodeIntelPool, flattenDocumentSymbols, navtoLocate, navtreeToSymbols, pathToUri, uriToPath, openDocument } from "./codeintel.js";
 
 const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
 const CMD_TIMEOUT_DEFAULT_MS = Number(process.env.AIH_CMD_TIMEOUT_MS ?? "") || 120_000;
 const CMD_TIMEOUT_MAX_MS = 600_000;
+
+/** Detect the user's shell (for tool-description adaptation). */
+function detectShellName(): string {
+  const s = process.env.SHELL ?? "";
+  if (/powershell|pwsh/i.test(s)) return "powershell";
+  if (/zsh/i.test(s)) return "zsh";
+  if (/bash/i.test(s)) return "bash";
+  return s.split("/").pop() || "sh";
+}
 
 function safePath(cwd: string, p: string | undefined): string {
   const target = resolve(cwd, p ?? ".");
@@ -51,6 +62,98 @@ export function truncateMiddle(
     text: `${head}\n… ${elided} chars elided …\n${tail}`,
     truncated: true,
     elidedChars: elided,
+  };
+}
+
+/** Input for the shared shell executor (run_cmd tool + `!` prompt prefix). */
+export interface RunShellInput {
+  command: string;
+  /** workspace root */
+  cwd: string;
+  /** per-call working directory (resolved against cwd); falls back to cwd */
+  workdir?: string;
+  timeout_ms?: number;
+  sandbox?: string;
+  keep_output?: boolean;
+  output_path?: string;
+}
+
+/** Structured result of a shell execution (mirrors the run_cmd tool output). */
+export interface RunShellResult {
+  code: number;
+  timed_out: boolean;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  elided_chars: number;
+  sandbox: string;
+  output_file?: string;
+  output_bytes?: number;
+  /** shell-scan annotation: what the command touches. */
+  scan: {
+    isWrite: boolean;
+    externalDirs: string[];
+    touchedPaths: string[];
+    summary: string;
+  };
+}
+
+/**
+ * Shared shell executor — the real production path both the `run_cmd` tool and
+ * the TUI `!`-prefix fast path use. Runs the command through the selected
+ * sandbox backend with env-filtered children, enforces the timeout, applies
+ * in-band middle-truncation (FA#1, verdict tail preserved), and persists the
+ * full output on request (T#22). Co-located here so the tool and the prompt
+ * prefix can never drift.
+ */
+export async function runShellCommand(
+  input: RunShellInput,
+  cwd = process.cwd(),
+): Promise<RunShellResult> {
+  const command = String(input.command);
+  if (!command.trim()) throw new Error("command is required");
+  const dir = input.workdir ? safePath(cwd, input.workdir) : safePath(cwd, ".");
+  const timeoutMs = Math.min(
+    CMD_TIMEOUT_MAX_MS,
+    Math.max(1000, Number(input.timeout_ms ?? CMD_TIMEOUT_DEFAULT_MS) || CMD_TIMEOUT_DEFAULT_MS),
+  );
+  const scan = scanCommand(command, dir);
+  const backend = resolveSandboxBackend(input.sandbox ? String(input.sandbox) : undefined);
+  const { code, timed_out: killed, output } = await backend.run({
+    command,
+    cwd: dir,
+    env: buildChildEnv(),
+    timeoutMs,
+  });
+  let outputFile: string | undefined;
+  if (input.keep_output === true) {
+    const dest = input.output_path
+      ? safePath(cwd, String(input.output_path))
+      : join(cwd, ".aih", "outputs", `cmd-${Date.now()}-${randomUUID().slice(0, 8)}.log`);
+    try {
+      mkdirSync(resolve(dest, ".."), { recursive: true });
+      writeFileSync(dest, output);
+      outputFile = dest;
+    } catch {
+      /* keep_output is best-effort; the in-band stdout below still returns */
+    }
+  }
+  const { text: stdout, truncated, elidedChars } = truncateMiddle(output, MAX_OUT);
+  return {
+    code,
+    timed_out: killed,
+    stdout,
+    stderr: "",
+    truncated,
+    elided_chars: elidedChars,
+    sandbox: backend.name,
+    scan: {
+      isWrite: scan.isWrite,
+      externalDirs: [...scan.externalDirs],
+      touchedPaths: scan.paths.slice(0, 50),
+      summary: formatScanSummary(scan),
+    },
+    ...(outputFile ? { output_file: outputFile, output_bytes: Buffer.byteLength(output) } : {}),
   };
 }
 
@@ -148,11 +251,13 @@ export function registerDevTools(
 
   registry.register({
     name: "run_cmd",
-    description:
-      `Run a shell command in the workspace; returns merged stdout+stderr. Timeout default ${Math.round(CMD_TIMEOUT_DEFAULT_MS / 1000)}s ` +
-      "(pass timeout_ms up to 600s for installs). Backgrounded children (cmd &) keep running after return. " +
-      "Set keep_output=true to persist the FULL (uncapped) output to a file for external inspection (T#22). " +
-      "Pick an execution sandbox via `sandbox` (local | bwrap | remote; D#12) — default local.",
+    description: generateShellDescription({
+      cwd,
+      timeoutMs: CMD_TIMEOUT_DEFAULT_MS,
+      maxLines: 400,
+      maxBytes: MAX_OUT,
+      shellName: detectShellName(),
+    }),
     kind: "write",
     permission: "ask",
     parameters: {
@@ -160,6 +265,7 @@ export function registerDevTools(
       properties: {
         command: { type: "string", description: "command to run via sh -c" },
         cwd: { type: "string", description: "working directory" },
+        workdir: { type: "string", description: "working directory (alias for cwd; prefer this over cd)" },
         timeout_ms: { type: "number", description: `timeout in ms (default ${CMD_TIMEOUT_DEFAULT_MS}, max ${CMD_TIMEOUT_MAX_MS})` },
         keep_output: { type: "boolean", description: "persist the full (uncapped) output to .aih/outputs/ and return output_file (T#22)" },
         output_path: { type: "string", description: "explicit path for the kept output (overrides the default .aih/outputs/ location)" },
@@ -171,51 +277,24 @@ export function registerDevTools(
       const a = args as {
         command?: unknown;
         cwd?: unknown;
+        workdir?: unknown;
         timeout_ms?: unknown;
         keep_output?: unknown;
         output_path?: unknown;
         sandbox?: unknown;
       };
-      const dir = safePath(cwd, String(a.cwd ?? "."));
-      const timeoutMs = Math.min(
-        CMD_TIMEOUT_MAX_MS,
-        Math.max(1000, Number(a.timeout_ms ?? CMD_TIMEOUT_DEFAULT_MS) || CMD_TIMEOUT_DEFAULT_MS),
+      return runShellCommand(
+        {
+          command: String(a.command),
+          cwd,
+          workdir: a.workdir !== undefined ? String(a.workdir) : String(a.cwd ?? "."),
+          timeout_ms: Number(a.timeout_ms ?? undefined),
+          sandbox: a.sandbox !== undefined ? String(a.sandbox) : undefined,
+          keep_output: a.keep_output === true,
+          output_path: a.output_path !== undefined ? String(a.output_path) : undefined,
+        },
+        cwd,
       );
-      // D#12: run through the selected sandbox backend (default local).
-      const backend = resolveSandboxBackend(a.sandbox ? String(a.sandbox) : undefined);
-      const { code, timed_out: killed, output } = await backend.run({
-        command: String(a.command),
-        cwd: dir,
-        env: buildChildEnv(),
-        timeoutMs,
-      });
-      // T#22: keep_output persists the FULL (uncapped) output for external viewing.
-      let outputFile: string | undefined;
-      if (a.keep_output === true) {
-        const dest = a.output_path
-          ? safePath(cwd, String(a.output_path))
-          : join(cwd, ".aih", "outputs", `cmd-${Date.now()}-${randomUUID().slice(0, 8)}.log`);
-        try {
-          mkdirSync(resolve(dest, ".."), { recursive: true });
-          writeFileSync(dest, output);
-          outputFile = dest;
-        } catch {
-          /* keep_output is best-effort; the in-band stdout below still returns */
-        }
-      }
-      // FA#1 — middle-truncate (keep head + tail, elide the middle) so the
-      // verdict lines at the end of shell output survive the in-band cap.
-      const { text: stdout, truncated, elidedChars } = truncateMiddle(output, MAX_OUT);
-      return {
-        code,
-        timed_out: killed,
-        stdout,
-        stderr: "",
-        truncated,
-        elided_chars: elidedChars,
-        sandbox: backend.name,
-        ...(outputFile ? { output_file: outputFile, output_bytes: Buffer.byteLength(output) } : {}),
-      };
     },
   });
 

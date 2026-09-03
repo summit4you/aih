@@ -156,7 +156,7 @@ import {
 } from "./skills.js";
 import { isKnownSlashCommand } from "./slash.js";
 import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
-import { registerDevTools } from "./dev-tools.js";
+import { registerDevTools, runShellCommand } from "./dev-tools.js";
 import { extractShellContext, formatShellContext, describeCommand } from "./shell-context.js";
 import { detectShellErrors, formatFixBlock, errorBadge, summarizeErrors, type ShellError } from "./error-detect.js";
 import { classifyQuestionPrefix, buildQuestionContext, composeQuestionPrompt } from "./question.js";
@@ -215,7 +215,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.5.1";
+export const VERSION = "0.5.2";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -287,11 +287,12 @@ Options:
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
       --no-stream             buffer full responses instead of streaming
-      --no-dev              chat only: disable the default local toolset — dev tools
-                              (list_dir, read_file, write_file[ask], run_cmd[ask]) and
-                              general tools (edit, glob, grep, todo, question, task,
-                              webfetch, websearch, apply_patch) for chat; the one-shot
-                              run command keeps the whole set opt-in via --dev
+      --no-dev              disable the default local toolset (dev tools
+                              list_dir, read_file, write_file[ask], run_cmd[ask]
+                              plus general tools edit, glob, grep, todo, question,
+                              task, webfetch, websearch, apply_patch) for both
+                              chat and one-shot run (shell = run_cmd is on by
+                              default)
   -f, --format text|json      run output: human text or NDJSON event stream
       --no-audit              do not append tool calls to .aih/tool-audit.jsonl
                                (on by default; every invocation is recorded with ok/error)
@@ -1275,7 +1276,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     // IT#1 — resolve the live session log at call time (created after the
     // registry); absent → shell_context reports "not wired".
     const logRef: { current: { all: () => readonly SessionEvent[] } | null } = { current: null };
-    if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
+    if (!bool(flags, "no-dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
     attachAudit(registry, flags);
 
     const log = loadSession(sessionPath);
@@ -1502,7 +1503,7 @@ async function cmdWorkflow(
       // IT#1 — resolve the live session log at call time (created after the
       // registry); absent → shell_context reports "not wired".
       const logRef: { current: { all: () => readonly SessionEvent[] } | null } = { current: null };
-      if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
+      if (!bool(flags, "no-dev")) registerLocalTools(registry, flags, gate, { current: null }, false, logRef);
       attachAudit(registry, flags);
       const log = loadSession(sessionPath);
       logRef.current = log; // IT#1 — shell_context now resolves the live log
@@ -2036,6 +2037,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     onLine: handleLine,
     onLineBusy: (line) => {
       const t = line.trim();
+      // `!`-prefixed lines are direct shell commands (opencode/mimo-code parity):
+      // they must execute immediately even mid-turn, never be steered into the
+      // running loop as a message. Returning false lets them fall through to
+      // handleLine's `!` branch, which runs the shell exec directly.
+      if (t.startsWith("!")) return false;
       // Slash commands need a quiet session — keep the queued fallback for
       // them. Known slash only: unknown "/..." is a message and gets steered.
       if (!t || isKnownSlash(t)) return false;
@@ -2539,6 +2545,49 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   async function handleLine(line: string): Promise<void> {
     const input = line.trim();
     if (!input) return;
+
+    // Opencode/mimo-code parity: a prompt starting with `!` is a direct shell
+    // command, executed here through the same `runShellCommand` path as the
+    // `run_cmd` tool (sandbox + env-filter + timeout + middle-truncation) —
+    // it is NEVER sent to the LLM. The command + output are rendered in the
+    // TUI as a shell execution. `!!` alone re-runs nothing; a bare `!` shows
+    // usage. `!` is only special as the leading character (a `!` later in the
+    // line is normal text).
+    if (input.startsWith("!")) {
+      const cmd = input.slice(1);
+      if (!cmd.trim()) {
+        tui.pushSystem("usage: !<shell command> — run the command directly (e.g. `!ls -la`); not sent to the model");
+        return;
+      }
+      tui.push({ role: "user", text: `! ${cmd}` });
+      const started = Date.now();
+      const callId = `bang-${started.toString(36)}`;
+      const turnId = "shell-bang";
+      // Record as a run_cmd tool/call + tool/result so the existing IT#1
+      // (/shell) and IT#2 (/fix) shell-context machinery picks it up exactly
+      // like an agent-invoked run_cmd — no separate side-channel to reconcile.
+      log.append({ type: "tool/call", turnId, callId, name: "run_cmd", args: { command: cmd, cwd: process.cwd() } });
+      try {
+        const r = await runShellCommand({ command: cmd, cwd: process.cwd() });
+        log.append({ type: "tool/result", turnId, callId, ok: true, result: r });
+        const durMs = Date.now() - started;
+        const icon = r.code === 0 && !r.timed_out ? "✓" : r.timed_out ? "↯" : "✗";
+        const out = r.stdout && r.stdout.trim() ? r.stdout : "(no output)";
+        const meta: string[] = [];
+        if (r.timed_out) meta.push(`timed out (${Math.round(durMs / 1000)}s)`);
+        else meta.push(`exited ${r.code} in ${(durMs / 1000).toFixed(1)}s`);
+        if (r.truncated) meta.push("output truncated — append keep_output (e.g. `!ls | tee /x`) or use run_cmd keep_output=true for the full log");
+        if (r.scan?.externalDirs?.length) meta.push(`touches outside workspace: ${r.scan.externalDirs.join(", ")}`);
+        tui.push({ role: "tool", text: out, tool: { name: "shell", args: `! ${cmd}`, callId, ok: r.code === 0 } });
+        tui.pushSystem(`${icon} ${cmd} · ${meta.join(" · ")}`);
+      } catch (err) {
+        log.append({ type: "tool/result", turnId, callId, ok: false, error: err instanceof Error ? err.message : String(err) });
+        tui.pushError(`failed to run \`${cmd}\`: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      store?.save(log);
+      tui.requestPaint();
+      return;
+    }
 
     tui.push({ role: "user", text: line });
 
@@ -3425,7 +3474,7 @@ async function cmdTools(flags: Record<string, string | boolean>) {
     const gate = makeBaseGate(flags);
     const registry = new ToolRegistry(gate);
     for (const def of await backend.listTools()) registry.register(def);
-    if (bool(flags, "dev")) registerLocalTools(registry, flags, gate, { current: null });
+    if (!bool(flags, "no-dev")) registerLocalTools(registry, flags, gate, { current: null });
     const tools = registry.schemas().map((s) => ({
       name: s.name,
       kind: registry.get(s.name)?.kind ?? "read",

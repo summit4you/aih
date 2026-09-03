@@ -6,6 +6,41 @@ All notable changes to AIH are documented in this file. The format is based on
 the versions listed here (`scripts/package` derives the version from
 `cli/src/index.ts` → `VERSION`).
 
+## [Unreleased]
+
+## [0.5.2] - 2026-09-03
+
+### Added
+- **Shell execution for `aih run` on by default (opencode parity)**: the `run_cmd`
+  shell tool (plus the rest of the local coding toolset) is now registered by
+  default for `aih run`, `aih chat`, and `aih tools` — no `--dev` flag required.
+  `--no-dev` disables it uniformly on all three paths. Previously the one-shot
+  `run` command kept the whole set opt-in via `--dev`.
+  (`cli/src/index.ts`)
+- **Command workspace-boundary analysis (`shell-scan`)**: `run_cmd` now pre-analyzes
+  each command for file-system writes and workspace-external paths (inspired by
+  opencode's tree-sitter shell tool, dependency-free regex version). Detects write
+  operations (`rm`/`mv`/`cp`/`mkdir`/`chmod`/`git add`…), resolves relative/`~`
+  paths against the workspace, and flags external directories. The scan result
+  (`isWrite`, `externalDirs`, `touchedPaths`) is surfaced in the tool result; a
+  human-readable summary is attached. (`cli/src/shell-scan.ts`)
+- **Shell-aware tool description (`shell-prompt`)**: `run_cmd`'s description now
+  adapts to the detected OS/shell and documents workdir/timeout/keep_output all in
+  one place, plus guidance to prefer dedicated tools over shell file ops.
+  (`cli/src/shell-prompt.ts`)
+- **TUI `!` prefix directly runs shell commands (opencode/mimo-code parity)**:
+  typing `!ls` in the input line executes `ls` locally through the same
+  `runShellCommand` executor as the `run_cmd` tool (sandbox + env filter + timeout
+  + middle-truncation) — it is **never sent to the LLM**. Runs even mid-turn
+  (not steered), and is recorded as `run_cmd` tool/call+result events so the
+  existing `/shell` (IT#1) and `/fix` (IT#2) shell-context machinery picks it up.
+  (`cli/src/index.ts`) — mirrors opencode/mimo-code's `!` shell mode and codex's
+  `!` prefix direct-exec "You ran" behavior.
+
+### Changed
+- `run_cmd` gains a `workdir` parameter (alias recommended over `cd`; `cwd` kept
+  for backward compatibility).
+
 ## [0.5.1] - 2026-09-02
 
 ### Added

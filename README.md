@@ -110,7 +110,7 @@ aih attach http://127.0.0.1:8787       # 从另一台机器 attach 一个 REPL
 
 - **build**：默认，全量工具权限用于开发
 - **plan**：只读分析模式，全部 `kind=write` 工具从注册表隐藏
-  （含 `--dev` 的 write_file/run_cmd），meta 行显示 `plan · …`（黄色）
+  （含 write_file/run_cmd），meta 行显示 `plan · …`（黄色）
 
 Tab（无补全时）或 `/mode <build|plan>` 切换。
 
@@ -234,6 +234,25 @@ Intelligent Terminal "type `?` + prompt, injects active pane context"）。纯 s
 - **`buildQuestionContext`**：复用 IT#1 shell-context 组装上下文块（最近 shell 输出 +
   cwd + 活动 session）；空 log → 仅 cwd，不注入噪声。
 - **`composeQuestionPrompt`**：上下文块 + `Task: <prompt>` 合成单条 prompt 送 agent。
+
+### `!` 前缀直接执行 shell 命令（opencode / mimo-code parity）
+
+TUI 输入行以 **`!`** 开头即作为**直接 shell 命令**就地执行（opencode/mimo-code 的
+"Start a message with `!` to run shell commands directly (e.g. `!ls -la`)"），
+**绝不发给 LLM**——`!ls` 就是在终端跑 `ls` 并回显输出：
+
+- **统一执行器**：与 `run_cmd` 工具共用 `runShellCommand`（`cli/src/dev-tools.ts`）——
+  同一条 sandbox + env 过滤 + 超时 + 中间折叠管线，工具与输入前缀永不漂移。
+- **busy 也执行**：turn 运行中输入 `!cmd` 依旧直接执行（opencode/codex 行为），
+  不会被 steer 成给正在运行的 turn 的注入消息。
+- **进入会话历史**：以 `run_cmd` 的 `tool/call` + `tool/result` 事件落盘，因此被复用
+  现有 IT#1（`/shell`）与 IT#2（`/fix`）的 shell 上下文机制——无需另开旁路。
+- **裸 `!`** 显示用法；`!` 仅作为**行首**字符特殊（行中 `!` 仍是普通文本）。
+
+参考实现对照（三仓实读）：opencode/mimo-code 用输入框 **keybind**（光标在位置 0 时按
+`!` 进入 shell mode，Enter 提交经 `session.shell()` 端点执行）；codex 用 `!` 前缀直接
+执行并把输出标为 **"You ran"** 进对话。AIH 取中点——行首 `!` 提交时原生执行，交互直觉
+与 codex 一致，执行器与 opencode 的 sandbox/env/timeout 对齐。
 
 ### 多 agent 会话管理面板（IT#4）
 
@@ -1066,7 +1085,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 运行形态 | Web UI（`npx @deepseek-ai/dsh web`，默认 127.0.0.1:3080） | TUI / CLI / 桌面 App | TUI / CLI（fork 自 opencode） | 仓库模板（配合 codex/claude 使用） | TUI / CLI / SDK，另提供 MCP server 外挂应用 |
 | 与 MCP 的关系 | 插件生态（含 MCP 能力） | 作为 MCP client 消费外部工具 | 同 opencode（MCP client） | 无（面向 codex 的 AGENTS.md 规约） | 自身即 MCP server，可被 opencode / codex / claude code 等消费 |
 | 权限模型 | 插件级权限声明 | 按 agent（build/plan）分档 + 规则审批（含 doom_loop 行为级守卫） | 同 opencode（fork 继承），面向企业加固 | `verification.default/handoff` 门禁 | 工具级 allow/ask/deny 三档 + ApprovalGate 可插拔审批 |
-| 接入业务应用 | 写插件 | 写 MCP server / 工具 | 写 MCP server / 工具 | 写 AGENTS.md / harness.yml | 内置通用编码工具集（`--dev`：read/write/edit/glob/grep/run_cmd/apply_patch/搜索/子代理）+ 实现 AppAdapter 接入业务应用 |
+| 接入业务应用 | 写插件 | 写 MCP server / 工具 | 写 MCP server / 工具 | 写 AGENTS.md / harness.yml | 内置通用编码工具集（默认开：read/write/edit/glob/grep/run_cmd/apply_patch/搜索/子代理；`--no-dev` 关）+ 实现 AppAdapter 接入业务应用 |
 | 会话与审计 | Session Log（模型可见即可回放） | 会话持久化 + LSP 上下文 | 同 opencode + 企业审计 | 决策日志 docs/decisions.md | append-only JSONL SessionEvent + 工具审计 |
 | 协议 | MIT | MIT | MIT（opencode 的 fork） | MIT | MIT |
 
