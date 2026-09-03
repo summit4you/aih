@@ -2847,6 +2847,56 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // F#30 side panel — cost and throughput must NOT share one line: the panel
+  // is ~24-32 cols wide and a combined "cost … · N tok/s · stream M tok/s"
+  // row truncates mid-number. Layout: cost line, then one "N tok/s · stream
+  // M tok/s" line, then cache-hit rate.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "glm-5.3-flash", provider: "empero" }),
+    cwd: "/tmp",
+    statusLeft: "",
+    statusRight: "",
+    busy: () => false,
+    onLine: () => {},
+    ctxUsage: () => ({ used: 250000, limit: 1000000, cost: 0.0123, tps: 142.8, stps: 38.5, cacheRate: 0.412 }),
+  });
+  const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const panel = tui.panelLinesForTest(30).map(strip);
+  const costIdx = panel.findIndex((l) => l.startsWith("cost "));
+  const speedIdx = panel.findIndex((l) => l.includes("tok/s"));
+  assert(costIdx >= 0, "F#30 panel: cost line present");
+  assert(panel[costIdx] === "cost 0.01", `F#30 panel: cost alone on its line (got ${panel[costIdx]})`);
+  assert(speedIdx === costIdx + 1, `F#30 panel: throughput directly under cost (got gap ${speedIdx - costIdx})`);
+  assert(
+    panel[speedIdx] === "143 tok/s · stream 38.5 tok/s",
+    `F#30 panel: tps + stream tps share ONE line (got ${panel[speedIdx]})`,
+  );
+  assert(panel.some((l) => l === "CH 41%"), "F#30 panel: cache rate on its own line");
+  assert(
+    panel.every((l) => l.length <= 30),
+    `F#30 panel: every line fits the 30-col panel (longest ${Math.max(...panel.map((l) => l.length))})`,
+  );
+  // absent metrics degrade independently (no empty stubs / no dangling "·")
+  const tui2 = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "",
+    statusRight: "",
+    busy: () => false,
+    onLine: () => {},
+    ctxUsage: () => ({ used: 1000, limit: 128000, cost: 0, tps: 90.55 }),
+  });
+  const panel2 = tui2.panelLinesForTest(30).map(strip);
+  assert(!panel2.some((l) => l.startsWith("cost")), "F#30 panel: zero cost omitted");
+  const tpsLine = panel2.find((l) => l.includes("tok/s"));
+  assert(tpsLine === "90.5 tok/s" || tpsLine === "90.6 tok/s", `F#30 panel: tps alone, no "stream" stub (got ${tpsLine})`);
+  assert(!panel2.some((l) => l.includes("CH ")), "F#30 panel: absent cache rate omitted");
+}
+
+{
   // sparkline: 8 steps, flat series mid-scale, fewer than 2 points = none
   const { Tui } = await import("./tui.js");
   assert(Tui.sparkline([1, 2, 3, 4, 5, 6, 7, 8]) === "▁▂▃▄▅▆▇█", "sparkline maps range to 8 blocks");

@@ -575,8 +575,7 @@ constructor(opts: TuiOptions) {
     const body: string[] = [];
     for (const u of this.#units()) {
       const lines = u.kind === "item" ? this.#block(u.item) : this.#groupLines(u);
-      for (const r of lines) body.push(r);
-    }
+      for (const r of lines) body.push(r);    }
     return body;
   }
 
@@ -1863,6 +1862,16 @@ constructor(opts: TuiOptions) {
     return success(bar);
   }
 
+  /**
+   * Side-panel lines at a given panel width (test hook — mirrors #panelLines,
+   * the private renderer used by #paint). Returns raw (styled) lines so tests
+   * can assert layout, e.g. the F#30 panel: cost on its own line, the two
+   * throughput figures sharing the next.
+   */
+  panelLinesForTest(pw: number): string[] {
+    return this.#panelLines(pw);
+  }
+
   #panelLines(pw: number): string[] {
     const lines: string[] = [];
     const ctx = this.#panelCtx();
@@ -1874,21 +1883,28 @@ constructor(opts: TuiOptions) {
       lines.push(this.#progressBar(pct, bw));
       const spark = Tui.sparkline(ctx.trend);
       lines.push(muted(`${this.#fmtTok(used)} / ${this.#fmtTok(ctx.limit)} · ${pct}%${spark ? `  ${spark}` : ""}`));
-      // F#30: cost + throughput (only when the model has a price table entry)
-      const extras: string[] = [];
-      if (typeof ctx.cost === "number" && ctx.cost > 0) {
-        extras.push(`cost ${ctx.cost < 0.01 ? `${ctx.cost.toFixed(4)}` : `${ctx.cost.toFixed(2)}`}`);
-      }
-      if (typeof ctx.tps === "number" && ctx.tps > 0) {
-        extras.push(`${ctx.tps >= 100 ? Math.round(ctx.tps) : ctx.tps.toFixed(1)} tok/s`);
-      }
-      if (typeof ctx.stps === "number" && ctx.stps > 0) {
-        extras.push(`stream ${ctx.stps >= 100 ? Math.round(ctx.stps) : ctx.stps.toFixed(1)} tok/s`);
-      }
+      // F#30: cost + throughput (only when the model has a price table entry).
+      // Layout: cost gets its own line; the two throughput figures share one
+      // ("N tok/s · stream M tok/s") — a single combined line overflows the
+      // narrow side panel and truncates mid-number.
+      const cost =
+        typeof ctx.cost === "number" && ctx.cost > 0
+          ? `cost ${ctx.cost < 0.01 ? ctx.cost.toFixed(4) : ctx.cost.toFixed(2)}`
+          : null;
+      const tps =
+        typeof ctx.tps === "number" && ctx.tps > 0
+          ? `${ctx.tps >= 100 ? Math.round(ctx.tps) : ctx.tps.toFixed(1)} tok/s`
+          : null;
+      const stps =
+        typeof ctx.stps === "number" && ctx.stps > 0
+          ? `stream ${ctx.stps >= 100 ? Math.round(ctx.stps) : ctx.stps.toFixed(1)} tok/s`
+          : null;
+      const speed = [tps, stps].filter(Boolean).join(" · ");
+      if (cost) lines.push(muted(cost));
+      if (speed) lines.push(muted(speed));
       if (typeof ctx.cacheRate === "number") {
-        extras.push(`CH ${Math.round(ctx.cacheRate * 100)}%`);
+        lines.push(muted(`CH ${Math.round(ctx.cacheRate * 100)}%`));
       }
-      if (extras.length) lines.push(muted(extras.join(" · ")));
       if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));
     }
     const todos = this.#panelTodos();
