@@ -2701,6 +2701,65 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // Bare-Esc residue in a question prompt — after a lone Esc the escape
+  // machine holds "\x1b" and used to eat the user's NEXT keypress as the
+  // double-Esc detector's timing sample: backspace looked dead, Tab looked
+  // dead, Enter had to be pressed twice. The follow-up byte must fall back
+  // to the answer handling instead.
+  const { Tui } = await import("./tui.js");
+  const mkTui = () =>
+    new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+  {
+    const tui = mkTui();
+    const p = tui.askQuestion("q:");
+    tui.feed("abcd");
+    tui.feed("\x1b"); // bare Esc
+    tui.feed("\x7f"); // backspace must work immediately after
+    tui.feed("\r");
+    const ans = await Promise.race([p.catch(() => "REJECTED"), new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+    assert(ans === "abc", `backspace works right after a bare Esc (got "${ans}")`);
+  }
+  {
+    const tui = mkTui();
+    const p = tui.askQuestion("q:");
+    tui.feed("ab");
+    tui.feed("\x1b");
+    tui.feed("\t"); // Tab is ignored, not leaked
+    tui.feed("\r"); // a single Enter submits (no double-press needed)
+    const ans = await Promise.race([p.catch(() => "REJECTED"), new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+    assert(ans === "ab", `single Enter submits after a bare Esc; Tab ignored (got "${ans}")`);
+  }
+  {
+    // Full sequences still complete and never leak into the answer.
+    const tui = mkTui();
+    const p = tui.askQuestion("q:");
+    tui.feed("ok");
+    tui.feed("\x1b[5~"); // PageUp
+    tui.feed("\r");
+    const ans = await Promise.race([p.catch(() => "REJECTED"), new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+    assert(ans === "ok", `PageUp sequence still swallowed (got "${ans}")`);
+  }
+  {
+    // Confirm prompt: Esc denies (was: eaten by the double-Esc detector,
+    // leaving the approval wedged).
+    const tui = mkTui();
+    const p = tui.askConfirm("allow?", "file.ts");
+    tui.feed("\x1b");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 400))]);
+    assert(out === "deny", `confirm Esc denies (got "${out}")`);
+  }
+  console.log("ok: bare-Esc residue no longer eats the next question/confirm key");
+}
+
+{
   // P#35 — Alt+Up recalls the last queued message back into the editor.
   const { Tui } = await import("./tui.js");
   const lines: string[] = [];

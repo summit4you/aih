@@ -1192,11 +1192,21 @@ constructor(opts: TuiOptions) {
       } else if (ch === "\x1b" || this.#held) {
         // Escape sequence (scroll keys, arrows, mouse) — do NOT swallow its
         // bytes as answer text; run the escape machine so the user can still
-        // scroll the transcript while a `question` prompt is open. Swallow
-        // the byte regardless: a completed sequence (e.g. PageUp scrolls)
-        // must not leak its final byte into the answer buffer.
+        // scroll the transcript while a `question` prompt is open.
+        //
+        // BUT a bare Esc's follow-up byte is NOT part of a sequence: the
+        // machine clears #held and consumes the byte as the double-Esc
+        // detector's timing sample. If we returned here, the user's NEXT real
+        // keypress (backspace / tab / Enter) would be the one swallowed — the
+        // observed "backspace doesn't work after Esc, need to press Enter
+        // twice" bug. When the machine consumed the held bare-Esc (held went
+        // from "\x1b" to "" on a non-escape byte), fall through to the answer
+        // handling below so that byte is processed as an answer key.
+        const heldBefore = this.#held;
         this.#escapeSeq(ch);
-        return;
+        if (ch === "\x1b" || this.#held) return;
+        if (!(heldBefore === "\x1b")) return;
+        // fall through: this byte belongs to the answer, not to a sequence
       }
       const done = this.#question;
       if (ch === "\r" || ch === "\n") {
@@ -1225,12 +1235,15 @@ constructor(opts: TuiOptions) {
         const roc = this.#confirmMode === "runorcopy";
         // IT#5 — run-or-copy keys: r=run(once), c=copy(always), n/no.
         // confirm keys (unchanged): y=once, a=always, n/deny.
+        // Esc denies: the footer advertises Esc as the cancel affordance and
+        // a bare Esc here used to fall through all branches and get eaten by
+        // the double-Esc detector, leaving the approval wedged.
         const accept = roc
           ? ch === "r" || ch === "R"
           : ch === "y" || ch === "Y";
         const secondary = roc ? ch === "c" || ch === "C" : ch === "a" || ch === "A";
         const refuse =
-          ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03";
+          ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03" || ch === "\x1b";
         if (accept) {
           done("once");
         } else if (secondary) {
