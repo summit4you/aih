@@ -8,6 +8,8 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-05
+
 ### Added
 - **MEA 独立判定层（LH#1 + CX-R#1 合并实施，roadmap 最高优先级项）**：融合
   LongHorizon Auditor 与 codex Guardian 双源，为 AIH 补齐此前未实施的"独立判定角色"。
@@ -24,6 +26,50 @@ the versions listed here (`scripts/package` derives the version from
     产出 AuditReport；只有 complete+contract_aligned+integrity≥0.9 才算 trusted state，
     缺缺失/阻塞则降级为 not-met 并注入续跑。交互 `/goal` 与 `aih run --goal` 两条路径均接入。
     （`cli/src/mea.ts`、`cli/src/index.ts`）
+- **Textual-grant bridge（`permissions` 工具）**：用户在对话里明确授权（"直接写"／
+  "不用确认"）时，模型现在调用 `permissions` 工具把授权转成**真实** allow 规则
+  （`SessionGate.grantRule`）——此前口头授权只是模型可见文本，gate 层继续逐条弹
+  "write command needs approval"。授权本身仍要过**一次**人工确认（模型不得单方面提权）；
+  `{"action":"status"}` 列出当前规则。系统提示新增 "Permission grants" 段规定只在
+  用户明说时授予。（`cli/src/gate.ts`、`cli/src/general-tools.ts`、`cli/src/index.ts`）
+- **CL-R#3 拒绝双段消息（cline 同构）**：所有权限拒绝 error 统一追加 REJECTION_SUFFIX
+  （"这不是工具或系统故障，请向用户澄清后再继续"），覆盖 permission=deny、ask 被拒
+  （含 doom-loop）、before-hook ask 被拒三个落点；Guardian deny notice 同步双段语义。
+  （`core/src/tool-registry.ts`、`cli/src/gate.ts`）
+- **KL-R#3 子代理权限传播（kilocode 同构）**：`RulesetGate.subagentGate()` —— 父 deny
+  规则传播到子代理、allow/ask 不传播；子代理内 write→deny（以 tool error 呈现，
+  拒绝≠终止）、read 放行。`SessionGate.denyRules()` + `makeSubagentGate` 供 task 与
+  best_of_n 共享；子代理注册表排除 best_of_n/todowrite（防递归/防改父 todo）。
+  （`core/src/seams/permissions.ts`、`cli/src/gate.ts`）
+- **RulesetGate.explain()**：返回最高优先级 winning rule，SessionGate deny 时透出
+  "denied by <file>"（规则来源可追溯）。（`core/src/seams/permissions.ts`、`cli/src/gate.ts`）
+
+### Changed
+- **OMP-R#1+OCL-R#4 重试升级**：`retryAfterHintFromHeaders()` 多源 hint 解析
+  （retry-after-ms / retry-after 秒或 HTTP-date / x-ratelimit-reset(-ms)，epoch 量级
+  区分，取最大值向上取整）；`QuotaError` 喂权威时序；`retryBackoffMs` 支持 floor——
+  服务器 hint 是下界，抖动严格向上（hint→hint×1.5，60s 封顶），无 hint 保持 ±25%
+  对称抖动。（`cli/src/seams/*`、`core/src/seams/llm-openai.ts`、`core/src/seams/llm-sse.ts`）
+- **OMP-R#7 memory 截断 marker**：fitBudget 截断时尾部附可行动提示
+  （edit .aih/memory.md or use /memory …）替代裸 (truncated)。（`cli/src/memory.ts`）
+- **OMP-R#10 replay-policy**：deriveMessages 过滤 turn/end stopReason 含
+  refusal/sensitive 的 turn 的 assistant 输出及其 tool 配对（避免孤儿 tool 消息触发
+  严格模板 400）。（`core/src/session-log.ts`）
+- **kl-R#5 截断 recovery 消息**（OMP turn-recovery 同构）：截断后的续跑指令升级。
+- **TUI footer hint 模式感知**：run-or-copy 确认（[R]un [C]opy [N]o）时底部提示同步
+  显示 `R run · C copy · N no`（此前硬编码 `y once · a always · n deny` 误导按键）。
+  （`cli/src/tui.ts`）
+
+### Fixed
+- **bare-Esc 残留不再吞掉下一个按键**：question 提示里按单次 Esc 后，escape 机的
+  `#held` 残留会把下一个 backspace/tab/回车当"双击检测的计时样本"吞掉（表现为
+  退格失灵、回车要按两次）；现在被消化裸 Esc 的跟随字节回退到答案处理；完整序列
+  （PageUp/方向键/鼠标）仍被正确吞掉。confirm 提示中 Esc = deny（footer 本就宣传
+  esc 取消，此前会卡死确认框）。（`cli/src/tui.ts`）
+- **sk- 脱敏形状收紧**：`/sk-[A-Za-z0-9_-]{8,}/` 会把 "auto-approve **ask-permission**
+  tools" 误判成 secret（模型读到 "a[REDACTED] tools"，之后 edit 用被污染文本做
+  old_string 失败 "old_string not found"）。现要求 20+ 连续 base62（无 -/_），
+  真实 OpenAI 风格 key 仍被脱敏。（`cli/src/hooks.ts`）
 
 ## [0.5.2] - 2026-09-03
 
