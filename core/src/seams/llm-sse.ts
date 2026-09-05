@@ -319,11 +319,15 @@ function mapUsage(u: SSEUsage): TokenUsage {
     Number(
       u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens ?? 0,
     );
+  // F#30 — cache WRITE tokens (Anthropic cache_creation_input_tokens analog,
+  // opencode Zen "缓存写入"): billed at a separate (higher) cacheWrite rate.
+  const cacheWrite = Number((u as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0);
   return {
     promptTokens: prompt,
     completionTokens: completion,
     totalTokens: u.total_tokens ?? prompt + completion,
     ...(cached > 0 ? { cachedTokens: cached } : {}),
+    ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
   };
 }
 

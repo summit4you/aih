@@ -410,6 +410,14 @@ aih quality [--mock] [--json]   # 跑 evals/quality.tasks.json + 对基线做回
   此前 `glm-5.3-flash` 会误配 `above/glm-5.3-flash` 商业价、`.gguf` 误配商业价，
   keyless 会话显示 ~$17 假账单）；同名模型跨 provider 价格不一致时**拒绝猜测**
   返回"—"（`/prices` 提示加 `prices` 覆盖），provider id 可锁定 `<provider>/<model>` 行
+- **缓存分层计价（cache-aware billing）**：`ModelPrice` 支持 `cacheRead`/`cacheWrite`
+  （opencode Zen「缓存读取/写入」、Anthropic cache_read/cache_creation 对应）；
+  成本公式 = (prompt − cached)×input + cached×cacheRead + cacheWriteTokens×cacheWrite +
+  completion×output——agentic 会话大部分 prompt 走缓存（glm-5.3-flash cache read
+  $0.03 vs input $0.15），按全价计曾把面板虚高 ~3-5 倍。无 cacheRead 的表按全价
+  （保守旧行为）。opencode-go 全表 26 行已按官方价目表校准（含 glm-5.3-flash
+  0.15/0.50/cacheRead 0.03，修掉过期 0.075/0.25 行）；快照生成器 `extractPrices`
+  保留 `cache_read`/`cache_write`（此前丢弃）
 - **三处展示**：TUI Context 面板加 `cost $x.xx · N tok/s` 行；`/usage` 输出累计成本 + 吞吐；
   `aih stats`（非交互）输出成本 + 吞吐
 - **TPS** 为会话平均吞吐（总 token / 时间跨度），数据可推导、可单测；

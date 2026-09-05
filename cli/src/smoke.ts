@@ -20,6 +20,8 @@ import type { Finding, DimensionReview } from "./review-pipeline.js";
 import {
   resolvePrice,
   totalCost,
+  costForUsage,
+  aggregateUsage,
   tokensPerSecond,
   fmtCost,
   fmtTps,
@@ -156,6 +158,31 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
   // 1M input @ $2.5 + 1M output @ $10 = $12.50
   const c = totalCost(events, price);
   assert(Math.abs(c - 12.5) < 1e-9, `totalCost = $12.50 for 1M in + 1M out (got ${c})`);
+  // F#30 cache-aware billing (user-reported panel overpricing): cached prompt
+  // tokens bill at cacheRead, only the uncached remainder at full input.
+  const zen = { input: 0.15, output: 0.5, cacheRead: 0.03 }; // glm-5.3-flash @ opencode-go (official)
+  const cachedTurn = { promptTokens: 1_000_000, completionTokens: 10_000, totalTokens: 1_010_000, cachedTokens: 900_000 };
+  assert(
+    Math.abs(costForUsage(cachedTurn, zen) - (0.1 * 0.15 + 0.9 * 0.03 + 0.01 * 0.5)) < 1e-9,
+    "costForUsage: cached prompt bills at cacheRead, uncached remainder at input (opencode-go glm-5.3-flash)",
+  );
+  assert(
+    Math.abs(costForUsage({ promptTokens: 100, completionTokens: 0, totalTokens: 100 }, { input: 2, output: 4 }) - 0.0002) < 1e-9 &&
+      Math.abs(costForUsage({ promptTokens: 100, completionTokens: 0, totalTokens: 100, cachedTokens: 60 }, { input: 2, output: 4 }) - 0.0002) < 1e-9,
+    "costForUsage: without cacheRead the price, cached tokens still bill at input (conservative old behavior)",
+  );
+  assert(
+    aggregateUsage([
+      { seq: 1, ts: 1, type: "turn/end", turnId: "t1", stopReason: "end_turn", usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110, cachedTokens: 80 } },
+      { seq: 2, ts: 2, type: "turn/end", turnId: "t2", stopReason: "end_turn", usage: { promptTokens: 200, completionTokens: 20, totalTokens: 220, cachedTokens: 150 } },
+    ]).cachedTokens === 230,
+    "aggregateUsage: cachedTokens summed across turn/end events (needed for cache-aware cost)",
+  );
+  assert(
+    resolvePrice("glm-5.3-flash", undefined, { providerHint: "opencode-go" })?.cacheRead === 0.03 &&
+      resolvePrice("glm-5.3-flash", undefined, { providerHint: "opencode-go" })?.input === 0.15,
+    "resolvePrice: opencode-go glm-5.3-flash carries the OFFICIAL price (0.15/0.50, cacheRead 0.03) — stale 0.075/0.25 row corrected",
+  );
   // 2M tokens over 2s = 1,000,000 tok/s
   const tps = tokensPerSecond(events);
   assert(Math.abs(tps - 1_000_000) < 1e-6, `tokensPerSecond = 1e6 tok/s (got ${tps})`);

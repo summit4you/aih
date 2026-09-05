@@ -35,7 +35,13 @@ async function fetchLive() {
 function extractPrices(m) {
   const p = m?.cost ?? m?.price;
   if (!p || typeof p.input !== "number" || typeof p.output !== "number") return undefined;
-  return { input: p.input, output: p.output };
+  const out = { input: p.input, output: p.output };
+  // F#30 — keep prompt-cache rates (models.dev cost.cache_read/cache_write,
+  // opencode Zen "缓存读取/写入"). Billing cached tokens at the full input
+  // price inflated agentic-session costs ~5×; these were previously dropped.
+  if (typeof p.cache_read === "number") out.cacheRead = p.cache_read;
+  if (typeof p.cache_write === "number") out.cacheWrite = p.cache_write;
+  return out;
 }
 
 function extractContextWindow(m) {
@@ -98,7 +104,12 @@ async function main() {
   ];
   for (const [key, meta] of entries.sort(([a], [b]) => a.localeCompare(b))) {
     const parts = [];
-    if (meta.price) parts.push(`price: { input: ${meta.price.input}, output: ${meta.price.output} }`);
+    if (meta.price) {
+      let priceStr = `input: ${meta.price.input}, output: ${meta.price.output}`;
+      if (meta.price.cacheRead !== undefined) priceStr += `, cacheRead: ${meta.price.cacheRead}`;
+      if (meta.price.cacheWrite !== undefined) priceStr += `, cacheWrite: ${meta.price.cacheWrite}`;
+      parts.push(`price: { ${priceStr} }`);
+    }
     if (meta.contextWindow) parts.push(`contextWindow: ${meta.contextWindow}`);
     lines.push(`  ${JSON.stringify(key)}: { ${parts.join(", ")} },`);
   }

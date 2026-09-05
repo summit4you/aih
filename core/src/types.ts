@@ -299,6 +299,12 @@ export interface TokenUsage {
    * observation in /usage and the context panel.
    */
   cachedTokens?: number;
+  /**
+   * F#30 — tokens billed as prompt-cache WRITES (Anthropic
+   * `cache_creation_input_tokens` analog; opencode Zen "缓存写入"). Providers
+   * that report it bill writes at a separate (usually higher) rate.
+   */
+  cacheWriteTokens?: number;
 }
 
 export interface LLMRequest {

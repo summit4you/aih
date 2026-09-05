@@ -43,6 +43,15 @@ export interface ModelPrice {
   input: number;
   /** $ per 1M output (completion) tokens */
   output: number;
+  /**
+   * F#30 — $ per 1M prompt-cache READ tokens (opencode Zen "缓存读取").
+   * Agentic sessions serve most of the prompt from cache; billing it at the
+   * full input price inflated the panel ~5×. Absent → cached tokens are
+   * billed at the full input price (conservative, pre-cache-aware behavior).
+   */
+  cacheRead?: number;
+  /** $ per 1M prompt-cache WRITE tokens (Anthropic cache_creation analog). */
+  cacheWrite?: number;
 }
 
 /** Built-in price table ($/1M tokens) for common models. */
@@ -214,21 +223,47 @@ export function snapshotContextWindow(modelId: string, providerHint?: string): n
 
 /** Cost (USD) of a single usage record at a given price. */
 export function costForUsage(usage: TokenUsage, price: ModelPrice): number {
+  // F#30 cache-aware billing: cached prompt tokens bill at cacheRead (when
+  // the price table carries one), only the uncached remainder bills at the
+  // full input price. Without cacheRead → everything at input (old behavior;
+  // conservative since cacheRead ≤ input on every known price list).
+  const cached = Math.min(usage.cachedTokens ?? 0, usage.promptTokens);
+  const uncached = usage.promptTokens - cached;
+  const cacheRead = price.cacheRead ?? price.input;
+  const cacheWrite = price.cacheWrite ?? price.input;
+  const writeTokens = usage.cacheWriteTokens ?? 0;
   return (
-    (usage.promptTokens / 1_000_000) * price.input +
+    (uncached / 1_000_000) * price.input +
+    (cached / 1_000_000) * cacheRead +
+    (writeTokens / 1_000_000) * cacheWrite +
     (usage.completionTokens / 1_000_000) * price.output
   );
 }
 
 /** Aggregate all turn/end usages in an event log. */
 export function aggregateUsage(events: readonly SessionEvent[]): TokenUsage {
-  const out = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const out: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let cached = 0;
+  let cacheWriteTokens = 0;
+  let seenCached = false;
   for (const e of events) {
     if (e.type === "turn/end" && e.usage) {
       out.promptTokens += e.usage.promptTokens;
       out.completionTokens += e.usage.completionTokens;
       out.totalTokens += e.usage.totalTokens;
+      if (typeof e.usage.cachedTokens === "number") {
+        cached += e.usage.cachedTokens;
+        seenCached = true;
+      }
+      if (typeof e.usage.cacheWriteTokens === "number") {
+        cacheWriteTokens += e.usage.cacheWriteTokens;
+        seenCached = true;
+      }
     }
+  }
+  if (seenCached) {
+    if (cached > 0) out.cachedTokens = cached;
+    if (cacheWriteTokens > 0) out.cacheWriteTokens = cacheWriteTokens;
   }
   return out;
 }

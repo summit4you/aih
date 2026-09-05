@@ -478,13 +478,18 @@ function sleep(ms: number): Promise<void> {
 export { consumeSSEStream as consumeStream } from "./llm-sse.js";
 
 function mapUsage(u: any): TokenUsage {
+  const cached =
+    Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) > 0
+      ? Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens)
+      : undefined;
+  // F#30 — cache WRITE tokens (Anthropic cache_creation_input_tokens analog).
+  const cacheWrite = Number(u.cache_creation_input_tokens) > 0 ? Number(u.cache_creation_input_tokens) : undefined;
   return {
     promptTokens: u.prompt_tokens ?? 0,
     completionTokens: u.completion_tokens ?? 0,
     totalTokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
-    ...(Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) > 0
-      ? { cachedTokens: Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? u.cache_read_input_tokens) }
-      : {}),
+    ...(cached ? { cachedTokens: cached } : {}),
+    ...(cacheWrite ? { cacheWriteTokens: cacheWrite } : {}),
   };
 }
 
