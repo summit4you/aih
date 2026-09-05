@@ -60,8 +60,13 @@ export function composeHooks(sets: ToolHooks[]): ToolHooks {
 type SecretPattern = { re: RegExp; group?: number };
 
 const BUILTIN_SECRET_PATTERNS: SecretPattern[] = [
-  // OpenAI / Anthropic / GitHub / Google / AWS / Slack / generic long tokens
-  { re: /sk-[A-Za-z0-9_-]{8,}/g },
+  // OpenAI / Anthropic / GitHub / Google / AWS / Slack / generic long tokens.
+  // `sk-` requires 20+ CONTIGUOUS base62 chars (no `-`/`_`): prose like
+  // "ask-permission" contains "sk-permission", which the old 8-char shape
+  // redacted as a fake OpenAI key — the model then read back
+  // "auto-approve a[REDACTED] tools" and its later edit failed with
+  // "old_string not found" (the poisoned text is not in the file).
+  { re: /sk-[A-Za-z0-9]{20,}/g },
   { re: /ghp_[A-Za-z0-9]{16,}/g },
   { re: /gho_[A-Za-z0-9]{16,}/g },
   { re: /ghs_[A-Za-z0-9]{16,}/g },

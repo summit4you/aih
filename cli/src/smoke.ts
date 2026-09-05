@@ -1794,7 +1794,7 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     process.env.AIH_MEMORY_BUDGET = "1200";
     try {
       const capped = loadMemoryBlock(workdir);
-      assert(capped.length <= 1400 && capped.includes("…(truncated)"), "AIH_MEMORY_BUDGET caps the injected memory block");
+      assert(capped.length <= 1400 && capped.includes("…(memory truncated at budget — edit .aih/memory.md or use /memory"), "AIH_MEMORY_BUDGET caps the injected memory block with an actionable truncation marker (OMP-R#7/KL-R#2)");
     } finally {
       if (prevBudget === undefined) delete process.env.AIH_MEMORY_BUDGET;
       else process.env.AIH_MEMORY_BUDGET = prevBudget;
@@ -1829,16 +1829,24 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
 
   // D#11: builtin redaction + timing hooks
   const { redactSecrets, countSecrets, builtinHooks, composeHooks } = await import("./hooks.js");
-  const r1 = redactSecrets({ stdout: "token=sk-abcdef1234567890 done" }) as Record<string, unknown>;
-  assert(String(r1.stdout).includes("[REDACTED]") && !String(r1.stdout).includes("sk-abcdef1234567890"), "redactSecrets masks sk- tokens");
+  const r1 = redactSecrets({ stdout: "token=sk-abcdefghijklmnopqrst done" }) as Record<string, unknown>;
+  assert(String(r1.stdout).includes("[REDACTED]") && !String(r1.stdout).includes("sk-abcdefghijklmnopqrst"), "redactSecrets masks sk- tokens (20+ base62)");
   const r2 = redactSecrets("ghp_ABCDEFGHIJKLMNOP1234567890") as string;
   assert(r2.includes("[REDACTED]") && !r2.includes("ghp_ABCDEFGHIJKLMNOP1234567890"), "redactSecrets masks ghp_ tokens");
   const r3 = redactSecrets("password: hunter2secretvalue") as string;
   assert(r3.includes("[REDACTED]") && !r3.includes("hunter2secretvalue"), "redactSecrets masks key=value secrets");
   assert(redactSecrets("hello world") === "hello world", "redactSecrets leaves non-secret text alone");
   assert(redactSecrets({ a: 1, b: [true, "xoxb-1234567890abcdef"] }) !== undefined, "redactSecrets recurses into arrays/objects");
-  assert(countSecrets("sk-abcdef1234567890") >= 1, "countSecrets counts secret shapes");
+  assert(countSecrets("sk-abcdefghijklmnopqrst") >= 1, "countSecrets counts secret shapes");
   assert(countSecrets("no secrets here") === 0, "countSecrets is 0 for clean text");
+  // sk- shape must NOT redact ordinary prose containing "sk-" inside a word —
+  // the old 8-char shape turned "auto-approve ask-permission tools" into
+  // "auto-approve a[REDACTED] tools", and the model's later edit then failed
+  // with "old_string not found" because it reused the poisoned text it had
+  // read back from the tool result.
+  const prose = redactSecrets("  -y, --yes                   auto-approve ask-permission tools") as string;
+  assert(!prose.includes("[REDACTED]") && prose.includes("ask-permission"), "sk- shape does not redact prose like 'ask-permission' (edit-poisoning regression)");
+  assert(redactSecrets("a task-description-sk example") === "a task-description-sk example", "sk- inside hyphenated words is left alone");
 
   // D#11 skill-driven hook config: extra secret shapes from skill front matter
   const { compileExtraPatterns } = await import("./hooks.js");
@@ -1852,8 +1860,8 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   assert(compileExtraPatterns(badExtra).length === 1, "compileExtraPatterns skips invalid regexes");
   assert(redactSecrets("key=acme_ABCDEFGHIJKLMNOP1234", badExtra) !== "key=acme_ABCDEFGHIJKLMNOP1234", "valid patterns still apply alongside an invalid one");
   // builtin patterns still apply on top of skill-driven ones
-  const rBoth = redactSecrets("a=sk-abcdef1234567890 b=acme_ABCDEFGHIJKLMNOP1234", extra) as string;
-  assert(!rBoth.includes("sk-abcdef1234567890") && !rBoth.includes("acme_ABCDEFGHIJKLMNOP1234"), "builtin + skill-driven patterns both apply");
+  const rBoth = redactSecrets("a=sk-abcdefghijklmnop1234 b=acme_ABCDEFGHIJKLMNOP1234", extra) as string;
+  assert(!rBoth.includes("sk-abcdefghijklmnop1234") && !rBoth.includes("acme_ABCDEFGHIJKLMNOP1234"), "builtin + skill-driven patterns both apply");
 
   const regHooks = new ToolRegistry(new AutoApprove());
   regHooks.register({
