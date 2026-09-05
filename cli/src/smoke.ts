@@ -103,6 +103,40 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     resolvePrice("totally-unknown-xyz") === undefined,
     "resolvePrice returns undefined when no table matches",
   );
+  // F#30 — snapshot substring mispricing fix: keyless gateways & local
+  // endpoints bill NOTHING per token (always $0), the snapshot matches
+  // bare-name EXACT only, and cross-provider ambiguity refuses to guess.
+  // Before the fix a 100M-prompt session on a keyless gateway showed ~$17
+  // (real cost: $0) because "glm-5.3-flash" substring-matched
+  // "above/glm-5.3-flash" and ".gguf" matched "aiand/qwen/qwen3.8-27b".
+  assert(
+    resolvePrice("glm-5.3-flash", undefined, { keyless: true })?.input === 0 &&
+      resolvePrice("glm-5.3-flash", undefined, { keyless: true })?.output === 0,
+    "resolvePrice: keyless gateway → $0 regardless of namesake snapshot prices",
+  );
+  assert(
+    resolvePrice("Qwen3.8-27B-q4_k_m.gguf", undefined, {
+      baseUrl: "http://222.16.69.209:8080/v1",
+    })?.input === 0,
+    "resolvePrice: local llama.cpp endpoint → $0",
+  );
+  assert(
+    resolvePrice("glm-5.3-flash") === undefined &&
+      resolvePrice("Qwen3.8-27B-q4_k_m.gguf") === undefined,
+    "resolvePrice: snapshot is bare-name EXACT only — free-gateway/local ids no longer inherit foreign commercial prices",
+  );
+  assert(
+    resolvePrice("deepseek-v4-flash") === undefined,
+    "resolvePrice: 24-way cross-provider price disagreement → ambiguous → undefined (never guess)",
+  );
+  assert(
+    resolvePrice("deepseek-v4-flash", undefined, { providerHint: "opencode" })?.input === 0.14,
+    "resolvePrice: providerHint locks the snapshot row to this provider",
+  );
+  assert(
+    resolvePrice("big-pickle")?.input === 0,
+    "resolvePrice: snapshot namesake with unanimous $0 (opencode free tier) → $0",
+  );
 
   // Seeded turn/end events with known usage + timestamps.
   const mk = (seq: number, ts: number, prompt: number, completion: number): SessionEvent =>

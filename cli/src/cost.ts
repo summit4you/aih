@@ -2,9 +2,10 @@
  * F#30 — cost / TPS accounting.
  *
  * Prices are $ per 1M tokens, split into input (prompt) and output (completion).
- * Resolution order: `prices` from aih.json (user override) → built-in default
- * table for common models. Matching is normalized substring (case-insensitive)
- * so dated / suffixed ids ("gpt-4o-2024-11-20") still resolve ("gpt-4o").
+ * Resolution order: user `prices` override → built-in table → models.dev
+ * snapshot (bare-name EXACT only; keyless/local endpoints always price $0 —
+ * see resolvePrice). Matching on the first two is normalized-substring
+ * (case-insensitive) so dated ids ("gpt-4o-2024-11-20") still resolve.
  *
  * All functions are pure over the session event log so they are unit-testable
  * without a live LLM (the mock LLM does not report usage).
@@ -12,6 +13,30 @@
 import type { SessionEvent, TokenUsage } from "@aih/core";
 import { estimateTokensText, truncateToolOutput } from "@aih/core";
 import { MODEL_METADATA } from "./model-metadata.js";
+
+/**
+ * True for self-hosted endpoints (llama.cpp / Ollama / vLLM on localhost, LAN,
+ * or plain http). These run without auth, so a keyless client is legitimate —
+ * and they bill nothing per token (F#30 pricing ground truth). Canonical owner
+ * is cost.ts (the billing module); index.ts re-exports it for compat.
+ */
+export function isLocalEndpoint(baseUrl: string | undefined): boolean {
+  try {
+    const u = new URL(baseUrl ?? "");
+    if (u.protocol === "http:") return true;
+    const h = u.hostname;
+    return (
+      h === "localhost" ||
+      h === "0.0.0.0" ||
+      h === "::" ||
+      h === "::1" ||
+      /\.(local|internal|lan)$/i.test(h) ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)
+    );
+  } catch {
+    return false;
+  }
+}
 
 export interface ModelPrice {
   /** $ per 1M input (prompt) tokens */
@@ -62,13 +87,27 @@ function norm(s: string): string {
 }
 
 /**
- * Resolve a price for a model id. Checks the user `prices` override first
- * (normalized substring match), then the built-in table. Returns undefined if
- * no table entry matches (cost then renders as "—").
+ * Resolve a price for a model id. Resolution order:
+ *   1. user `prices` override (normalized substring match — small, curated)
+ *   2. built-in table (normalized substring match — small; dated/suffixed
+ *      ids like "gpt-4o-2024-11-20" mapping to the "gpt-4o" row is intended)
+ *   3. models.dev snapshot (P#48) — **bare-name EXACT match only**:
+ *      the snapshot is 7400+ provider-scoped rows ("above/glm-5.3-flash",
+ *      "aiand/qwen/qwen3.8-27b", …); substring-matching a local/free-gateway
+ *      model id against it used to charge FOREIGN COMMERCIAL PRICES for
+ *      keyless gateways and local gguf files (F#30 fix — the panel showed
+ *      ~$17 for sessions that cost $0). Now:
+ *        a. `providerHint` unlocks the scoped row "<provider>/<bare>";
+ *        b. bare-name must match exactly;
+ *        c. multiple providers with the SAME price → that price;
+ *        d. multiple providers DISAGREEING → ambiguous, return undefined
+ *           (the panel renders "—" and the /prices hint suggests an override)
+ *           — refusing to guess beats showing a wrong bill.
  */
 export function resolvePrice(
   model: string,
   prices?: Record<string, ModelPrice>,
+  opts?: { providerHint?: string; keyless?: boolean; baseUrl?: string },
 ): ModelPrice | undefined {
   const m = norm(model);
   if (!m) return undefined;
@@ -84,35 +123,39 @@ export function resolvePrice(
     }
     return undefined;
   };
-  // P#48: models.dev snapshot as the LAST fallback — user overrides and the
-  // built-in table win; the snapshot only fills gaps for models missing from
-  // both (snapshot keys are provider-scoped like "openai/gpt-4o", so match
-  // on the bare model segment).
-  const snapLook = (table: Record<string, ModelPrice>): ModelPrice | undefined => {
-    const keys = Object.keys(table).sort(
-      (a, b) => b.length - a.length || a.localeCompare(b),
-    );
-    for (const k of keys) {
-      const nk = norm(k);
-      if (m === nk || m.includes(nk)) return table[k];
-    }
-    return undefined;
-  };
-  return look(prices ?? {}) ?? look(DEFAULT_PRICES) ?? snapLook(snapshotPrices());
-}
+  const userHit = look(prices ?? {});
+  if (userHit) return userHit;
+  const builtHit = look(DEFAULT_PRICES);
+  if (builtHit) return builtHit;
 
-/**
- * P#48 — flatten the generated models.dev snapshot to bare model-name keys
- * (provider prefix stripped; first occurrence wins on collision).
- */
-function snapshotPrices(): Record<string, ModelPrice> {
-  const out: Record<string, ModelPrice> = {};
+  // Billing ground truth — F#30: no credential at the endpoint means NO
+  // per-token billing AT ALL, whatever the snapshot says about namesake
+  // models elsewhere. Keyless public gateways (opencode Zen fingerprint
+  // auth, empero keyless) and local llama.cpp/Ollama/vLLM endpoints bill
+  // nothing per token; their prices are ALWAYS {0,0} regardless of model id.
+  // (A user `prices` override above still wins for explicit opt-in pricing.)
+  if (opts?.keyless || (opts?.baseUrl !== undefined && isLocalEndpoint(opts.baseUrl))) {
+    return { input: 0, output: 0 };
+  }
+
+  // P#48 snapshot — bare-name EXACT only (see doc above for the F#30 fix).
+  const bare = norm(m.split("/").pop() ?? m);
+  const hint = opts?.providerHint ? norm(opts.providerHint) : "";
+  const scoped: ModelPrice[] = [];
+  const exact: Array<{ bare: string; price: ModelPrice }> = [];
   for (const [k, v] of Object.entries(MODEL_METADATA)) {
     if (!v.price) continue;
-    const bare = k.split("/").pop() ?? k;
-    if (!out[bare]) out[bare] = v.price;
+    const nk = norm(k);
+    const nbare = norm(k.split("/").pop() ?? k);
+    if (hint && nk === `${hint}/${bare}`) scoped.push(v.price);
+    if (nbare === bare) exact.push({ bare: nbare, price: v.price });
   }
-  return out;
+  if (scoped.length > 0) return scoped[0];
+  if (exact.length === 0) return undefined;
+  const distinct = new Map<string, ModelPrice>();
+  for (const e of exact) distinct.set(`${e.price.input}/${e.price.output}`, e.price);
+  if (distinct.size === 1) return exact[0].price;
+  return undefined; // ambiguous: ≥2 providers, disagreeing prices
 }
 
 /**

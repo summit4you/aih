@@ -404,6 +404,12 @@ aih quality [--mock] [--json]   # 跑 evals/quality.tasks.json + 对基线做回
 - **价目表**：`cli/src/cost.ts` 内置常见模型 $/1M 价格（OpenAI / Anthropic / Google /
   DeepSeek / Qwen / Meta）；`aih.json` 的 `prices` 键可覆盖（`{ "gpt-4o": { "input": 2.5, "output": 10 } }`），
   匹配为归一化子串——dated id（`gpt-4o-2024-11-20`）命中 `gpt-4o` 行
+- **计费真值（防错账）**：**keyless 网关与本地 llama.cpp/Ollama 端点一律 $0**——
+  没有按 token 计费的凭据就不可能产生账单，models.dev 快照里同名模型的商业价
+  不适用；快照仅按**裸名精确匹配**（不再子串匹配 7400+ 条 provider 域条目，
+  此前 `glm-5.3-flash` 会误配 `above/glm-5.3-flash` 商业价、`.gguf` 误配商业价，
+  keyless 会话显示 ~$17 假账单）；同名模型跨 provider 价格不一致时**拒绝猜测**
+  返回"—"（`/prices` 提示加 `prices` 覆盖），provider id 可锁定 `<provider>/<model>` 行
 - **三处展示**：TUI Context 面板加 `cost $x.xx · N tok/s` 行；`/usage` 输出累计成本 + 吞吐；
   `aih stats`（非交互）输出成本 + 吞吐
 - **TPS** 为会话平均吞吐（总 token / 时间跨度），数据可推导、可单测；

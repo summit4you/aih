@@ -455,27 +455,10 @@ export function bool(flags: Record<string, string | boolean>, ...keys: string[])
 /** Built-in fallback context window (max input tokens) when nothing is configured. */
 export const DEFAULT_CONTEXT_WINDOW = 131072;
 
-/**
- * True for self-hosted endpoints (llama.cpp / Ollama / vLLM on localhost, LAN,
- * or plain http). These run without auth, so a keyless client is legitimate.
- */
-function isLocalEndpoint(baseUrl: string | undefined): boolean {
-  try {
-    const u = new URL(baseUrl ?? "");
-    if (u.protocol === "http:") return true;
-    const h = u.hostname;
-    return (
-      h === "localhost" ||
-      h === "0.0.0.0" ||
-      h === "::" ||
-      h === "::1" ||
-      /\.(local|internal|lan)$/i.test(h) ||
-      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)
-    );
-  } catch {
-    return false;
-  }
-}
+// F#30 — canonical owner of endpoint classification is cost.ts (billing);
+// re-exported here for backward compatibility (existing importers use this path).
+export { isLocalEndpoint } from "./cost.js";
+import { isLocalEndpoint } from "./cost.js";
 
 /**
  * Resolve the model's context window for a command:
@@ -1906,7 +1889,11 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         }).provider ?? "custom";
 
   // F#30: resolve the active model's price (user `prices` override → built-in
-  // table). Recomputed lazily so a runtime /model switch picks up the new price.
+  // table → models.dev snapshot EXACT-only). Recomputed lazily so a runtime
+  // /model switch picks up the new price. `keyless`/`baseUrl` ground the
+  // BILLING truth: keyless gateways & local llama.cpp endpoints bill nothing
+  // per token → $0, no matter what a namesake model costs elsewhere; the
+  // providerHint locks the snapshot row to THIS provider when one exists.
   const currentPrice = () => {
     const id =
       str(flags, "model") ??
@@ -1914,7 +1901,25 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       resolveLlm({}).model.value ??
       "";
     if (!id) return undefined;
-    return resolvePrice(id, loadPrices());
+    let keyless = false;
+    let baseUrl: string | undefined;
+    let provider = providerLabel;
+    if (bool(flags, "mock")) return { input: 0, output: 0 };
+    try {
+      const resolved = resolveLlm({
+        flagModel: str(flags, "model"),
+        flagBaseUrl: str(flags, "base-url"),
+        flagProvider: str(flags, "provider"),
+        envModel: process.env.AIH_MODEL,
+        envBaseUrl: process.env.AIH_BASE_URL,
+      });
+      keyless = resolved.keyless;
+      baseUrl = resolved.baseUrl.value;
+      provider = resolved.provider ?? providerLabel;
+    } catch {
+      /* resolve failure → fall through to plain model-id pricing */
+    }
+    return resolvePrice(id, loadPrices(), { keyless, baseUrl, providerHint: provider });
   };
 
   /**
