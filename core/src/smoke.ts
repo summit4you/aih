@@ -24,6 +24,8 @@ import {
   TRUNCATED_RETRY_PROMPT,
   STREAM_RESUME_PROMPT,
   isQuotaExhaustion,
+  isTerminalQuota,
+  isUnrecoverableTurnError,
   QuotaError,
   StallError,
   ReasoningRunawayError,
@@ -2267,6 +2269,42 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
     .catch((e: unknown) => e)) as QuotaError;
   assert(quotaErr instanceof QuotaError, "quota 429 → QuotaError (not a retried HTTP error)");
   assert(quotaErr.retryAfterSec === 60, "QuotaError carries the Retry-After horizon");
+
+  // CC-R#2 — terminal quota (spend/billing blocks) vs recoverable quota window.
+  // A window resets on a schedule → waiting is correct. A spend block NEVER
+  // resets by waiting → the wait would be MAX_QUOTA_WAITS × up-to-30min of
+  // sleeping into the same error.
+  assert(isTerminalQuota(429, "spend limit reached for this org"), "CC-R#2: spend-limit 429 → terminal");
+  assert(isTerminalQuota(402, "insufficient credits on paid plan"), "CC-R#2: insufficient-credits 402 → terminal");
+  assert(isTerminalQuota(429, "billing error: payment method declined"), "CC-R#2: billing 429 → terminal");
+  assert(!isTerminalQuota(429, "rate limit exceeded, quota resets at 00:00 UTC"), "CC-R#2: reset-window 429 → NOT terminal (keep waiting)");
+  assert(!isTerminalQuota(500, "spend limit"), "CC-R#2: non-429/402 → NOT terminal");
+  const termAdapter = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 3,
+    fetchImpl: (async () =>
+      new Response("error: spend limit reached for this organization", {
+        status: 429,
+        headers: { "retry-after": "1800" },
+      })) as typeof fetch,
+  });
+  const termErr = (await termAdapter
+    .complete({ messages: [{ role: "user", content: "hi" }], tools: [] })
+    .catch((e: unknown) => e)) as QuotaError;
+  assert(termErr instanceof QuotaError, "CC-R#2: spend-limit 429 → QuotaError");
+  assert(termErr.terminal === true, "CC-R#2: QuotaError.terminal flags spend blocks (no wait loop)");
+
+  // CC-R#2 — isUnrecoverableTurnError: the /goal chains must clear the goal
+  // on failures that retrying/waiting can never fix, and keep it on anything
+  // else (a blip should not silently kill a goal chain).
+  assert(isUnrecoverableTurnError("llm request failed: HTTP 401 invalid api key"), "CC-R#2: auth 401 → unrecoverable");
+  assert(isUnrecoverableTurnError("usage limit exhausted (HTTP 429): spend limit reached"), "CC-R#2: spend-limit message → unrecoverable");
+  assert(isUnrecoverableTurnError("prompt is too long: 210000 tokens > 200000 maximum"), "CC-R#2: escaped context overflow → unrecoverable");
+  assert(isUnrecoverableTurnError("request rejected: policy violation"), "CC-R#2: policy refusal → unrecoverable");
+  assert(!isUnrecoverableTurnError("llm request failed: HTTP 500 upstream hiccup"), "CC-R#2: transient 500 → recoverable (goal survives)");
+  assert(!isUnrecoverableTurnError("usage limit exhausted (HTTP 429): quota resets in 60s — reset in ~60s"), "CC-R#2: reset-window quota → recoverable (wait is the right cure)");
 
   // 3) AgentLoop: quota 429 → wait → re-issue SAME call → success. The
   //    quota_wait event is logged and the turn completes (not an error).

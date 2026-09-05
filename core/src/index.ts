@@ -83,8 +83,11 @@ export type { OpenAICompatibleOptions } from "./seams/llm-openai.js";
 export {
   consumeSSEStream,
   classifyProviderError,
+  CONTEXT_LENGTH_RE,
   isQuotaExhaustion,
   isReasoningRunaway,
+  isTerminalQuota,
+  isUnrecoverableTurnError,
   parseFrame,
   QuotaError,
   ReasoningRunawayError,

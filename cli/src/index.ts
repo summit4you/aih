@@ -39,6 +39,7 @@ import {
   scanRecovery,
   describeFact,
   PARK_REASON,
+  isUnrecoverableTurnError,
 } from "@aih/core";
 import type {
   ApprovalGate,
@@ -1569,10 +1570,24 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
           ? `\n[goal] Unverified criteria: ${verdict.unmet.join("; ")}\nVerify each against real persisted state (read the file, run the check) — do not re-claim completion without fresh evidence.\n`
           : "";
         process.stderr.write(`${dim(`↻ goal check: not yet met — ${verdict.reason} (auto-continuing, ${rounds} left)`)}\n`);
-        await loop.send(
-          `${unmetNote}[goal] The goal "${goal}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
-          streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
-        );
+        // CC-R#2 — the continuation turn may die on an UNRECOVERABLE provider
+        // error (auth / spend limit / escaped context overflow). Left
+        // uncaught it would crash run mode with a stack trace and leave the
+        // goal recorded as still-active; caught here it prints an honest
+        // stop line, clears the goal, and exits 1 like other bounded stops.
+        try {
+          await loop.send(
+            `${unmetNote}[goal] The goal "${goal}" is not yet met. Judge's note: ${verdict.reason}\nContinue working until the goal is fully achieved.`,
+            streaming ? { onDelta: (d) => process.stdout.write(d) } : undefined,
+          );
+        } catch (contErr) {
+          const msg = contErr instanceof Error ? contErr.message : String(contErr);
+          if (isUnrecoverableTurnError(msg)) {
+            process.stderr.write(`${red("⏹ goal cleared — unrecoverable error: ")}${msg}\n`);
+            process.exit(1);
+          }
+          throw contErr;
+        }
         saveSession(sessionPath, log);
       }
       if (format === "json") {
@@ -3650,7 +3665,18 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       await runGoalCheck();
       void ensureTitle();
     } catch (err) {
-      tui.pushError(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      // CC-R#2 — a turn killed by an UNRECOVERABLE provider error (auth /
+      // spend limit / escaped context overflow) also kills the goal chain:
+      // leaving the goal active would auto-requeue it next idle tick and the
+      // next turn would die the same way, forever. Clear it and say why.
+      if (isUnrecoverableTurnError(msg)) {
+        if (goalCondition) {
+          goalCondition = "";
+          tui.pushSystem(`⏹ goal cleared — unrecoverable error: ${msg}`);
+        }
+      }
+      tui.pushError(msg);
     } finally {
       tui.turnSettled();
     }

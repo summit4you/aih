@@ -327,6 +327,48 @@ function mapUsage(u: SSEUsage): TokenUsage {
   };
 }
 
+// ── CC-R#2 — terminal quota vs recoverable quota window ────────────────
+//
+// A usage-window quota ("resets in 60s", Retry-After horizon) DOES recover by
+// waiting. But some quota rejections mean the SPEND itself is blocked on this
+// account/plan (spend limit, billing, no credits left on a paid plan) — those
+// never recover by waiting; MAX_QUOTA_WAITS × up-to-30min of sleep would end
+// in the same error. isTerminalQuota separates the two by provider wording.
+
+const TERMINAL_QUOTA_RE =
+  /(spend[_ ]limit|hard limit|billing|insufficient (?:funds|balance|credits?)|out of credits|credit balance|payment required|plan limit)/i;
+
+/** True when a 429/402 body says the spend itself is blocked (terminal), not that a window will reset. */
+export function isTerminalQuota(status: number, body: string): boolean {
+  if (status !== 429 && status !== 402) return false;
+  return TERMINAL_QUOTA_RE.test(body);
+}
+
+/**
+ * CC-R#2 — decide from an error MESSAGE whether a turn-killing failure can
+ * never be recovered by retrying or waiting: auth refusal, terminal quota
+ * (spend/billing block), escaped context overflow (the in-loop compact+retry
+ * already ran and failed — another round only makes the prompt bigger), or a
+ * provider policy refusal. The /goal chains use this to stop auto-continuation
+ * honestly (clear the goal) instead of burning judge rounds on a turn that
+ * will always die the same way.
+ */
+export function isUnrecoverableTurnError(message: string): boolean {
+  if (/\b(?:401|403)\b/.test(message) || /unauthorized|invalid api key|invalid key|expired token|authentication/i.test(message)) return true;
+  if (isTerminalQuota(429, message) || isTerminalQuota(402, message)) return true;
+  if (CONTEXT_LENGTH_RE.test(message)) return true;
+  if (/policy violation|content_policy|content policy/i.test(message)) return true;
+  return false;
+}
+
+/**
+ * Canonical provider context-length regex. Lives here (the error-classification
+ * layer, CC-R#2) so both the AgentLoop overflow-recovery path and
+ * isUnrecoverableTurnError share ONE pattern instead of two drifting copies.
+ */
+export const CONTEXT_LENGTH_RE =
+  /(maximum context|context length|context_length|prompt is too long|too many tokens|maximum number of tokens|exceeds? (the )?(longest )?maximum|requested \d+ tokens)/i;
+
 // ── Provider error classification (CC#49 semantic ③) ──────────────────
 
 /**
@@ -449,6 +491,13 @@ export function isQuotaExhaustion(
 export class QuotaError extends Error {
   /** Seconds until the provider expects the window to reset (0 = unknown). */
   retryAfterSec: number;
+  /**
+   * CC-R#2 — true when the rejection is a spend/billing block that will NEVER
+   * recover by waiting (spend limit, billing, exhausted credits). The
+   * AgentLoop must not sleep on it: waiting can't fix the account, so the
+   * error is surfaced immediately.
+   */
+  terminal: boolean;
   constructor(status: number, body: string, retryAfterSec: number) {
     super(
       `usage limit exhausted (HTTP ${status}): ${body.slice(0, 200)}` +
@@ -456,5 +505,6 @@ export class QuotaError extends Error {
     );
     this.name = "QuotaError";
     this.retryAfterSec = retryAfterSec;
+    this.terminal = isTerminalQuota(status, body);
   }
 }

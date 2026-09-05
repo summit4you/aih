@@ -996,7 +996,7 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_RETRIES` (1) | LLM 429/5xx 自动重试次数（鉴权错误不重试） |
 | `AIH_FIRST_TOKEN_TIMEOUT_MS` (180000) | 流式响应首 token 超时（0 关闭）；超时后带部分内容的断流触发**断流续传**（保留 partial 文本 + 有界续跑一次），无内容的计入重试预算 |
 | `AIH_STALL_TIMEOUT_MS` (60000) | 流式响应帧间 stall 超时（0 关闭）；语义同上 |
-| `AIH_QUOTA_AUTO_RESUME` (1) | 配额耗尽（429/402 + quota/limit/credits 或 Retry-After ≥ 60s）时交互会话自动等待重置后**重发被拒调用**（有界 2 次，TUI 显示等待行）；`0` 关闭。非交互 `run` 恒快速失败 |
+| `AIH_QUOTA_AUTO_RESUME` (1) | 配额耗尽（429/402 + quota/limit/credits 或 Retry-After ≥ 60s）时交互会话自动等待重置后**重发被拒调用**（有界 2 次，TUI 显示等待行）；`0` 关闭。非交互 `run` 恒快速失败。**spend limit/billing 类终态配额不等待**，立即失败（CC-R#2） |
 | `NO_COLOR` | 关闭彩色输出 |
 | `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`） |
 | `AIH_GOAL_ROUNDS` (3) | `/goal` 与 `run --goal` 的额外续跑轮数上限 |
@@ -1136,7 +1136,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | doom_loop 死循环守卫 | ◐ 钩子拦截 | ✅ | ✅ | — | ✅ |
 | 上下文压缩（主动+被动+手动 /compact） | — | ✅ | ✅ | — | ✅ 三路+手动 |
 | 流式断流防护+诚实续传（stall 看门狗） | — | ◐ | ◐ | — | ✅ CC#49（首 token/帧间超时，partial 保留+有界续跑） |
-| 配额耗尽自动等待+重发被拒调用 | — | ◐ | ◐ | — | ✅ CC#51（quota/limit/credits 或 Retry-After≥60s，交互自动续、run 快速失败） |
+| 配额耗尽自动等待+重发被拒调用 | — | ◐ | ◐ | — | ✅ CC#51（quota/limit/credits 或 Retry-After≥60s，交互自动续、run 快速失败）+ CC-R#2（spend limit/billing 类**终态**配额不等待立即失败；goal 链遇不可恢复错误自动清除，`isUnrecoverableTurnError`：auth/终态配额/逃逸溢出/policy） |
 | 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
 | 项目记忆（memory.md + 注入预算 + 词元检索召回） | — | — | ✅ | — | ✅（KL-R#2 `memory_recall`） |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |

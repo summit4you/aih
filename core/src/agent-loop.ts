@@ -1,5 +1,5 @@
 import type { LLMAdapter } from "./seams/llm.js";
-import { QuotaError, StallError } from "./seams/llm-sse.js";
+import { CONTEXT_LENGTH_RE, QuotaError, StallError } from "./seams/llm-sse.js";
 import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT, TRUNCATED_RETRY_PROMPT } from "./prompts.js";
 import type { LoopObserver } from "./observers.js";
 import { LoopAbort, notifyObservers } from "./observers.js";
@@ -158,8 +158,7 @@ export interface AgentLoopOptions {
   }) => void;
 }
 
-const CONTEXT_ERROR =
-  /(maximum context|context length|context_length|prompt is too long|too many tokens|maximum number of tokens|exceeds? (the )?(longest )?maximum|requested \d+ tokens)/i;
+const CONTEXT_ERROR = CONTEXT_LENGTH_RE; // CC-R#2 — single source in llm-sse.ts (shared with isUnrecoverableTurnError)
 
 /**
  * CJK-aware token estimate. A flat chars÷4 undercounts the tool-JSON +
@@ -629,7 +628,12 @@ export class AgentLoop {
         // re-issue the SAME call. Only when the caller opted in (interactive
         // session with auto-resume on); otherwise the QuotaError propagates
         // so non-interactive `run` fails fast and predictably.
-        if (err instanceof QuotaError && hooks?.quotaWait && quotaWaits < MAX_QUOTA_WAITS) {
+        if (
+          err instanceof QuotaError &&
+          !err.terminal && // CC-R#2 — spend/billing blocks never recover by waiting
+          hooks?.quotaWait &&
+          quotaWaits < MAX_QUOTA_WAITS
+        ) {
           quotaWaits += 1;
           const waitSec = Math.min(
             Math.max(1, Math.round(err.retryAfterSec || QUOTA_DEFAULT_WAIT_SEC)),
@@ -656,7 +660,12 @@ export class AgentLoop {
               response = await doComplete();
               break;
             } catch (retryErr) {
-              if (!(retryErr instanceof QuotaError) || ac.signal.aborted || quotaWaits >= MAX_QUOTA_WAITS) {
+              if (
+                !(retryErr instanceof QuotaError) ||
+                retryErr.terminal || // CC-R#2 — spend blocks: waiting can't fix the account
+                ac.signal.aborted ||
+                quotaWaits >= MAX_QUOTA_WAITS
+              ) {
                 throw retryErr;
               }
               quotaWaits += 1;
