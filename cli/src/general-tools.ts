@@ -18,6 +18,8 @@ import { formatAfterWrite } from "./formatter.js";
 import { bestOfN, capAnswer, answerCapLimit } from "./maxmode.js";
 import { userAihDir } from "./paths.js";
 import { extractShellContext } from "./shell-context.js";
+import { parseMemoryEntries } from "./memory-tidy.js";
+import { recall, type RecallEntry } from "./memory-recall.js";
 
 export interface GeneralToolsOptions {
   cwd?: string;
@@ -572,6 +574,79 @@ export function registerGeneralTools(
         writeFileSync(path, `${existing.replace(/\s+$/, "")}\n\n- ${stamp} — ${text}\n`);
       }
       return { path, action, scope };
+    },
+  });
+
+  // KL-R#2 — memory recall: zero-dependency lexical retrieval over memory.md.
+  // The per-turn injected block is budget-capped (4000 chars) and may truncate
+  // the oldest entries; this read-only tool lets the model pull back the most
+  // relevant entries by query instead of relying on the injected slice alone.
+  // Scoring = token-overlap (not vector / not FTS), pure stdlib.
+  reg({
+    name: "memory_recall",
+    description:
+      "Search project + user memory (memory.md) by a free-text query and return the most " +
+      "relevant entries (token-overlap scoring, no network). Use when the injected memory " +
+      "block may have been truncated by budget, or when you need to recall a specific past " +
+      "decision/convention/fact. Read-only — does not modify memory.",
+    kind: "read",
+    permission: "allow",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "free-text query (natural language or keywords)" },
+        top_k: { type: "number", description: "max entries to return (integer, default 8, cap 50)" },
+      },
+      required: ["query"],
+    },
+    execute: async (args) => {
+      const a = args as { query?: unknown; top_k?: unknown };
+      const query = String(a.query ?? "").trim();
+      if (!query) throw new Error("memory_recall requires a non-empty query");
+      const topK = Math.max(1, Math.min(50, Math.floor(Number(a.top_k) || 8)));
+
+      const files: Array<{ path: string; scope: "project" | "user" }> = [
+        { path: join(cwd, ".aih", "memory.md"), scope: "project" },
+        { path: join(userAihDir(), "memory.md"), scope: "user" },
+      ];
+      const corpus: RecallEntry[] = [];
+      let totalEntries = 0;
+      for (const f of files) {
+        if (!existsSync(f.path)) continue;
+        let text: string;
+        try {
+          text = readFileSync(f.path, "utf8");
+        } catch {
+          continue;
+        }
+        const entries = parseMemoryEntries(text);
+        totalEntries += entries.length;
+        for (const e of entries) corpus.push({ text: e.text, date: e.date, scope: f.scope });
+      }
+
+      const hits = recall(query, corpus, { topK });
+      if (hits.length === 0) {
+        return {
+          found: 0,
+          totalEntries,
+          query,
+          note:
+            `no memory entries matched "${query.slice(0, 80)}" (searched ${totalEntries} entries) ` +
+            `— memory may be empty, or the query terms are not present; try broader keywords or /memory to see the live block`,
+        };
+      }
+      return {
+        found: hits.length,
+        totalEntries,
+        query,
+        entries: hits.map((h) => ({
+          text: h.text,
+          date: h.date,
+          scope: h.scope,
+          score: h.score,
+          matched: h.matched,
+        })),
+      };
     },
   });
 

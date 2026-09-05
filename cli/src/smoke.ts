@@ -1911,6 +1911,97 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     if (prevAihHome === undefined) delete process.env.AIH_HOME;
     else process.env.AIH_HOME = prevAihHome;
   }
+
+  // KL-R#2 — memory_recall: zero-dependency lexical retrieval over memory.md.
+  // Pure-module tests (tokenize / restates / recall scoring) + tool wiring.
+  {
+    const mr = await import("./memory-recall.js");
+    // tokenize: NFKC + camelCase split + CJK bigrams + stopword/single-char drop
+    assert(mr.tokenize("The FooBar API").includes("foo") && mr.tokenize("The FooBar API").includes("bar"), "KL-R#2 tokenize: camelCase split (FooBar → foo, bar)");
+    assert(mr.tokenize("The FooBar API").includes("api") && !mr.tokenize("The FooBar API").includes("the"), "KL-R#2 tokenize: keeps terms, drops stopwords");
+    const cjk = mr.tokenize("借鉴 LongHorizon 的 prompt 层设计");
+    assert(cjk.includes("借鉴") && cjk.includes("long"), "KL-R#2 tokenize: CJK bigrams + latin words");
+    assert(mr.tokenize("").length === 0 && mr.tokenize("a").length === 0, "KL-R#2 tokenize: empty / single-char → no tokens");
+    // restates: near-duplicate token sets flagged; distinct sets not
+    // ≥85% coverage of the SMALLER token set by the larger → restatement (kilo
+    // word-overlap rule; here 3/3 of the smaller set are covered → 100% ≥ 85%).
+    assert(mr.restates(["memory", "session", "turn"], ["memory", "session", "turn", "llm"]) === true, "KL-R#2 restates: smaller set ≥85% covered by larger → restatement");
+    assert(mr.restates(["memory", "session"], ["guardian", "policy", "allow"]) === false, "KL-R#2 restates: disjoint sets → not a restatement");
+
+    const corpus: Array<import("./memory-recall.js").RecallEntry> = [
+      { text: "guardian 体验松绑三件套：放宽 policy、trust 模式、一键授权", date: "2026-09-05", scope: "project" },
+      { text: "guardian 体验松绑三件套：放宽 policy、trust 模式、一键授权（同一事件的重述）", date: "2026-09-05", scope: "project" },
+      { text: "borrow LongHorizon prompt layer design: FINAL_STATE_GUARD + TASK_CONTRACT_RULES", date: "2026-08-23", scope: "project" },
+      { text: "shell env policy (buildChildEnv) strips secrets; --debug-prompt added", date: "2026-08-23", scope: "project" },
+      { text: "user prefers minimal LOC and root-cause fixes over guards", date: "2026-01-01", scope: "user" },
+    ];
+    const g = mr.recall("guardian policy trust", corpus);
+    assert(g.length >= 1 && g[0].score >= 2, "KL-R#2 recall: query terms accumulate score (guardian+policy+trust)");
+    assert(g[0].text.includes("guardian") && g[0].text.includes("三件套"), "KL-R#2 recall: top hit is the guardian entry");
+    // dedupe: the two near-identical guardian entries collapse to one
+    const guardianHits = g.filter((h) => h.text.includes("guardian"));
+    assert(guardianHits.length === 1, "KL-R#2 recall: restates-duplicate entries collapse to one");
+    // freshness: among equal-score guardian rows, the more recent date wins
+    const fresh = mr.recall("guardian", [{ text: "guardian early", date: "2020-01-01" }, { text: "guardian late", date: "2026-01-01" }]);
+    assert(fresh[0].text === "guardian late", "KL-R#2 recall: equal score → newer date ranks first");
+    // generic-word suppression: a term in >50% of entries is non-discriminative.
+    // Every entry contains "memory"; only one has "zebra". Querying just
+    // "memory" must return nothing (ubiquitous → suppressed), while "zebra"
+    // still surfaces that one entry.
+    const genCorpus: Array<import("./memory-recall.js").RecallEntry> = [
+      { text: "memory alpha", scope: "project" },
+      { text: "memory beta", scope: "project" },
+      { text: "memory gamma", scope: "project" },
+      { text: "memory zebra", scope: "project" },
+    ];
+    assert(mr.recall("memory", genCorpus).length === 0, "KL-R#2 recall: ubiquitous term (>80% of entries, corpus ≥3) is non-discriminative → no score → no hits");
+    const z = mr.recall("zebra", genCorpus);
+    assert(z.length === 1 && z[0].text.includes("zebra"), "KL-R#2 recall: a distinctive term still surfaces its entry");
+    // topK bound + minScore floor
+    assert(mr.recall("guardian trust policy shell borrow user", corpus, { topK: 2 }).length <= 2, "KL-R#2 recall: topK bounds the result count");
+    assert(mr.recall("zzzznope", corpus).length === 0, "KL-R#2 recall: no-match query → empty");
+
+    // Tool wiring: recall reads project+user memory.md and returns ranked entries.
+    const callDir = ".aih-smoke-recall";
+    rmSync(callDir, { recursive: true, force: true });
+    mkdirSync(`${callDir}/.aih`, { recursive: true });
+    writeFileSync(`${callDir}/.aih/memory.md`,
+      "# Project memory\n\n- 2026-08-23 — LongHorizon prompt layer: FINAL_STATE_GUARD + TASK_CONTRACT_RULES\n" +
+      "- 2026-08-23 — shell env policy buildChildEnv strips secrets\n" +
+      "- 2026-09-05 — guardian 体验松绑：policy 放宽 + trust + 一键授权\n");
+    const recHome = mkdtempSync("/tmp/aih-recall-");
+    writeFileSync(`${recHome}/memory.md`, "# User memory\n\n- 2026-01-01 — user prefers minimal LOC and root-cause fixes\n");
+    const prevHome2 = process.env.AIH_HOME;
+    process.env.AIH_HOME = recHome;
+    try {
+      const recReg = new ToolRegistry(new AutoApprove());
+      registerGeneralTools(recReg, { gate: new AutoApprove(), cwd: callDir });
+      const rc = async (name: string, args: unknown) => {
+        const r = await recReg.invoke(name, args, { turnId: "t", inject: () => {} });
+        if (!r.ok) throw new Error(`${name}: ${r.error}`);
+        return r.result as Record<string, unknown>;
+      };
+      const hit = await rc("memory_recall", { query: "LongHorizon prompt layer FINAL_STATE_GUARD", top_k: 3 });
+      assert((hit.found as number) >= 1, "KL-R#2 tool: finds entries by query");
+      const entries = hit.entries as Array<{ text: string; scope?: string; score: number }>;
+      assert(entries.some((e) => e.text.includes("LongHorizon") && e.scope === "project"), "KL-R#2 tool: returns the matching project entry");
+      assert(entries.every((e) => e.score >= 1), "KL-R#2 tool: every returned entry has score ≥ 1");
+      // cross-scope: a user-memory fact is also reachable
+      const uh = await rc("memory_recall", { query: "minimal LOC root-cause fixes" });
+      assert((uh.found as number) >= 1 && (uh.entries as unknown[]).some((e) => (e as { scope?: string }).scope === "user"), "KL-R#2 tool: searches user (cross-project) memory too");
+      // empty query rejected
+      let emptyErr = "";
+      try { await rc("memory_recall", { query: "  " }); } catch (e) { emptyErr = String((e as Error).message); }
+      assert(emptyErr.includes("non-empty"), "KL-R#2 tool: empty query is rejected");
+      // no-match → found 0 with an actionable note
+      const nm = await rc("memory_recall", { query: "quantum entanglement flux capacitor" });
+      assert((nm.found as number) === 0 && typeof nm.note === "string" && (nm.note as string).length > 0, "KL-R#2 tool: no-match → found 0 + note");
+    } finally {
+      if (prevHome2 === undefined) delete process.env.AIH_HOME;
+      else process.env.AIH_HOME = prevHome2;
+      rmSync(callDir, { recursive: true, force: true });
+    }
+  }
   const registryHooks = new ToolRegistry(gate);
   registryHooks.register({
     name: "calc",

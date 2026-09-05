@@ -506,7 +506,16 @@ agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化
 - `remember` 工具写入：`action=append` 追加带日期条目 / `action=set` 整体重写；
   `scope` 可选 `project`（`.aih/memory.md`）/ `user`（XDG 用户目录 `memory.md`）
 - 每轮自动注入 system prompt（项目 + 用户两级合并，预算 `AIH_MEMORY_BUDGET`，
-  默认 4000 字符，超出截断）
+  默认 4000 字符，超出截断；截断时尾部附可操作提示语，agent 知道被切了、
+  知道去找全量）
+- **`memory_recall` 只读工具（KL-R#2，词元重叠检索）**：注入块被预算截断后，
+  agent 可以用自由文本 query 召回最相关的记忆条目（`{"query": "...", "top_k": 8}`）。
+  打分 = 查询词元命中计数（非向量/非 FTS/零依赖）：NFKC 归一、camelCase 拆词、
+  小写、CJK bigram（中文条目可检索）、英文功能词静态停用；泛化词动态抑制
+  （在 >80% 条目出现且语料 ≥3 条的词元不计分，防止 "memory"/"session" 刷分，
+  阈值未取 kilo 原版 0.5——小语料下领域词 60% 出现率极正常）；排序 = 分数 →
+  新鲜度（date 降序）→ 字典序；`restates` 词元重叠 ≥85% 去重近重复条目；
+  project + user 两级都查，返回带 `score`/`matched`/`scope`
 - TUI `/memory` 查看当前记忆；`/tidy [project|user]` 确定性去重
   （保留最新日期副本，`/tidy apply` 写入）
 
@@ -778,6 +787,7 @@ AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认
 | `grep` | 正则内容搜索 + `include` 文件名过滤 | allow |
 | `todo` | 任务清单（`.aih/todos.json`，至多一个 in_progress） | allow |
 | `remember` | 项目记忆：追加/重写 `.aih/memory.md`，跨会话持久化知识 | allow |
+| `memory_recall` | 检索项目+用户记忆：自由文本 query → 词元重叠打分返回最相关条目（零依赖，注入块被预算截断时的兜底召回） | allow |
 | `question` | 模型向用户提问并等待回答（TUI 内联问答行） | allow |
 | `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断）。浏览器级 UA + Accept 头、网络失败有界重试 1 次、Cloudflare 403 challenge 自动换诚实 UA 重试、`timeout` 参数（秒，默认 30、上限 120）、下载前 content-length 预检、失败信息可操作（提示替代端点/websearch） | allow |
 | `websearch` | DuckDuckGo 搜索（标题/URL/摘要，免 key） | allow |
@@ -1128,7 +1138,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 | 流式断流防护+诚实续传（stall 看门狗） | — | ◐ | ◐ | — | ✅ CC#49（首 token/帧间超时，partial 保留+有界续跑） |
 | 配额耗尽自动等待+重发被拒调用 | — | ◐ | ◐ | — | ✅ CC#51（quota/limit/credits 或 Retry-After≥60s，交互自动续、run 快速失败） |
 | 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
-| 项目记忆（memory.md + 注入预算） | — | — | ✅ | — | ✅ |
+| 项目记忆（memory.md + 注入预算 + 词元检索召回） | — | — | ✅ | — | ✅（KL-R#2 `memory_recall`） |
 | Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
 | 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ✅ 串行 `task` + **并行 `best_of_n`**（Max Mode，P2#9）+ **Agent Teams**（D#15） |
 | 并行工具调用（读类 ≤N 有界并发） | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29（写类恒串行） |
