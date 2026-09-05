@@ -390,7 +390,9 @@ export function loadSafety(): SafetyConfig {
 export function loadPermissionRules(): PermissionRule[] {
   const out: PermissionRule[] = [];
   for (const layer of loadLayers()) {
-    for (const rule of layer.config.permissions ?? []) out.push(rule);
+    // KL-R#5 — provenance: each rule carries the config file it came from, so
+    // the gate can surface "denied by <file>" on rejections.
+    for (const rule of layer.config.permissions ?? []) out.push({ ...rule, source: layer.path });
   }
   return out;
 }

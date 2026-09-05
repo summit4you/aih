@@ -85,7 +85,7 @@ export class SessionGate implements ApprovalGate {
 
   #remember(req: ApprovalRequest): string {
     const scope = deriveScope(req);
-    const rule: PermissionRule = { tool: req.tool, pattern: scope, action: "allow" };
+    const rule: PermissionRule = { tool: req.tool, pattern: scope, action: "allow", source: "session (this run)" };
     this.#ruleset.add(rule);
     let saved = "this session only";
     if (this.#persist) {
@@ -96,6 +96,46 @@ export class SessionGate implements ApprovalGate {
       }
     }
     return `${req.tool} ${scope} → allow (${saved})`;
+  }
+
+  /**
+   * Textual-grant bridge — the model calls this (via the `permissions` tool)
+   * when the user grants write access in plain conversation ("直接写，不用确认").
+   * WITHOUT this, such a message is only model-visible text: the gate keeps
+   * prompting on every write, which is exactly the new-install UX complaint.
+   *
+   * Guardrail: the grant itself passes through ONE human confirm — the model
+   * must never be able to escalate permissions unilaterally. If this TUI has
+   * no confirm channel (headless), the grant is refused.
+   */
+  async grantRule(rule: PermissionRule): Promise<{ ok: boolean; note: string }> {
+    const action = rule.action === "deny" ? "deny" : "allow";
+    const grant: PermissionRule = { ...rule, action };
+    const detail = `grant ${grant.tool} ${grant.pattern ?? "*"} → ${action}`;
+    if (this.#tui) {
+      const answer = await this.#tui.askConfirm(`${detail} (confirmed by conversation — remember?)`, "permission");
+      if (answer === "deny") return { ok: false, note: "grant refused by user" };
+      // "once" here would defeat the point (the user already granted in
+      // conversation); both once/always persist for this session, always
+      // also persists to disk.
+    }
+    this.#ruleset.add(grant);
+    let saved = "this session only";
+    if (this.#persist) {
+      try {
+        saved = `saved to ${this.#persist(grant)}`;
+      } catch {
+        saved = "session only (persist failed)";
+      }
+    }
+    const note = `${detail} (${saved})`;
+    if (this.#tui) this.#tui.pushSystem(`[gate] ${note}`);
+    return { ok: true, note };
+  }
+
+  /** Current ruleset snapshot (for the `permissions` tool's status action). */
+  rulesSnapshot(): PermissionRule[] {
+    return this.#ruleset.rules.map((r) => ({ ...r }));
   }
 
   /**
@@ -113,7 +153,17 @@ export class SessionGate implements ApprovalGate {
   async request(req: ApprovalRequest): Promise<boolean> {
     const action = this.#ruleset.evaluate(req);
     if (action === "allow") return true;
-    if (action === "deny") return false;
+    if (action === "deny") {
+      // KL-R#5 — provenance: surface WHERE the denial came from, so operators
+      // see "denied by .aih/config.json" instead of an unexplained veto.
+      const winner = this.#ruleset.explain(req);
+      if (winner?.source && this.#tui) {
+        this.#tui.pushSystem(`denied by ${winner.source} (${winner.tool} ${winner.pattern ?? "*"})`);
+      } else if (winner?.source) {
+        process.stderr.write(`[gate] denied by ${winner.source} (${winner.tool} ${winner.pattern ?? "*"})\n`);
+      }
+      return false;
+    }
     // CC#54 — autoAllowReadonly: with no EXPLICIT ruleset decision (undefined
     // = rules never mentioned this tool), a provably read-only command may
     // pass without prompting. Never overrides deny/ask rules — the floor

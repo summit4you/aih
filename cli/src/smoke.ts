@@ -2643,6 +2643,50 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // IT#5 UX regression — the run-or-copy prompt used to render the keys
+  // `[R]un [C]opy [N]o` while the footer hint hard-coded `y once · a always
+  // · n deny`, so users pressed y/a/n and nothing happened. The hint is now
+  // mode-aware, and the keymap itself is locked here: R/C/N act, y/a/n are
+  // inert in run-or-copy (they are the CONFIRM-mode keys).
+  const { Tui } = await import("./tui.js");
+  const mkTui = () =>
+    new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+  {
+    const tui = mkTui();
+    const p = tui.askRunOrCopy("npm run build", "scope");
+    tui.feed("y"); // confirm-mode key — must NOT answer run-or-copy
+    const stillOpen = await Promise.race([p.then(() => "answered"), new Promise((r) => setTimeout(() => r("OPEN"), 150))]);
+    assert(stillOpen === "OPEN", "run-or-copy: 'y' does not answer (hint no longer advertises it)");
+    tui.feed("R");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 200))]);
+    assert(out === "run", `run-or-copy R=run (got "${out}")`);
+  }
+  {
+    const tui = mkTui();
+    const p = tui.askRunOrCopy("ls", "s");
+    tui.feed("C");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 200))]);
+    assert(out === "copy", `run-or-copy C=copy (got "${out}")`);
+  }
+  {
+    const tui = mkTui();
+    const p = tui.askRunOrCopy("ls", "s");
+    tui.feed("N");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 200))]);
+    assert(out === "no", `run-or-copy N=no (got "${out}")`);
+  }
+  console.log("ok: run-or-copy keymap locked (R/C/N act, y/a/n inert; footer hint mode-aware)");
+}
+
+{
   // IT#3 — `?` prefix: classify + context composition (pure, no LLM).
   const {
     classifyQuestionPrefix,
@@ -7010,4 +7054,74 @@ function mkFinding(file: string, start: number, end: number, title: string): Fin
     );
   }
   console.log("ok: CL-R#3/KL-R#3/OMP-R#10 rejection semantics + subagent gate + replay filter passed");
+}
+
+{
+  // CL-R#1 / KL-R#1 / KL-R#5 / OMP-R#1+OCL-R#4 — review-candidate batch 2.
+  const { retryAfterHintFromHeaders, RulesetGate } = await import("@aih/core");
+
+  // OMP-R#1 — multi-source retry-hint parsing takes the MAXIMUM and rounds
+  // up; epoch values are disambiguated by magnitude.
+  {
+    const now = Date.UTC(2026, 8, 6, 12, 0, 0);
+    const fromMs = retryAfterHintFromHeaders({ "retry-after-ms": "2500" }, now);
+    assert(fromMs === 3, `OMP-R#1: retry-after-ms 2500 → 3s (got ${fromMs})`);
+    const fromMulti = retryAfterHintFromHeaders(
+      { "retry-after": "30", "x-ratelimit-reset": String(now / 1000 + 120) },
+      now,
+    );
+    assert(fromMulti === 120, `OMP-R#1: max(retry-after 30, epoch-reset 120) = 120 (got ${fromMulti})`);
+    const fromEpochMs = retryAfterHintFromHeaders(
+      { "x-ratelimit-reset-ms": String(now + 45_000) },
+      now,
+    );
+    assert(fromEpochMs === 45, `OMP-R#1: epoch-ms reset 45s ahead → 45 (got ${fromEpochMs})`);
+    const none = retryAfterHintFromHeaders({}, now);
+    assert(none === undefined, `OMP-R#1: no headers → undefined (got ${none})`);
+  }
+
+  // OCL-R#4 — a retry hint is a LOWER bound: backoff with a floor never
+  // waits less than the hint (jitter strictly upward).
+  {
+    const { retryBackoffMs } = await import("@aih/core");
+    for (let i = 0; i < 50; i += 1) {
+      const ms = retryBackoffMs(0, 2);
+      assert(ms >= 2000, `OCL-R#4: floor 2s → wait >= 2000ms (got ${ms})`);
+      assert(ms <= 3000, `OCL-R#4: floor 2s → wait <= 3000ms (hint*1.5 cap) (got ${ms})`);
+    }
+  }
+
+  // KL-R#1 — search timeout resolver + actionable error text.
+  {
+    const { SearchTimeoutError, searchTimeoutMs } = await import("./general-tools.js");
+    const prev = process.env.AIH_SEARCH_TIMEOUT_MS;
+    process.env.AIH_SEARCH_TIMEOUT_MS = "0";
+    assert(searchTimeoutMs() === 0, "KL-R#1: AIH_SEARCH_TIMEOUT_MS=0 disables the search budget");
+    process.env.AIH_SEARCH_TIMEOUT_MS = "1";
+    assert(searchTimeoutMs() === 1, "KL-R#1: AIH_SEARCH_TIMEOUT_MS=1 honored");
+    if (prev === undefined) delete process.env.AIH_SEARCH_TIMEOUT_MS;
+    else process.env.AIH_SEARCH_TIMEOUT_MS = prev;
+    const timeoutErr = new SearchTimeoutError(30_000);
+    assert(
+      timeoutErr.message.includes("narrow the search path"),
+      "KL-R#1: timeout error is actionable (narrow path / raise budget)",
+    );
+  }
+
+  // KL-R#5 — provenance: rules carry their source; explain() returns the
+  // winning rule for denial surfacing.
+  {
+    const parent = new RulesetGate(
+      { async request() { return false; } },
+      [{ tool: "run_cmd", pattern: "**", action: "deny", source: ".aih/config.json" }],
+    );
+    const winner = parent.explain({ tool: "run_cmd", kind: "write", args: { command: "x" } });
+    assert(
+      winner?.action === "deny" && winner.source === ".aih/config.json",
+      `KL-R#5: explain() returns the winning rule with its source (got ${JSON.stringify(winner)})`,
+    );
+    const noRule = parent.explain({ tool: "grep", kind: "read", args: {} });
+    assert(noRule === undefined, "KL-R#5: no matching rule → explain() undefined (base decided)");
+  }
+  console.log("ok: CL-R#1/KL-R#1/KL-R#5/OMP-R#1+OCL-R#4 patch guard + search timeout + provenance + retry hints passed");
 }

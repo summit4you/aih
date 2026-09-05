@@ -88,6 +88,7 @@ export {
   parseFrame,
   QuotaError,
   ReasoningRunawayError,
+  retryAfterHintFromHeaders,
   StallError,
 } from "./seams/llm-sse.js";
 export type { StreamAccumulator, ParseOptions, ProviderErrorClass } from "./seams/llm-sse.js";

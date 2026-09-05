@@ -146,6 +146,7 @@ import {
   consumeSSEStream,
   classifyProviderError,
   isQuotaExhaustion,
+  retryAfterHintFromHeaders,
   QuotaError,
   ReasoningRunawayError,
   StallError,
@@ -269,6 +270,11 @@ export class OpenAICompatibleLLM implements LLMAdapter {
 
     let lastError: unknown;
     let attempts = maxAttempts; // grows when a capacity-classified error shows up
+    // OCL-R#4 — a server Retry-After hint is a LOWER bound: the next wait
+    // must be at least that long (jitter rounds UP from the hint, never
+    // down), otherwise we deterministically re-hit the 429. undefined →
+    // plain symmetric-jitter exponential backoff.
+    let retryFloorSec: number | undefined;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (attempt > 0) {
         // Exponential backoff with ±25% jitter, capped at 8s per gap. Zen's
@@ -277,7 +283,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         // connection resets); opencode survives the same bursts by retrying
         // far longer than a flat ~2s budget, so its users never see them.
         req.onRetry?.(attempt, lastError);
-        await sleep(retryBackoffMs(attempt - 1));
+        await sleep(retryBackoffMs(attempt - 1, retryFloorSec));
       }
       let res: Response;
       try {
@@ -308,9 +314,15 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         // on a schedule (minutes). Throw QuotaError so the AgentLoop can wait
         // for the reset and re-issue the SAME call (instead of burning the
         // retry budget and ending the turn with an error).
-        const retryAfterRaw = res.headers.get("retry-after");
-        const retryAfterNum = retryAfterRaw ? Number(retryAfterRaw) : NaN;
-        const retryAfterSec = Number.isFinite(retryAfterNum) ? retryAfterNum : undefined;
+        // OMP-R#1 — take the MAXIMUM retry hint across ALL header sources
+        // (retry-after-ms / retry-after / x-ratelimit-reset*), not just
+        // retry-after; the horizon is authoritative, so the AgentLoop waits
+        // exactly as long as the provider demanded.
+        const retryAfterSec = retryAfterHintFromHeaders(res.headers);
+        // OCL-R#4 — remember the hint as the floor for the NEXT backoff gap
+        // (only for short/transient hints; long quota windows go through the
+        // QuotaError path, which waits exactly that long in the AgentLoop).
+        if (retryAfterSec !== undefined) retryFloorSec = retryAfterSec;
         if (isQuotaExhaustion(res.status, text, retryAfterSec)) {
           this.#notifyDeGrade("quota", message);
           throw new QuotaError(res.status, text, retryAfterSec ?? 0);
@@ -445,7 +457,14 @@ export const DEFAULT_RETRIES = 6;
  * Backoff before retry `attempt` (0-based): 400ms doubling to an 8s cap,
  * with ±25% jitter so concurrent clients don't re-synchronize.
  */
-export function retryBackoffMs(attempt: number): number {
+export function retryBackoffMs(attempt: number, floorSec?: number): number {
+  // OCL-R#4 — an authoritative server hint is a LOWER bound: wait at least
+  // that long, jitter strictly upward (hint → hint×1.5), so we never
+  // deterministically re-hit a 429 by waiting less than demanded.
+  if (floorSec !== undefined && floorSec > 0) {
+    const floorMs = Math.min(floorSec * 1000, 60_000);
+    return Math.round(floorMs * (1 + Math.random() * 0.5));
+  }
   const base = Math.min(8000, 400 * 2 ** Math.max(0, attempt));
   return Math.round(base * (0.75 + Math.random() * 0.5));
 }

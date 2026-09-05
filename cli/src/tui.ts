@@ -2248,7 +2248,7 @@ constructor(opts: TuiOptions) {
     const usage = this.#usageText();
     // Contextual footer: only what is actionable right now (progressive disclosure).
     let hint: string;
-    if (this.#confirmText) hint = "y once · a always · n deny";
+    if (this.#confirmText) hint = this.#confirmMode === "runorcopy" ? "R run · C copy · N no" : "y once · a always · n deny";
     else if (this.#question) hint = "enter answer · esc cancel";
     else if (this.#opts.busy()) hint = "esc escape twice to cancel · enter queues";
     else hint = "? help · /commands · ctrl-p palette · tab complete";

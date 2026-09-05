@@ -41,6 +41,16 @@ export interface GeneralToolsOptions {
    * (`judgeDegraded`) and warned, never silently dropped.
    */
   judge2?: LLMAdapter | (() => LLMAdapter | undefined);
+  /**
+   * Textual-grant bridge — the `permissions` tool turns a plain-conversation
+   * authorization ("直接写，不用确认") into a REAL permission rule. Absent →
+   * the tool is not registered. Structural typing: only these two methods
+   * are required, so the CLI passes its SessionGate directly.
+   */
+  permissions?: {
+    grantRule(rule: { tool: string; pattern?: string; action: "allow" | "deny" }): Promise<{ ok: boolean; note: string }>;
+    rulesSnapshot(): Array<{ tool: string; pattern?: string; action: "allow" | "ask" | "deny" }>;
+  };
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", ".hg", ".svn", "dist", "build"]);
@@ -105,9 +115,35 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`${re}$`);
 }
 
-function walk(base: string, out: string[]): void {
+// KL-R#1 — grep/glob share this synchronous walk; on a huge tree it can hang
+// the whole session (kilocode ripgrep timeout parity: hard-fail with an
+// actionable error instead of blocking forever). Deadline checked per
+// directory; default 30s, override with AIH_SEARCH_TIMEOUT_MS (0 = off).
+const SEARCH_TIMEOUT_DEFAULT_MS = 30_000;
+export function searchTimeoutMs(): number {
+  const raw = process.env.AIH_SEARCH_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return SEARCH_TIMEOUT_DEFAULT_MS;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : SEARCH_TIMEOUT_DEFAULT_MS;
+}
+
+export class SearchTimeoutError extends Error {
+  constructor(budgetMs: number) {
+    super(
+      `search timed out after ${Math.round(budgetMs / 1000)}s — narrow the search path or pattern ` +
+        `(or raise AIH_SEARCH_TIMEOUT_MS)`,
+    );
+    this.name = "SearchTimeoutError";
+  }
+}
+
+function walk(base: string, out: string[], deadlineMs?: number): void {
+  const budget = deadlineMs ?? searchTimeoutMs();
+  const start = Date.now();
+  const expired = (): boolean => budget > 0 && Date.now() - start > budget;
   const stack = [base];
   while (stack.length) {
+    if (expired()) throw new SearchTimeoutError(budget);
     const dir = stack.pop()!;
     let entries;
     try {
@@ -539,6 +575,52 @@ export function registerGeneralTools(
     },
   });
 
+  // Textual-grant bridge: lets the model convert a plain-conversation
+  // authorization ("直接写，不用确认") into a REAL permission rule instead of
+  // just acknowledging it in prose — which used to leave the gate prompting on
+  // every single write (the new-install "write command needs approval" UX
+  // complaint). The grant itself passes one human confirm inside the gate
+  // (grantRule), so the model can never escalate unilaterally.
+  if (opts.permissions) {
+    reg({
+      name: "permissions",
+      description:
+        "Read or change the session permission rules. Call `permissions` with {\"action\":\"status\"} to list " +
+        "current rules. When the USER explicitly grants tool access in conversation (e.g. \"直接写\", " +
+        "\"不用确认\", \"授权 write\"), convert it into a real rule with {\"action\":\"grant\",\"tool\":\"run_cmd\"} " +
+        "— the user is asked to confirm ONCE more inside the grant prompt, then writes stop prompting. " +
+        "Only grant what the user actually said; never grant on your own initiative.",
+      kind: "read",
+      permission: "allow",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "grant"], description: "status = list rules; grant = add a rule" },
+          tool: { type: "string", description: "(grant) tool name or * — e.g. run_cmd" },
+          pattern: { type: "string", description: "(grant, optional) scope pattern, e.g. /workspace/** or * for everything" },
+          rule_action: { type: "string", enum: ["allow", "deny"], description: "(grant, default allow)" },
+        },
+        required: ["action"],
+      },
+      execute: async (args) => {
+        const a = args as { action?: unknown; tool?: unknown; pattern?: unknown; rule_action?: unknown };
+        const perms = opts.permissions; // capture: TS narrowing dies inside async closures
+        if (a.action === "grant" && perms) {
+          const tool = String(a.tool ?? "").trim();
+          if (!tool) throw new Error("grant needs a tool name (e.g. run_cmd) or *");
+          const rule = {
+            tool,
+            ...(a.pattern !== undefined && String(a.pattern).trim() ? { pattern: String(a.pattern).trim() } : {}),
+            action: (a.rule_action === "deny" ? "deny" : "allow") as "allow" | "deny",
+          };
+          const r = await perms.grantRule(rule);
+          return { ok: r.ok, note: r.note, rules: perms.rulesSnapshot() };
+        }
+        return { rules: (perms ?? { rulesSnapshot: () => [] as Array<{ tool: string; pattern?: string; action: "allow" | "ask" | "deny" }> }).rulesSnapshot() };
+      },
+    });
+  }
+
   reg({
     name: "question",
     description:
@@ -739,6 +821,16 @@ export function registerGeneralTools(
             i += 1;
           }
           mkdirSync(dirname(path), { recursive: true });
+          // CL-R#1 — Add File must never overwrite a real file (cline PR
+          // #13835 parity): "Add" means "this file does not exist yet"; a
+          // pre-existing target is a stale-patch / wrong-path bug and the
+          // patch MUST fail loudly instead of silently clobbering it.
+          if (existsSync(path)) {
+            throw new Error(
+              `Add File target already exists: ${path} — a patch may only ADD missing files. ` +
+                `Use "*** Update File: ${relative(cwd, path)}" to modify it, or delete the file first if it is genuinely stale.`,
+            );
+          }
           writeFileSync(path, `${content.join("\n")}\n`);
           applied.push(`A ${relative(cwd, path)}`);
           written.push(path);

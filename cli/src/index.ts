@@ -824,7 +824,8 @@ export function loadSystemPrompt(): string {
   // compaction summary can never bury it (observed: after compaction the
   // English summary pushed the mid-prompt language rule out of reach and the
   // agent reverted to English notes). Nothing else is appended after it.
-  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${LIVE_VERIFY_DISCIPLINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}`;
+  const guard = `\n\n# Completion honesty rules\n${FINAL_STATE_GUARD}\n\n${TASK_CONTRACT_RULES}\n\n${REPAIR_DOCTRINE}\n\n${LIVE_VERIFY_DISCIPLINE}\n\n${DECISION_QUESTION_RULE}\n\n${TOOL_OUTPUT_NOTES}\n\n# Permission grants
+When the user grants tool access in plain conversation (e.g. "直接写", "不用确认", "授权 write", "you can write directly"), acknowledge it AND convert it into a real rule by calling the permissions tool with {"action":"grant","tool":"run_cmd"} — prose acknowledgment alone does NOT change the permission gate, and write commands will keep prompting otherwise. Only grant what the user actually said, never on your own initiative; the grant prompts the user for one final confirmation.`;
   // opencode `rules` parity — AGENTS.md / CLAUDE.md / config `instructions`
   // are merged in as mandatory project rules.
   const rules = renderRules(collectRulesSync());
@@ -1153,6 +1154,18 @@ export function registerLocalTools(
       // registry in every path); absent → shell_context reports "not wired".
       logProvider: logRef ? () => logRef.current ?? undefined : undefined,
       ask: (q) => (tuiRef.current ? tuiRef.current.askQuestion(q) : makeStdinAsk(q)),
+      // Textual-grant bridge: the `permissions` tool turns a plain-conversation
+      // authorization ("直接写，不用确认") into a REAL allow rule (one human
+      // confirm inside the grant). Only wired when the gate exposes the
+      // grant API — SessionGate does; bare ApprovalGate base gates don't.
+      ...(typeof (gate as { grantRule?: unknown }).grantRule === "function"
+        ? {
+            permissions: {
+              grantRule: (gate as unknown as { grantRule: (r: { tool: string; pattern?: string; action: "allow" | "deny" }) => Promise<{ ok: boolean; note: string }> }).grantRule.bind(gate),
+              rulesSnapshot: (gate as unknown as { rulesSnapshot: () => Array<{ tool: string; pattern?: string; action: "allow" | "ask" | "deny" }> }).rulesSnapshot.bind(gate),
+            },
+          }
+        : {}),
       // Two-judge panel for best_of_n (Freebuff BuffBench parity): opt-in via
       // AIH_SECOND_JUDGE_MODEL; absent → single judge (unchanged).
       judge2: () => buildJudge2Llm(flags),

@@ -372,6 +372,60 @@ const QUOTA_RE = /quota|limit|credits/i;
 const QUOTA_RETRY_AFTER_SEC = 60;
 
 /**
+ * OMP-R#1 — parse the authoritative retry horizon from EVERY hint source the
+ * provider may offer, taking the MAXIMUM (omp turn-recovery parity):
+ *   - `retry-after-ms` (Anthropic-style, milliseconds)
+ *   - `retry-after` (seconds — or an HTTP-date, resolved against now)
+ *   - `x-ratelimit-reset` / `x-ratelimit-reset-ms`
+ *     (epoch seconds vs epoch milliseconds disambiguated by magnitude:
+ *     >1e11 is ms, >1e9 is epoch seconds, smaller values are relative seconds)
+ * Returns seconds, rounded up (openclaw parity: a server hint is a LOWER
+ * bound — waiting less than it guarantees another 429).
+ */
+export function retryAfterHintFromHeaders(
+  headers: Record<string, string | string[] | undefined> | Headers | null | undefined,
+  now: number = Date.now(),
+): number | undefined {
+  if (!headers) return undefined;
+  const get = (name: string): string | undefined => {
+    if (typeof (headers as Headers).get === "function") {
+      const v = (headers as Headers).get(name);
+      return v ?? undefined;
+    }
+    const rec = headers as Record<string, string | string[] | undefined>;
+    const v = rec[name] ?? rec[name.toLowerCase()];
+    return Array.isArray(v) ? v[0] : v;
+  };
+  const candidatesSec: number[] = [];
+  const msRaw = get("retry-after-ms");
+  if (msRaw) {
+    const n = Number(msRaw);
+    if (Number.isFinite(n) && n > 0) candidatesSec.push(n / 1000);
+  }
+  const raRaw = get("retry-after");
+  if (raRaw) {
+    const n = Number(raRaw);
+    if (Number.isFinite(n) && n > 0) {
+      candidatesSec.push(n);
+    } else {
+      const d = Date.parse(raRaw); // HTTP-date
+      if (Number.isFinite(d)) candidatesSec.push(Math.max(0, (d - now) / 1000));
+    }
+  }
+  for (const name of ["x-ratelimit-reset-ms", "x-ratelimit-reset"]) {
+    const raw = get(name);
+    if (!raw) continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (n > 1e11) candidatesSec.push((n - now) / 1000); // epoch ms
+    else if (n > 1e9) candidatesSec.push(n - now / 1000); // epoch seconds
+    else candidatesSec.push(n); // relative seconds
+  }
+  if (!candidatesSec.length) return undefined;
+  return Math.max(...candidatesSec.map((s) => Math.ceil(s)));
+}
+
+/**
  * CC#51 — true when a 429 (or 402) is a quota/usage-window exhaustion rather
  * than a transient rate limit. `retryAfterSec` is the Retry-After header in
  * seconds (undefined when absent).

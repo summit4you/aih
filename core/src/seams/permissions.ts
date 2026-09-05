@@ -75,6 +75,13 @@ export interface PermissionRule {
   tool: string;
   pattern?: string;
   action: "allow" | "ask" | "deny";
+  /**
+   * KL-R#5 — provenance of this rule (config file path / "session" / "env").
+   * Not part of matching; the gate surfaces it on denials/asks so operators
+   * can see WHY a request was allowed or rejected ("denied by
+   * .aih/config.json").
+   */
+  source?: string;
 }
 
 const PATH_KEYS = ["path", "file", "dir", "directory", "target"] as const;
@@ -180,6 +187,30 @@ export class RulesetGate implements ApprovalGate {
       else if (rule.action === "allow" && action !== "ask" && action !== "deny") action = "allow";
     }
     return action;
+  }
+
+  /**
+   * KL-R#5 — the highest-priority matching rule for a request (the one whose
+   * action `evaluate` returned). Used by the SessionGate to surface WHERE a
+   * decision came from ("denied by ~/.aih/config.json"); undefined when no
+   * rule matched (the fallback/base decided).
+   */
+  explain(req: ApprovalRequest): PermissionRule | undefined {
+    const raw = targetOf(req);
+    const abs = raw ? resolve(raw) : undefined;
+    let winner: PermissionRule | undefined;
+    let rank = -1; // 2=deny, 1=ask, 0=allow
+    for (const rule of this.rules) {
+      if (!matchPattern(rule.pattern, raw) && !matchPattern(rule.pattern, abs)) continue;
+      const pathScoped = !!rule.pattern && rule.pattern !== "*" && rule.pattern !== "**";
+      if (!(pathScoped || rule.tool === req.tool || rule.tool === "*")) continue;
+      const r = rule.action === "deny" ? 2 : rule.action === "ask" ? 1 : 0;
+      if (r >= rank) {
+        rank = r;
+        winner = rule;
+      }
+    }
+    return winner;
   }
 
   async request(req: ApprovalRequest): Promise<boolean> {
