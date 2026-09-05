@@ -17,6 +17,18 @@ const DOOM_LOOP_ASK_AT = 3;
 const DOOM_LOOP_DENY_AT = 6;
 let hookCallSeq = 0;
 
+/**
+ * CL-R#3 — suffix appended to every permission-rejection error the model sees.
+ * Encodes cline's three-part semantics (USER_REJECTED_TOOL_REASON +
+ * TOOL_REJECTION_SUFFIX): a rejection is NOT a tool/system failure (no blind
+ * retry), nothing was executed (non-transient), and the model must clarify
+ * with the user before proceeding (not a termination signal). Kept in English
+ * — tool errors feed provider chat templates where English is the stable
+ * lingua franca for instruction-following.
+ */
+export const REJECTION_SUFFIX =
+  " -- NOT a tool or system failure. Clarify with the user before proceeding.";
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
   if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
@@ -114,7 +126,11 @@ export class ToolRegistry {
         : def.permission;
 
     if (decision === "deny") {
-      return { ok: false, error: `permission denied for ${name}`, permission: "denied" };
+      return {
+        ok: false,
+        error: `permission denied for ${name}${REJECTION_SUFFIX}`,
+        permission: "denied",
+      };
     }
 
     const hash = `${name}:${stableStringify(args)}`;
@@ -140,9 +156,16 @@ export class ToolRegistry {
           : {}),
       });
       if (!approved) {
+        // CL-R#3 — the rejection text the model sees carries the three-part
+        // semantics (rejection ≠ tool/system failure; not executed — do not
+        // blindly retry; clarify with the user before continuing). Without it
+        // the model reads a policy rejection as a transient failure and
+        // retries, or as a termination signal and stops.
         return {
           ok: false,
-          error: doomLoop ? "user stopped the repeated (doom-loop) call" : `user rejected ${name}`,
+          error: doomLoop
+            ? `user stopped the repeated (doom-loop) call${REJECTION_SUFFIX}`
+            : `user rejected ${name}${REJECTION_SUFFIX}`,
           permission: "denied",
         };
       }
@@ -173,7 +196,7 @@ export class ToolRegistry {
           if (approved) break; // continue with the call
           return {
             ok: false,
-            error: `user rejected ${name} (before-hook ask)`,
+            error: `user rejected ${name} (before-hook ask)${REJECTION_SUFFIX}`,
             permission: "denied",
           };
         }

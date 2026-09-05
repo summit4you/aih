@@ -315,12 +315,28 @@ export class SessionLog {
         : undefined;
     const messages: ChatMessage[] = [];
     if (systemContent) messages.push({ role: "system", content: systemContent });
+    // OMP-R#10 — replay-policy: a turn that ended in a provider-side refusal
+    // (stopReason "refusal"/"sensitive") must not replay its assistant output
+    // into the next conversation. Replaying a refusal makes the model think
+    // the refusal happened to IT (or worse, treats an API-level rejection as
+    // dialogue), polluting resume/restore. Filter those assistant messages out;
+    // the surrounding context (user ask + tool results) stays intact.
+    const refusalTurns = new Set<string>();
+    for (const e of this.#events) {
+      if (e.type === "turn/end") {
+        const r = e.stopReason.toLowerCase();
+        if (r.includes("refusal") || r.includes("sensitive")) refusalTurns.add(e.turnId);
+      }
+    }
     const pushMessage = (event: SessionEvent): void => {
       switch (event.type) {
         case "user/message":
           messages.push({ role: "user", content: event.text });
           break;
         case "assistant/message":
+          // OMP-R#10: skip assistant output of refused turns (provider-level
+          // refusal, not a genuine completed turn).
+          if (refusalTurns.has(event.turnId)) break;
           messages.push({
             role: "assistant",
             content: event.text,
@@ -331,6 +347,10 @@ export class SessionLog {
           const call = this.#events.find(
             (e) => e.type === "tool/call" && e.callId === event.callId,
           );
+          // OMP-R#10: a refused turn's assistant message is skipped below —
+          // its tool call/result pairs must go with it or strict chat
+          // templates see an orphan tool reply and reject the request.
+          if (call && call.type === "tool/call" && refusalTurns.has(call.turnId)) break;
           if (
             call &&
             call.type === "tool/call" &&

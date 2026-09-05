@@ -136,6 +136,31 @@ export class RulesetGate implements ApprovalGate {
   }
 
   /**
+   * KL-R#3 — build a subagent-scoped gate from an inherited deny set.
+   *
+   * Kilo semantics (subagent-permissions.ts): the parent's DENY rules and
+   * external-directory constraints propagate to the subagent, but the
+   * parent's ALLOW rules do NOT — a subagent stands on its own permissions.
+   * In AIH's non-interactive subagent there is nobody to answer an "ask"
+   * prompt, so write requests resolve to deny (returned as a tool error, the
+   * subagent keeps exploring — "拒绝≠终止"), while read requests pass so the
+   * subagent can do its research. task/todowrite are excluded by the caller
+   * (no recursive delegation).
+   */
+  static subagentGate(denyOnly: PermissionRule[]): ApprovalGate {
+    return new RulesetGate(
+      {
+        async request(req: ApprovalRequest): Promise<boolean> {
+          // No human in the subagent: writes are denied (surfaced as tool
+          // errors), reads pass so exploration continues.
+          return req.kind === "read";
+        },
+      },
+      denyOnly.map((r) => ({ ...r, action: "deny" as const })),
+    );
+  }
+
+  /**
    * CC#53 — evaluate the ruleset with a deny > ask > allow priority floor.
    * If ANY matching rule is "deny", the request is denied. Else if ANY is
    * "ask", it must be confirmed by a human (a later "allow" cannot lift this

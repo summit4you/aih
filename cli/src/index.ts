@@ -756,7 +756,13 @@ export function loadEnvFile(env: NodeJS.ProcessEnv = process.env): void {
 }
 
 function fitBudget(text: string, budget: number): string {
-  if (text.length > budget) return `${text.slice(0, Math.max(budget - 12, 0))}\n…(truncated)`;
+  if (text.length > budget) {
+    // OMP-R#7 + KL-R#2 — truncation carries an actionable marker so the model
+    // knows the memory was cut and how to retrieve the rest (edit the file or
+    // ask /memory for the live block), instead of silently believing the
+    // injected slice is the whole memory.
+    return `${text.slice(0, Math.max(budget - 64, 0))}\n…(memory truncated at budget — edit .aih/memory.md or use /memory to see the full block, then remember the key facts)`;
+  }
   return text;
 }
 

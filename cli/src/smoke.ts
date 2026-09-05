@@ -6884,3 +6884,130 @@ function mkFinding(file: string, start: number, end: number, title: string): Fin
   }
   console.log("ok: AC#2 code-intel primitives passed");
 }
+
+{
+  // CL-R#3 / KL-R#3 / OMP-R#10 — review-candidate increments (2026-09-05).
+  const { REJECTION_SUFFIX } = await import("@aih/core");
+  const { SessionGate, makeSubagentGate } = await import("./gate.js");
+  const { ToolRegistry } = await import("@aih/core");
+  const { SessionLog } = await import("@aih/core");
+
+  // CL-R#3 — every permission-rejection error the model sees carries the
+  // two-part semantics (not a tool failure; clarify before proceeding).
+  assert(
+    REJECTION_SUFFIX.includes("NOT a tool or system failure") &&
+      REJECTION_SUFFIX.includes("Clarify with the user"),
+    "CL-R#3: REJECTION_SUFFIX encodes not-a-failure + clarify semantics",
+  );
+  {
+    // CL-R#3 — reuse the MEA fake-LLM Guardian deny path (no human prompt):
+    // the injected notice must carry the two-part semantics, and the same
+    // suffix must appear on the ToolRegistry error the model actually reads.
+    const gateMod = await import("./gate.js");
+    const DenyHuman = { async request() { return false; } };
+    const denyLlm = { async complete() { return { text: '{"outcome":"deny","risk_level":"critical","rationale":"destructive"}' }; } };
+    let injected = "";
+    const g = new gateMod.SessionGate(
+      DenyHuman as never,
+      [],
+      undefined,
+      false,
+      {
+        llm: () => denyLlm as never,
+        inject: (t: string) => { injected = t; },
+      },
+    );
+    await g.request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
+    assert(
+      injected.includes("这不是工具或系统故障") && injected.includes("澄清后再继续"),
+      "CL-R#3: guardian denial notice carries the two-part (not-a-failure / clarify) semantics",
+    );
+    const reg = new ToolRegistry({ async request() { return false; } });
+    reg.register({
+      name: "write_thing",
+      description: "write probe",
+      kind: "write",
+      permission: "ask",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => "should never run",
+    });
+    const res = await reg.invoke("write_thing", {}, { turnId: "smoke" } as never);
+    assert(
+      res.ok === false &&
+        res.permission === "denied" &&
+        String(res.error).includes("user rejected write_thing") &&
+        String(res.error).includes("NOT a tool or system failure"),
+      "CL-R#3: rejected ask surfaces the two-part rejection suffix",
+    );
+  }
+
+  // KL-R#3 — subagent gate: parent deny propagates, parent allow does not,
+  // no human inside → write asks deny (as tool errors) while reads pass.
+  {
+    const { RulesetGate } = await import("@aih/core");
+    const parent = new RulesetGate(new (await import("./gate.js")).DenyGate(), [
+      { tool: "run_cmd", pattern: "**", action: "deny" },
+      { tool: "grep", pattern: "**", action: "allow" },
+    ]);
+    const sub = makeSubagentGate(parent);
+    const deniedRun = await sub.request({ tool: "run_cmd", kind: "write", args: { command: "rm -rf /" } });
+    const allowedGrep = await sub.request({ tool: "grep", kind: "read", args: {} });
+    const deniedWrite = await sub.request({ tool: "write_file", kind: "write", args: { path: "/tmp/x" } });
+    const allowedRead = await sub.request({ tool: "read_file", kind: "read", args: {} });
+    assert(deniedRun === false, "KL-R#3: parent deny rule propagates into the subagent gate");
+    assert(allowedGrep === true, "KL-R#3: parent allow does NOT block — read passes via subagent base");
+    assert(deniedWrite === false, "KL-R#3: write inside a subagent resolves to deny (no human to ask)");
+    assert(allowedRead === true, "KL-R#3: reads pass inside the subagent (exploration continues)");
+    const reg = new ToolRegistry(sub);
+    reg.register({
+      name: "probe",
+      description: "probe",
+      kind: "write",
+      permission: "ask",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => "never",
+    });
+    const res = await reg.invoke("probe", {}, { turnId: "smoke" } as never);
+    assert(
+      res.ok === false && res.permission === "denied",
+      "KL-R#3: rejected subagent call is a tool ERROR (拒绝≠终止 — the subagent keeps going)",
+    );
+  }
+
+  // OMP-R#10 — a turn that ended in a provider refusal (turn/end
+  // stopReason refusal/sensitive) does not replay its assistant output or
+  // tool pairs into the restored conversation.
+  {
+    const log = new SessionLog();
+    log.append({ type: "user/message", turnId: "t1", text: "do the thing" });
+    log.append({
+      type: "assistant/message",
+      turnId: "t1",
+      text: "I will not do that.",
+      toolCalls: [],
+    });
+    log.append({ type: "turn/end", turnId: "t1", stopReason: "refusal" });
+    log.append({ type: "user/message", turnId: "t2", text: "try again please" });
+    log.append({
+      type: "assistant/message",
+      turnId: "t2",
+      text: "done, all clear",
+      toolCalls: [],
+    });
+    log.append({ type: "turn/end", turnId: "t2", stopReason: "end_turn" });
+    const msgs = log.deriveMessages("sys").filter((m) => m.role !== "system");
+    assert(
+      !msgs.some((m) => String(m.content).includes("I will not do that")),
+      "OMP-R#10: refused turn's assistant output is filtered on replay",
+    );
+    assert(
+      msgs.some((m) => m.role === "user" && String(m.content).includes("do the thing")),
+      "OMP-R#10: the user request itself still replays (context intact)",
+    );
+    assert(
+      msgs.some((m) => String(m.content).includes("done, all clear")),
+      "OMP-R#10: normal turns replay untouched",
+    );
+  }
+  console.log("ok: CL-R#3/KL-R#3/OMP-R#10 rejection semantics + subagent gate + replay filter passed");
+}

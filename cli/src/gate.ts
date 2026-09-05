@@ -98,6 +98,18 @@ export class SessionGate implements ApprovalGate {
     return `${req.tool} ${scope} → allow (${saved})`;
   }
 
+  /**
+   * KL-R#3 — subagent permission inheritance: the parent's DENY rules (and
+   * only those) propagate to delegated subagents; parent ALLOW/ask rules do
+   * not. Returns copies so the caller can build a subagent-scoped gate
+   * without mutating the parent ruleset.
+   */
+  denyRules(): PermissionRule[] {
+    return this.#ruleset.rules
+      .filter((r) => r.action === "deny")
+      .map((r) => ({ ...r }));
+  }
+
   async request(req: ApprovalRequest): Promise<boolean> {
     const action = this.#ruleset.evaluate(req);
     if (action === "allow") return true;
@@ -147,7 +159,15 @@ export class SessionGate implements ApprovalGate {
             break; // human confirm below
           case "deny": {
             const interrupt = this.#guardianBreaker.recordDenial();
-            const notice = `[guardian] ✗ denied ${req.tool}${r.assessment?.rationale ? ` — ${r.assessment.rationale}` : ""}\n${GUARDIAN_CIRCUMVENTION_NOTICE}`;
+            // CL-R#3 — two-part denial message: the model must read a policy
+            // rejection as NOT a tool/system failure (never retry blindly) and
+            // NOT a termination signal — clarify with the user before
+            // proceeding. Same semantics as cline's USER_REJECTED_TOOL_REASON
+            // + `"-- NOT a tool or system failure. Clarify with user before
+            // proceeding."`.
+            const denialNoticeTail =
+              "这不是工具或系统故障，请向用户澄清后再继续（不要自动重试、不要将其当作终止信号）。";
+            const notice = `[guardian] ✗ denied ${req.tool}${r.assessment?.rationale ? ` — ${r.assessment.rationale}` : ""}\n${denialNoticeTail}\n${GUARDIAN_CIRCUMVENTION_NOTICE}`;
             guardian.inject?.(notice);
             if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}`);
             else process.stderr.write(`[guardian] ✗ denied ${req.tool}\n`);
@@ -239,4 +259,28 @@ export class SessionGate implements ApprovalGate {
       });
     });
   }
+}
+
+/**
+ * KL-R#3 — build the permission gate for a delegated subagent. Shared by the
+ * `task` tool and best_of_n's `runSubagent`. Kilo semantics: the parent's
+ * DENY rules propagate (red lines survive delegation), ALLOW/ask rules do
+ * not; with no human inside the subagent, asks resolve to deny and the
+ * subagent keeps going (rejection is surfaced as a tool error, never a
+ * crash — 拒绝≠终止). When the parent gate isn't a SessionGate (--yes
+ * AutoApprove, DenyGate), no deny rules are inherited — the
+ * read-passes/writes-deny base still applies, keeping subagents read-only
+ * explorers.
+ */
+export function makeSubagentGate(parent: ApprovalGate): ApprovalGate {
+  const p = parent as unknown as {
+    denyRules?: () => PermissionRule[];
+    rules?: PermissionRule[];
+  };
+  const denyRules = typeof p.denyRules === "function"
+    ? p.denyRules()
+    : Array.isArray(p.rules)
+      ? p.rules.filter((r) => r.action === "deny").map((r) => ({ ...r }))
+      : [];
+  return RulesetGate.subagentGate(denyRules);
 }

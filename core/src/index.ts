@@ -51,7 +51,7 @@ export type {
   ObserverToolResult,
   RepetitionObserverOptions,
 } from "./observers.js";
-export { ToolRegistry } from "./tool-registry.js";
+export { ToolRegistry, REJECTION_SUFFIX } from "./tool-registry.js";
 export type {
   ToolHookInfo,
   ToolHooks,

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
+import { makeSubagentGate } from "./gate.js";
 
 export interface SubagentOptions {
   gate: ApprovalGate;
@@ -77,9 +78,14 @@ export function answerCapLimit(): number {
 export async function runSubagent(o: SubagentOptions, prompt: string): Promise<SubagentResult> {
   const parent = o.toolsProvider();
   if (!parent) throw new Error("subagent has no parent tool registry");
-  const sub = new Registry(o.gate);
+  // KL-R#3 — subagent permission inheritance (see makeSubagentGate): parent's
+  // DENY rules propagate, ALLOW/ask do not; writes resolve to deny (no human
+  // inside the subagent) and the subagent keeps exploring.
+  const sub = new Registry(makeSubagentGate(o.gate));
   for (const schema of parent.schemas()) {
-    if (schema.name === "task" || schema.name === "question" || schema.name === "best_of_n") continue;
+    // KL-R#3 — same recursion guard as the task tool: no delegation, no
+    // rewriting the parent's todo state from inside a subagent.
+    if (schema.name === "task" || schema.name === "question" || schema.name === "best_of_n" || schema.name === "todowrite") continue;
     const def = parent.get(schema.name);
     if (def) sub.register(def);
   }

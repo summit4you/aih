@@ -11,6 +11,7 @@ import { publishFile } from "./atomic.js";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ApprovalGate, LLMAdapter, ToolHooks, ToolRegistry } from "@aih/core";
 import { AgentLoop, SessionLog, ToolRegistry as Registry } from "@aih/core";
+import { makeSubagentGate } from "./gate.js";
 import type { DiffLine } from "./diff.js";
 import { lineDiff } from "./diff.js";
 import { formatAfterWrite } from "./formatter.js";
@@ -901,9 +902,14 @@ export function registerGeneralTools(
       const llm = typeof opts.llm === "function" ? opts.llm() : opts.llm;
       const parent = opts.toolsProvider();
       if (!parent) throw new Error("task subagent has no parent tool registry");
-      const subRegistry = new Registry(opts.gate);
+      // KL-R#3 — subagent permission inheritance (see makeSubagentGate):
+      // parent's DENY rules propagate, ALLOW/ask do not; no human inside the
+      // subagent, so writes resolve to deny and the subagent keeps exploring.
+      const subRegistry = new Registry(makeSubagentGate(opts.gate));
       for (const schema of parent.schemas()) {
-        if (schema.name === "task" || schema.name === "question") continue;
+        // KL-R#3 — subagents must not delegate further (no task/best_of_n) nor
+        // rewrite the parent's todo state (no todowrite): recursion guard.
+        if (schema.name === "task" || schema.name === "question" || schema.name === "best_of_n" || schema.name === "todowrite") continue;
         const def = parent.get(schema.name);
         if (def) subRegistry.register(def);
       }
