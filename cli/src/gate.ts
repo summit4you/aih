@@ -34,6 +34,14 @@ export interface GuardianReviewer {
   llm: () => LLMAdapter | null;
   policy?: string;
   failClosed?: boolean;
+  /**
+   * B (2026-09-05, user-confirmed) — trust mode (AIH_GUARDIAN_TRUST=1):
+   * the reviewer's "allow" auto-approves at ANY risk level (not just low),
+   * so a medium-risk allow no longer falls back to a human prompt. "deny"
+   * still stops the action; "ask" still reaches the human. The reviewer is
+   * the sole decider — use only when you accept its judgment as binding.
+   */
+  trust?: boolean;
   /** Called after every Guardian review (for event persistence). */
   onReview?: (r: GuardianReviewResult, req: ApprovalRequest) => void;
   /** Inject text into the running agent's context (circumvention notice). */
@@ -205,15 +213,17 @@ export class SessionGate implements ApprovalGate {
         switch (r.decision) {
           case "allow": {
             // Low risk → Guardian auto-approves (takes over this ask). Higher
-            // risk still falls through to the human below.
+            // risk falls through to the human — UNLESS trust mode (B): there
+            // the reviewer's allow is binding at any risk level.
             const risk = r.assessment?.risk_level ?? "low";
             this.#guardianBreaker.recordPass();
-            if (risk === "low") {
-              if (this.#tui) this.#tui.pushSystem(`[guardian] ✓ ${req.tool} — low risk, auto-approved`);
-              else process.stderr.write(`[guardian] ✓ ${req.tool} — low risk, auto-approved\n`);
+            if (risk === "low" || guardian.trust) {
+              const why = guardian.trust && risk !== "low" ? ` — ${risk} risk, trust mode` : " — low risk";
+              if (this.#tui) this.#tui.pushSystem(`[guardian] ✓ ${req.tool}${why}, auto-approved`);
+              else process.stderr.write(`[guardian] ✓ ${req.tool}${why}, auto-approved\n`);
               return true;
             }
-            break; // medium/high risk → human confirm below
+            break; // medium/high risk, no trust → human confirm below
           }
           case "ask":
             this.#guardianBreaker.recordPass();
@@ -234,16 +244,42 @@ export class SessionGate implements ApprovalGate {
             if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}${rationale}`);
             else process.stderr.write(`[guardian] ✗ denied ${req.tool}${rationale}\n`);
             if (interrupt) guardian.interrupt?.("guardian circuit breaker: consecutive denials reached threshold");
+            // C (2026-09-05, user-confirmed) — one-key grant on deny: pressing
+            // [g] at the keyboard writes a session allow rule for this
+            // request's scope (same scope as the "always" confirm). The
+            // ruleset allow then short-circuits the gate BEFORE the guardian
+            // ever runs again, so a repeatedly-denied pattern stops costing a
+            // review round-trip. The grant is explicit keyboard authorization
+            // — the model cannot press keys (CC#60: only "tty" input may
+            // answer), and it never fires when the breaker just interrupted.
+            if (!interrupt && req.source !== "injected" && this.#tui) {
+              const granted = await (
+                this.#tui as unknown as { askGrantScope?: (detail: string, scope: string) => Promise<boolean> }
+              ).askGrantScope?.(req.tool, deriveScope(req));
+              if (granted === true) {
+                const line = `granted: ${this.#remember(req)}`;
+                if (this.#tui) this.#tui.pushSystem(line);
+                else process.stderr.write(`${line}\n`);
+                // Close the loop for the model: the denial notice told it to
+                // clarify with the user; the user just DID (pressed [g]). Tell
+                // it the scope is now pre-authorized so it can retry instead of
+                // stalling in the "denied — clarify" state.
+                guardian.inject?.(
+                  `[gate] the user has explicitly pre-authorized ${req.tool} for this scope — the denial above is superseded; retry the action if it is still needed.`,
+                );
+              }
+            }
             // Execution-first semantics (user-confirmed): a guardian DENY does
-            // NOT open a second interactive prompt — in a long unattended loop
-            // that would stall the run on every reviewer misjudgment (a
-            // harmless `tar tzf … | grep | head` was once mis-read as
-            // "truncated/malformed"). Instead: refuse immediately, tell the
-            // model who denied and why (via the injected notice + the
-            // lastDenySource flag the tool error surfaces), and let the user
-            // PRE-authorize the pattern via the `permissions` grant bridge —
-            // a ruleset allow short-circuits the gate before the guardian ever
-            // runs, so granted loops never stall.
+            // NOT open a second interactive prompt for the action ITSELF — in
+            // a long unattended loop that would stall the run on every
+            // reviewer misjudgment (a harmless `tar tzf … | grep | head` was
+            // once mis-read as "truncated/malformed"). Instead: refuse
+            // immediately, tell the model who denied and why (via the
+            // injected notice + the lastDenySource flag the tool error
+            // surfaces), and let the user PRE-authorize the pattern via the
+            // [g] grant above or the `permissions` grant bridge — a ruleset
+            // allow short-circuits the gate before the guardian ever runs,
+            // so granted loops never stall.
             this.lastDenySource = "guardian";
             return false;
           }

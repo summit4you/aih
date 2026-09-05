@@ -830,6 +830,30 @@ constructor(opts: TuiOptions) {
   }
 
   /**
+   * C (2026-09-05) — one-key grant offered AFTER a Guardian deny.
+   * `[g]` grants an allow rule for this scope (same semantics as "always" —
+   * the gate writes the rule; it persists to disk when a persist hook exists),
+   * `[n]` declines. The gate then denies THIS action (the denial already
+   * happened) but the pattern is pre-authorized for the rest of the run.
+   * Resolves false for anything other than g/G (Esc, Enter, other keys).
+   */
+  askGrantScope(tool: string, scope: string): Promise<boolean> {
+    this.pushSystem(`guardian denied ${tool} — allow this scope anyway?`);
+    this.#confirmText = `[g] grant ${scope}   [n] no`;
+    this.requestPaint();
+    return new Promise((resolve) => {
+      this.#confirm = (ans) => {
+        this.#confirm = null;
+        this.#confirmText = "";
+        const granted = ans === "always";
+        this.pushSystem(granted ? "granted — this scope is now pre-authorized" : "grant declined");
+        this.requestPaint();
+        resolve(granted);
+      };
+    });
+  }
+
+  /**
    * IT#5 — run-or-copy approval for a WRITE shell command. Renders
    * `[R]un / [C]opy / [N]o` and resolves with the choice. The gate owns the
    * side-effects + outcome reporting (it does the clipboard copy for "copy");

@@ -204,6 +204,13 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     }
     assert(threw, "MEA parseGuardianAssessment: invalid outcome throws");
 
+    // A (2026-09-05) — default policy now carries an explicit ALLOW bias for
+    // routine workspace work and reserves deny for red lines only.
+    assert(/LOW risk → ALLOW/.test(mea.DEFAULT_GUARDIAN_POLICY), "MEA A: default policy declares LOW-risk workspace work → ALLOW");
+    assert(/Credential\/secret/i.test(mea.DEFAULT_GUARDIAN_POLICY), "MEA A: default policy keeps credential handling as a red line");
+    assert(/ONLY grounds to deny/.test(mea.DEFAULT_GUARDIAN_POLICY), "MEA A: default policy scopes deny to red lines only");
+    assert(/red lines/i.test(mea.GUARDIAN_POLICY_TEMPLATE), "MEA A: reviewer template restates the red-lines-only deny rule");
+
     // runGuardianReview with a fake LLM (allow / deny / malformed→deny-failclosed).
     const fakeLlm = (text: string) => ({
       async complete() {
@@ -334,6 +341,73 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     const failClosedGate = gateWithGuardian(errLlm, true);
     const failClosedDenied = await failClosedGate.request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
     assert(failClosedDenied === false, "MEA SessionGate+Guardian: reviewer error + failClosed → deny (no prompt)");
+
+    // B (2026-09-05) — trust mode: a MEDIUM-risk allow is BINDING (auto-
+    // approved, no human prompt). Same assessment without trust still falls
+    // through to the human confirm below.
+    const mediumAllowLlm = { async complete() { return { text: '{"outcome":"allow","risk_level":"medium"}' }; } };
+    const trustGate = new gateMod.SessionGate(
+      DenyHuman as never, [], undefined, false,
+      { llm: () => mediumAllowLlm as never, trust: true, inject: (t: string) => { injected += t; } },
+    );
+    const trustOk = await trustGate.request({ tool: "npm_install", kind: "write", args: { command: "npm i" }, source: "tty" });
+    assert(trustOk === true, "MEA B: trust mode — medium-risk allow auto-approves (no human prompt)");
+    const noTrustGate = new gateMod.SessionGate(
+      DenyHuman as never, [], undefined, false,
+      { llm: () => mediumAllowLlm as never, inject: (t: string) => { injected += t; } },
+    );
+    (noTrustGate as { attachTui(t: unknown): void }).attachTui({
+      askConfirm: async () => "deny",
+      pushSystem: () => {},
+    });
+    const noTrustOk = await noTrustGate.request({ tool: "npm_install", kind: "write", args: { command: "npm i" }, source: "tty" });
+    assert(noTrustOk === false, "MEA B: without trust — medium-risk allow still falls to human confirm (stub denied)");
+
+    // C (2026-09-05) — one-key grant after a Guardian deny: pressing [g]
+    // writes an allow rule for the scope; the SAME request then passes with
+    // ZERO further reviewer calls (ruleset allow short-circuits before the
+    // guardian runs). Declining ([n]) leaves no rule behind.
+    let denyCalls = 0;
+    const countingDenyLlm = { async complete() { denyCalls += 1; return { text: '{"outcome":"deny","risk_level":"high","rationale":"test"}' }; } };
+    const grantStub = {
+      granted: [] as string[],
+      pushSystem: (t: string) => { if (t.startsWith("granted:")) grantStub.granted.push(t); },
+      askGrantScope: async (_tool: string, scope: string) => { grantStub.granted.push(`ask:${scope}`); return true; },
+    };
+    const cGate = new gateMod.SessionGate(
+      DenyHuman as never, [], undefined, false,
+      { llm: () => countingDenyLlm as never, inject: (t: string) => { injected += t; } },
+    );
+    (cGate as { attachTui(t: unknown): void }).attachTui(grantStub);
+    const cFirst = await cGate.request({ tool: "deploy", kind: "write", args: { path: "/srv/x" }, source: "tty" });
+    assert(cFirst === false, "MEA C: deny still refuses THIS action");
+    assert(denyCalls === 1, "MEA C: reviewer consulted exactly once for the denied action");
+    assert(grantStub.granted.some((g) => g.startsWith("ask:")), "MEA C: grant prompt was offered after the deny");
+    assert(grantStub.granted.some((g) => g.startsWith("granted:")), "MEA C: grant surfaced as a remembered allow rule");
+    const snapshot = (cGate as unknown as { rulesSnapshot(): { tool: string; action: string }[] }).rulesSnapshot();
+    assert(snapshot.some((r) => r.action === "allow"), "MEA C: ruleset now carries an allow rule for the scope");
+    const cSecond = await cGate.request({ tool: "deploy", kind: "write", args: { path: "/srv/x" }, source: "tty" });
+    assert(cSecond === true, "MEA C: same scope re-request is auto-approved after the grant");
+    assert(denyCalls === 1, "MEA C: NO further reviewer call — the allow rule short-circuits the guardian");
+    assert(injected.includes("pre-authorized"), "MEA C: the model is told the denial is superseded (may retry)");
+    // Decline path: [n] → still denied, no allow rule added.
+    const denyCalls2 = { n: 0 };
+    const countingDenyLlm2 = { async complete() { denyCalls2.n += 1; return { text: '{"outcome":"deny","risk_level":"high"}' }; } };
+    const declineStub = {
+      rules: 0,
+      pushSystem: () => {},
+      askGrantScope: async () => false,
+    };
+    const declineGate = new gateMod.SessionGate(
+      DenyHuman as never, [], undefined, false,
+      { llm: () => countingDenyLlm2 as never, inject: (t: string) => { injected += t; } },
+    );
+    (declineGate as { attachTui(t: unknown): void }).attachTui(declineStub);
+    const injectedBefore = injected.length;
+    const declined = await declineGate.request({ tool: "deploy", kind: "write", args: { path: "/srv/y" }, source: "tty" });
+    const declineRules = (declineGate as unknown as { rulesSnapshot(): { action: string }[] }).rulesSnapshot();
+    assert(declined === false && declineRules.every((r) => r.action !== "allow"), "MEA C: declining the grant adds no allow rule — still denied");
+    assert(injected.slice(injectedBefore).includes("denied") && !injected.slice(injectedBefore).includes("pre-authorized"), "MEA C (decline): denial still surfaced, but no supersede/retry notice is injected");
 
     console.log("ok: MEA 判定层（parse / circuit-breaker / auditor / ledger / describeAction / SessionGate）passed");
   }

@@ -153,12 +153,17 @@ roadmap 最高优先级项（LH#1 LongHorizon Auditor + CX-R#1 codex Guardian �
 为 AIH 补齐此前未实施的"独立判定角色"——主 agent 之外的第二双眼睛：
 
 - **写动作 Guardian（默认开启，接管 ask 流程）**：需批准（ask）的写操作在弹人工确认前，
-  先由独立无工具 LLM 按声明式 policy（`AIH_GUARDIAN_POLICY`，缺省内置白名单）评估
+  先由独立无工具 LLM 按声明式 policy（`AIH_GUARDIAN_POLICY`，缺省内置 policy）评估
   `risk × authorization → allow/deny/ask`。低风险 allow 自动放行不打扰、deny 拒绝并注入
   "不得规避达成同一结果"、连续 deny≥3 触发 circuit-breaker 注入停止指令。**fail-closed**：
   超时/解析失败/LLM 错误 → deny（`AIH_GUARDIAN_FAIL_CLOSED=1`），否则安全降级为人工确认。
   无 API key/无可配 LLM 时自动降级回原人工 gate（零行为变化）——这是本地确定性的默认兜底。
   用 `--no-guardian` 或 `AIH_GUARDIAN=0` 关闭。
+  **体验松绑三件套（2026-09-05）**：① 内置 policy 改为「workspace 常规写 = 低风险 → allow 倾向」，
+  只保留真正红线域（凭据/密钥、数据外泄、破坏性批量删除、策略规避）作为 deny 依据，从源头减少误 deny；
+  ② `AIH_GUARDIAN_TRUST=1` 信任模式——Guardian 的 allow 在**任意**风险级都直接放行（medium 不再回落人工），
+  deny 仍拦截；③ deny 时键盘弹 `[g] grant <scope>`——按一次即写入会话 allow 规则，同 scope 永久短路
+  Guardian 不再审（按 `[n]` 拒绝则仅本次拒绝）。
 - **完成产物 Auditor（/goal 独立验证）**：goal 裁判判 met 后，再由独立 Auditor LLM 依据
   **verified-state ledger**（从会话日志采集真实工具输出，而非 agent 自述）审计真实产物，
   产出 AuditReport；只有 `complete + contract_aligned + integrity≥0.9` 才算 trusted state，
@@ -998,7 +1003,8 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_SENSOR_TIMEOUT_MS` (60000) | PE#1 单条传感器命令超时 |
 | `AIH_GUARDIAN` (1) | MEA 写动作 Guardian：需批准写操作先由独立无工具 LLM 按声明式 policy 评估（`0` 与 `--no-guardian` 关闭，回落纯人工确认） |
 | `AIH_GUARDIAN_FAIL_CLOSED` | Guardian 审核超时/解析失败/LLM 错误时 fail-closed → deny（未设则安全降级为人工确认） |
-| `AIH_GUARDIAN_POLICY` | Guardian 声明式 policy.md 文本（缺省用内置白名单） |
+| `AIH_GUARDIAN_POLICY` | Guardian 声明式 policy.md 文本（缺省用内置 policy，含「workspace 常规写=低风险→allow 倾向」） |
+| `AIH_GUARDIAN_TRUST` (0) | 信任模式：Guardian 的 allow 在**任意**风险级直接放行（medium 不再回落人工）；deny 仍拦截 |
 
 ### 会话标题（隐藏系统 agent）
 

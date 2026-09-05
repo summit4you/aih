@@ -94,13 +94,36 @@ Rules:
   {"risk_level":"<low|medium|high|critical>","user_authorization":"<unknown|low|medium|high>","outcome":"<allow|deny|ask>","rationale":"<one sentence>"}
 - Truncated/absent context is NOT safe — assume the worst for anything you cannot see.
 - If you cannot confidently allow, output "deny" or "ask". Deny if the action could
-  bypass policy or is destructive without explicit authorization.`;
+  bypass policy or is destructive without explicit authorization.
+- The policy's red lines (credential/secret handling, exfiltration, destructive bulk
+  delete, policy circumvention) are the ONLY grounds to deny. Routine workspace
+  work — build, test, edits, dev tooling, ordinary shell commands inside the workspace —
+  is LOW risk: prefer "allow". Do not deny a routine action for speculative or
+  hypothetical harm that is not in the policy.`;
 
-/** 默认内置 policy（无显式 policy.md 时使用，本地确定性白名单为纲）。 */
-export const DEFAULT_GUARDIAN_POLICY = `Destructive actions (delete, overwrite, formatting, credential/secret handling) are HIGH/critical risk and require strong user authorization.
-Actions touching files outside the workspace are forbidden unless explicitly authorized.
-Credential-probing, exfiltration, or policy-circumvention actions are DENIED.
-Routine build/test/read of the workspace is low risk.`;
+/**
+ * 默认内置 policy（无显式 policy.md 时使用）。
+ * A（2026-09-05，用户确认）— 从「红线域默认高危」改为「workspace 常规写 = 低风险 →
+ * allow 倾向」，只保留真正的红线域（凭据/密钥、数据外泄、破坏性批量删除、策略规避、
+ * workspace 外）。根因：旧的极简 policy 没有 allow 倾向，reviewer LLM 把无害操作
+ * （`tar tzf | grep`、常规构建命令）误判成 deny，反复打断实现。
+ */
+export const DEFAULT_GUARDIAN_POLICY = `LOW risk → ALLOW (no human needed):
+- Build, test, typecheck, lint, format, dev tooling inside the workspace.
+- Reading, creating, editing, renaming files inside the workspace.
+- Ordinary shell commands that operate on workspace paths (git status/add/commit, npm scripts,
+  tar/cp/mv within the workspace, pipes to grep/head).
+
+MEDIUM risk → "ask" (human decides):
+- Writing or touching files outside the workspace.
+- Installing packages, network POSTs, or commands with broad side effects.
+
+HIGH / CRITICAL risk → DENY unless the user has explicitly authorized this exact action:
+- Deleting in bulk (rm -rf, find -delete, drop table/truncate), overwriting untracked user data.
+- Credential/secret handling: reading, printing, moving, or exfiltrating tokens, keys, .env.
+- Data exfiltration, policy circumvention, or any action designed to bypass this policy.
+
+Red lines are the ONLY grounds to deny. A routine workspace action is never a red line.`;
 
 /** deny 后注入「不得规避达成同一结果」（对齐 codex GUARDIAN_REJECTION_INSTRUCTIONS）。 */
 export const GUARDIAN_CIRCUMVENTION_NOTICE =

@@ -291,7 +291,10 @@ Options:
                               (on by default: independent LLM reviews "ask" write
                               actions before the human prompt; low-risk
                               auto-approved, denials inject a no-circumvention
-                              notice, circuit-breaker interrupts after 3)
+                              notice, circuit-breaker interrupts after 3;
+                              deny prompt offers [g] to pre-authorize the scope;
+                              AIH_GUARDIAN_TRUST=1 makes its allow binding at
+                              any risk level)
       --no-stream             buffer full responses instead of streaming
       --no-dev              disable the default local toolset (dev tools
                               list_dir, read_file, write_file[ask], run_cmd[ask]
@@ -336,6 +339,9 @@ Environment:
   AIH_GUARDIAN_FAIL_CLOSED ("1" → Guardian failure/timeout denies instead of
     degrading to a human prompt)
   AIH_GUARDIAN_POLICY (custom declarative policy text; else a built-in default)
+  AIH_GUARDIAN_TRUST ("1" → Guardian "allow" is binding at ANY risk level —
+    a medium-risk allow no longer falls back to a human prompt; "deny" still
+    stops the action)
 
 Examples:
   aih run "add a todo buy milk" --mock
@@ -875,7 +881,8 @@ export function makeSessionGate(flags: Record<string, string | boolean>): Sessio
  * MEA — build a GuardianReviewer for the interactive loop. Default ON (unless
  * `--no-guardian` / AIH_GUARDIAN=0). The reviewer LLM is resolved lazily (null
  * when no model is configured → pure-human fallback). `failClosed` from
- * AIH_GUARDIAN_FAIL_CLOSED=1; `policy` from AIH_GUARDIAN_POLICY (or default).
+ * AIH_GUARDIAN_FAIL_CLOSED=1; `policy` from AIH_GUARDIAN_POLICY (or default);
+ * `trust` from AIH_GUARDIAN_TRUST=1 (allow is binding at any risk level).
  * `inject`/`interrupt` reach into `loop`; `onReview` surfaces a TUI row.
  */
 export function buildGuardianReviewer(
@@ -888,6 +895,7 @@ export function buildGuardianReviewer(
 ): GuardianReviewer | undefined {
   if (bool(flags, "no-guardian") || process.env.AIH_GUARDIAN === "0") return undefined;
   const failClosed = process.env.AIH_GUARDIAN_FAIL_CLOSED === "1";
+  const trust = process.env.AIH_GUARDIAN_TRUST === "1";
   const policy = process.env.AIH_GUARDIAN_POLICY?.length ? process.env.AIH_GUARDIAN_POLICY : undefined;
   return {
     llm: () => {
@@ -900,6 +908,7 @@ export function buildGuardianReviewer(
     },
     ...(policy ? { policy } : {}),
     ...(failClosed ? { failClosed: true } : {}),
+    ...(trust ? { trust: true } : {}),
     inject: (text) => refs.loop()?.inject(text),
     interrupt: (reason) => {
       const loop = refs.loop();
