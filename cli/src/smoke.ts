@@ -179,6 +179,131 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     }
   }
 
+  // --- MEA: 独立判定层（写动作 Guardian + 完成 Auditor）----------------------
+  {
+    const mea = await import("./mea.js");
+    // parseGuardianAssessment: full / minimal / fenced / malformed→throws.
+    const full = mea.parseGuardianAssessment(
+      '```json\n{"risk_level":"high","user_authorization":"medium","outcome":"deny","rationale":"destructive"}\n```',
+    );
+    assert(full.outcome === "deny" && full.risk_level === "high" && full.user_authorization === "medium", "MEA parseGuardianAssessment: fenced full JSON");
+    const min = mea.parseGuardianAssessment('{"outcome":"allow"}');
+    assert(min.outcome === "allow" && min.risk_level === "low", "MEA parseGuardianAssessment: minimal → low risk");
+    let threw = false;
+    try {
+      mea.parseGuardianAssessment("not json");
+    } catch {
+      threw = true;
+    }
+    assert(threw, "MEA parseGuardianAssessment: non-JSON throws");
+    threw = false;
+    try {
+      mea.parseGuardianAssessment('{"outcome":"maybe"}');
+    } catch {
+      threw = true;
+    }
+    assert(threw, "MEA parseGuardianAssessment: invalid outcome throws");
+
+    // runGuardianReview with a fake LLM (allow / deny / malformed→deny-failclosed).
+    const fakeLlm = (text: string) => ({
+      async complete() {
+        return { text };
+      },
+    });
+    const allowR = await mea.runGuardianReview({ llm: fakeLlm('{"outcome":"allow","risk_level":"low"}') as never, action: "fmt" });
+    assert(allowR.decision === "allow" && allowR.assessment?.risk_level === "low", "MEA runGuardianReview: allow");
+    const denyR = await mea.runGuardianReview({ llm: fakeLlm('{"outcome":"deny","risk_level":"critical"}') as never, action: "rm" });
+    assert(denyR.decision === "deny", "MEA runGuardianReview: deny");
+    const badR = await mea.runGuardianReview({ llm: fakeLlm("garbage") as never, action: "rm" });
+    assert(badR.decision === "deny" && !!badR.meta, "MEA runGuardianReview: malformed → fail-closed deny");
+
+    // Circuit breaker: 3 consecutive denials interrupt, pass resets.
+    const cb = new mea.GuardianCircuitBreaker();
+    assert(cb.recordDenial() === false, "MEA breaker: 1 denial not tripped");
+    assert(cb.recordDenial() === false, "MEA breaker: 2 denials not tripped");
+    assert(cb.recordDenial() === true, "MEA breaker: 3rd consecutive denial trips interrupt");
+    assert(cb.consecutive === 3, "MEA breaker: consecutive count = 3");
+    cb.recordPass();
+    assert(cb.consecutive === 0, "MEA breaker: pass resets consecutive count");
+    cb.reset();
+    assert(cb.consecutive === 0, "MEA breaker: reset clears");
+
+    // parseAuditReport + runAudit fail-closed.
+    const ok = mea.parseAuditReport(
+      '{"status":"complete","integrity":1.0,"contract_aligned":true,"completed":["x"],"missing":[],"blockers":[],"findings":[]}',
+    );
+    assert(ok.status === "complete" && ok.integrity === 1 && ok.contract_aligned, "MEA parseAuditReport: complete");
+    const auditPass = await mea.runAudit({
+      llm: fakeLlm('{"status":"complete","integrity":1.0,"contract_aligned":true,"completed":[],"missing":[],"blockers":[],"findings":[]}') as never,
+      goal: "g",
+      ledger: new mea.VerifiedStateLedger(),
+    });
+    assert(auditPass.passed === true, "MEA runAudit: passed on complete+aligned+integrity≥0.9");
+    const auditFail = await mea.runAudit({
+      llm: fakeLlm('{"status":"incomplete","integrity":0.2,"contract_aligned":false,"completed":[],"missing":["file"],"blockers":[],"findings":[]}') as never,
+      goal: "g",
+      ledger: new mea.VerifiedStateLedger(),
+    });
+    assert(auditFail.passed === false && auditFail.report.missing.includes("file"), "MEA runAudit: incomplete → not passed");
+    const auditErr = await mea.runAudit({
+      llm: { async complete() { throw new Error("boom"); } } as never,
+      goal: "g",
+      ledger: new mea.VerifiedStateLedger(),
+    });
+    assert(auditErr.passed === false && auditErr.report.status === "incomplete", "MEA runAudit: LLM error → fail-closed incomplete");
+
+    // VerifiedStateLedger: add / render dedupe / clear.
+    const ledger = new mea.VerifiedStateLedger();
+    ledger.add("file:a", "content A");
+    ledger.add("file:a", "content A");
+    ledger.add("file:b", "content B");
+    const rendered = ledger.render();
+    assert(rendered.includes("file:a") && rendered.includes("file:b"), "MEA ledger: render lists entries");
+    assert(rendered.indexOf("file:a") === rendered.lastIndexOf("file:a"), "MEA ledger: dedupes identical entries");
+    ledger.clear();
+    assert(ledger.render().includes("no verified evidence"), "MEA ledger: clear empties");
+
+    // describeAction renders tool + kind + target.
+    const desc = mea.describeAction({ tool: "remove_todo", kind: "write", args: { id: 3 } });
+    assert(desc.includes("remove_todo") && desc.includes("write"), "MEA describeAction: renders tool + kind");
+
+    // SessionGate + GuardianReviewer integration (写动作审核接管 ask 流程):
+    //   - low-risk allow → auto-approved (no human gate),
+    //   - deny → rejected + circumvention injected + breaker counts,
+    //   - no reviewer LLM (null) → falls back to the human deny gate.
+    const gateMod = await import("./gate.js");
+    const DenyHuman = { async request() { return false; } };
+    let injected = "";
+    const denyLlm = { async complete() { return { text: '{"outcome":"deny","risk_level":"critical","rationale":"destructive"}' }; } };
+    const lowLlm = { async complete() { return { text: '{"outcome":"allow","risk_level":"low"}' }; } };
+    const gateWithGuardian = (llm: unknown, failClosed = false) =>
+      new gateMod.SessionGate(
+        DenyHuman as never,
+        [],
+        undefined,
+        false,
+        {
+          llm: () => llm as never,
+          inject: (t: string) => { injected = t; },
+          ...(failClosed ? { failClosed: true } : {}),
+        },
+      );
+    const denied = await gateWithGuardian(denyLlm).request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
+    assert(denied === false, "MEA SessionGate+Guardian: deny rejects the write");
+    assert(injected.includes("circumvention"), "MEA SessionGate+Guardian: deny injects no-circumvention notice");
+    injected = "";
+    const autoAllowed = await gateWithGuardian(lowLlm).request({ tool: "fmt", kind: "write", args: {}, source: "tty" });
+    assert(autoAllowed === true, "MEA SessionGate+Guardian: low-risk allow auto-approves");
+    // failClosed=true + reviewer error → the write is denied (no human prompt),
+    // and the breaker is charged.
+    const errLlm = { async complete() { throw new Error("boom"); } };
+    const failClosedGate = gateWithGuardian(errLlm, true);
+    const failClosedDenied = await failClosedGate.request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
+    assert(failClosedDenied === false, "MEA SessionGate+Guardian: reviewer error + failClosed → deny (no prompt)");
+
+    console.log("ok: MEA 判定层（parse / circuit-breaker / auditor / ledger / describeAction / SessionGate）passed");
+  }
+
   // --- PE#3: harness health scorecard (pure over seeded events) -------------
   {
   const { computeScorecard, formatScorecard, countDatedEntries } = await import("./scorecard.js");

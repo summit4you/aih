@@ -147,6 +147,23 @@ Next move）。
 CLI 侧同样可用：`aih run --goal "<条件>" "<任务>"` 在非交互场景做有界自动续跑，
 裁判事件以结构化 `goal/judge` 类型写入会话日志（append-only JSONL，可审计回放）。
 
+#### MEA 独立判定层（写动作 Guardian + 完成 Auditor）
+
+roadmap 最高优先级项（LH#1 LongHorizon Auditor + CX-R#1 codex Guardian 合并实施），
+为 AIH 补齐此前未实施的"独立判定角色"——主 agent 之外的第二双眼睛：
+
+- **写动作 Guardian（默认开启，接管 ask 流程）**：需批准（ask）的写操作在弹人工确认前，
+  先由独立无工具 LLM 按声明式 policy（`AIH_GUARDIAN_POLICY`，缺省内置白名单）评估
+  `risk × authorization → allow/deny/ask`。低风险 allow 自动放行不打扰、deny 拒绝并注入
+  "不得规避达成同一结果"、连续 deny≥3 触发 circuit-breaker 注入停止指令。**fail-closed**：
+  超时/解析失败/LLM 错误 → deny（`AIH_GUARDIAN_FAIL_CLOSED=1`），否则安全降级为人工确认。
+  无 API key/无可配 LLM 时自动降级回原人工 gate（零行为变化）——这是本地确定性的默认兜底。
+  用 `--no-guardian` 或 `AIH_GUARDIAN=0` 关闭。
+- **完成产物 Auditor（/goal 独立验证）**：goal 裁判判 met 后，再由独立 Auditor LLM 依据
+  **verified-state ledger**（从会话日志采集真实工具输出，而非 agent 自述）审计真实产物，
+  产出 AuditReport；只有 `complete + contract_aligned + integrity≥0.9` 才算 trusted state，
+  发现缺失/阻塞则降级为 not-met 并注入续跑。交互 `/goal` 与 `aih run --goal` 两条路径均接入。
+
 ### 确定性 Workflow（`.aih/workflows/*.mjs`）
 
 把固定流程写成代码而非 prompt——借鉴 MiMo-Code 的 `.mimocode/workflows` 与
@@ -979,6 +996,9 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 | `AIH_SENSORS` | PE#1 计算式传感器：SensorConfig JSON 数组或单对象（写后验证命令，红→有界重试→升级） |
 | `AIH_SENSOR_RETRIES` (1) | PE#1 传感器红→升级前的重试次数 |
 | `AIH_SENSOR_TIMEOUT_MS` (60000) | PE#1 单条传感器命令超时 |
+| `AIH_GUARDIAN` (1) | MEA 写动作 Guardian：需批准写操作先由独立无工具 LLM 按声明式 policy 评估（`0` 与 `--no-guardian` 关闭，回落纯人工确认） |
+| `AIH_GUARDIAN_FAIL_CLOSED` | Guardian 审核超时/解析失败/LLM 错误时 fail-closed → deny（未设则安全降级为人工确认） |
+| `AIH_GUARDIAN_POLICY` | Guardian 声明式 policy.md 文本（缺省用内置白名单） |
 
 ### 会话标题（隐藏系统 agent）
 
@@ -1143,7 +1163,7 @@ AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者�
 - **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子（✅ D#11 脱敏/计时 + 技能驱动）、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）、后台 jobs（✅ D#13）、Agent Teams（✅ D#15）—— 余：沙箱 seam（✅ D#12 接口已留，默认本地）。
 - **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）；checkpoint 回滚（✅ F#28 `/checkpoint`+`/restore`）。
 - **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS ✅ F#30；side-by-side diff ✅ F#31（双色单元格 + 行号列 + 窄屏回退）。
-- **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；余：MEA 三角色循环（Manager/Executor/Auditor + verified-state ledger，候选 roadmap）。
+- **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；MEA 三角色判定层（独立 Auditor + verified-state ledger）✅ 已交付（`cli/src/mea.ts`，与 codex Guardian 合并实施，见 README「MEA 独立判定层」节）。
 - **OpenClaw**（openclaw/openclaw，多渠道 AI 助手网关）→ 只借判断层/工程纪律：**核心每调用税 + 重复需求→seam 治理标尺**（OC#2，core 进严审 / 技能·扩展无税鼓励扩张 / ≥2 处独立 wire-in 提取 seam ✅，`docs/decisions.md` + APP.md §6）、修复教义（OC#1，root-cause-first / 生产 LOC 一等约束 / 禁止 consumer-only guard 掩盖根因 ✅）、**live-verify 默认 + 先查现成方案**（OC#3，用户可见行为落地前走真实生产路径 + 自定义前先做简短现成方案门 ✅，`core/src/prompts.ts` `LIVE_VERIFY_DISCIPLINE`）、**信任模型澄清**（OC#4，本地单算子边界 + prompt-injection-only 链不算安全 bug ✅，见权限模型章节后「信任模型」段 + APP.md §3）、凭据所有者隔离（OC#7，降级 owner 而非 fallback 凭据 ✅，见专章）、版本化状态守卫 + 配置自愈（OC#5，schemaVersion + 拒绝开更新版本 + `aih doctor --fix` 把 legacy 配置备份后迁到规范形态 ✅）、成熟度记分卡 / 覆盖ID+证据模式（OC#6，`aih coverage` 从冒烟分组标题派生稳定覆盖注册表 + mock/live 证据分类 + 按 profile 选子集，`npm run eval:quality` ✅）；明确不借：多渠道网关 / 伴随应用 / ClawHub 市场 / OTel 遥测 / Crabbox 云沙箱 / pnpm monorepo（撞"本地单算子"定位）。
 - **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
 - **Apache Maka**（apache/maka，local-first agent workspace）→ 借 **事实层纪律**：append-only 事件即唯一事实源、UI/模型调用只是投影。已落地：compaction coverage digest（✅ MK#42，摘要必须证明覆盖范围，否则 fail-open）、tool/dispatch T1 事实 + RecoveryResolver 四态分类 + park 稳定码（✅ MK#44/45）、工具结果修剪 + archive_read 惰性归档（✅ MK#43）、工作区身份 UUID（✅ MK#47）、models.dev 快照 fail-closed 同步（✅ P#48）、steering/follow-up 双队列（✅ P#35）；明确不借 SQLite/Electron、Phase3/4 文件级 reconcile、provider-native 远程压缩。

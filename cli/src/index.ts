@@ -53,7 +53,8 @@ import { AutoApprove } from "@aih/core";
 import { connectBackend, connectMultiBackend } from "./mcp-backend.js";
 import type { McpBackend } from "./mcp-backend.js";
 import { connectCatalog, catalogEntry, type CatalogProvider } from "./provider-catalog.js";
-import { DenyGate, SessionGate } from "./gate.js";
+import { DenyGate, SessionGate, type GuardianReviewer } from "./gate.js";
+import { VerifiedStateLedger, runAudit, type AuditReport } from "./mea.js";
 import {
   loadModelCatalog,
   loadPermissionRules,
@@ -136,7 +137,7 @@ import {
   summarizeTeam,
 } from "./teams.js";
 import { tidyMemory, formatTidyReport } from "./memory-tidy.js";
-import { cyan, dim, green, red, bold, toolTrace, turnFooter } from "./ui.js";
+import { cyan, dim, green, red, yellow, bold, toolTrace, turnFooter } from "./ui.js";
 import { Tui } from "./tui.js";
 import type { PickerEntry } from "./tui.js";
 import {
@@ -286,6 +287,11 @@ Options:
       --debug-prompt          print the exact model-visible prompt input before each LLM call
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
+      --no-guardian           disable the MEA write-action Guardian reviewer
+                              (on by default: independent LLM reviews "ask" write
+                              actions before the human prompt; low-risk
+                              auto-approved, denials inject a no-circumvention
+                              notice, circuit-breaker interrupts after 3)
       --no-stream             buffer full responses instead of streaming
       --no-dev              disable the default local toolset (dev tools
                               list_dir, read_file, write_file[ask], run_cmd[ask]
@@ -326,6 +332,10 @@ Environment:
   AIH_CMD_TIMEOUT_MS (120000 default run_cmd timeout)
   AIH_TOOL_CONCURRENCY (4) max parallel read-only tool calls per step
   AIH_FORMAT_TIMEOUT_MS (15000) post-write formatter timeout
+  AIH_GUARDIAN (default on; "0" disables the write-action Guardian reviewer)
+  AIH_GUARDIAN_FAIL_CLOSED ("1" → Guardian failure/timeout denies instead of
+    degrading to a human prompt)
+  AIH_GUARDIAN_POLICY (custom declarative policy text; else a built-in default)
 
 Examples:
   aih run "add a todo buy milk" --mock
@@ -854,12 +864,88 @@ export function makeSessionGate(flags: Record<string, string | boolean>): Sessio
   );
 }
 
+/**
+ * MEA — build a GuardianReviewer for the interactive loop. Default ON (unless
+ * `--no-guardian` / AIH_GUARDIAN=0). The reviewer LLM is resolved lazily (null
+ * when no model is configured → pure-human fallback). `failClosed` from
+ * AIH_GUARDIAN_FAIL_CLOSED=1; `policy` from AIH_GUARDIAN_POLICY (or default).
+ * `inject`/`interrupt` reach into `loop`; `onReview` surfaces a TUI row.
+ */
+export function buildGuardianReviewer(
+  flags: Record<string, string | boolean>,
+  refs: {
+    loop: () => { inject(text: string): void } | null;
+    tui?: () => { pushSystem(text: string): void } | null;
+    llm?: () => ReturnType<typeof buildLlm> | null;
+  },
+): GuardianReviewer | undefined {
+  if (bool(flags, "no-guardian") || process.env.AIH_GUARDIAN === "0") return undefined;
+  const failClosed = process.env.AIH_GUARDIAN_FAIL_CLOSED === "1";
+  const policy = process.env.AIH_GUARDIAN_POLICY?.length ? process.env.AIH_GUARDIAN_POLICY : undefined;
+  return {
+    llm: () => {
+      if (refs.llm) return refs.llm();
+      try {
+        return buildLlm(flags);
+      } catch {
+        return null; // no model → Guardian disabled (human fallback)
+      }
+    },
+    ...(policy ? { policy } : {}),
+    ...(failClosed ? { failClosed: true } : {}),
+    inject: (text) => refs.loop()?.inject(text),
+    interrupt: (reason) => {
+      const loop = refs.loop();
+      if (loop) {
+        loop.inject(
+          `[guardian] ${reason}. Stop the current action sequence, reassess with a materially safer approach, and surface the denial to the user before continuing.`,
+        );
+      }
+      refs.tui?.()?.pushSystem(`[guardian] ⛔ ${reason}`);
+    },
+    onReview: (r, req) => {
+      const tui = refs.tui?.();
+      if (!tui) {
+        process.stderr.write(`[guardian] ${req.tool} → ${r.decision}${r.meta ? ` (${r.meta})` : ""}\n`);
+        return;
+      }
+      if (r.decision === "allow") return; // low-risk auto-approve already surfaced
+      tui.pushSystem(`[guardian] ${req.tool} → ${r.decision}${r.meta ? ` (${r.meta})` : ""}`);
+    },
+  };
+}
+
 /** E#18 — the extra system-prompt line for the active `--as` profile (or ""). */
 export function agentProfilePrompt(flags: Record<string, string | boolean>): string {
   const asName = str(flags, "as") ?? str(flags, "a");
   if (!asName) return "";
   const profile = loadAgentProfile(asName);
   return profile?.prompt ? `\n\n[agent profile: ${asName}] ${profile.prompt}` : "";
+}
+
+/**
+ * MEA (LH#1) — collect a verified-state ledger from REAL session-log evidence
+ * (actual tool outputs, not the agent's prose), correlated by callId. Used by
+ * the completion Auditor so "done" must be backed by observed state.
+ */
+export function collectSessionLedger(log: { all: () => readonly SessionEvent[] }): VerifiedStateLedger {
+  const ledger = new VerifiedStateLedger();
+  const byCall = new Map<string, { name: string }>();
+  for (const e of log.all()) {
+    if (e.type === "tool/call") byCall.set(e.callId, { name: e.name });
+    else if (e.type === "tool/result" && e.ok) {
+      const call = byCall.get(e.callId);
+      const name = call?.name ?? "tool";
+      const text =
+        typeof e.result === "string"
+          ? e.result
+          : e.result
+            ? JSON.stringify(e.result)
+            : (e.error ?? "");
+      if (text && text.trim()) ledger.add(`${name}@${e.callId}`, text.slice(0, 600), "tool-result");
+    }
+  }
+  return ledger;
 }
 
 export function registerSkillTool(
@@ -1330,6 +1416,10 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
         : {}),
     });
 
+    // MEA — write-action Guardian reviewer for this one-shot run (default-on).
+    const guardian = buildGuardianReviewer(flags, { loop: () => loop });
+    if (guardian) gate.setGuardian(guardian);
+
     // P1#4: BM25 relevance auto-loading — nudge the model toward a clearly
     // relevant installed skill (best-effort; the model decides whether to load).
     if (message.trim().length >= 8) {
@@ -1416,9 +1506,31 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
         log.append({ type: "goal/judge", turnId, met: verdict.met, reason: verdict.reason, unmet: verdict.unmet, roundsLeft: verdict.met ? 0 : rounds, ...(degraded ? { degraded: true } : {}) });
         saveSession(sessionPath, log);
         if (verdict.met) {
-          goalMet = true;
-          process.stderr.write(`${green("✅ goal met")} — ${verdict.reason}\n`);
-          break;
+          // MEA (LH#1) — independent Auditor verifies REAL product state via
+          // the verified-state ledger before accepting completion. Gaps
+          // downgrade to not-met (rounds may continue), mirroring interactive.
+          const audit = await runAudit({
+            llm,
+            goal,
+            ledger: collectSessionLedger(log),
+          });
+          if (audit.passed) {
+            goalMet = true;
+            process.stderr.write(`${green("✅ goal met")} — ${verdict.reason}\n`);
+            break;
+          }
+          process.stderr.write(
+            `${yellow("⚠ independent auditor found gaps")} — ${
+              audit.report.blockers.concat(audit.report.findings).join("; ") || audit.report.missing.join("; ") || "completion not verifiable"
+            }\n`,
+          );
+          verdict = {
+            met: false,
+            reason: `independent auditor found gaps: ${
+              audit.report.blockers.concat(audit.report.findings).join("; ") || "completion not verified"
+            }`,
+            unmet: audit.report.missing.length ? audit.report.missing : ["completion not verified by independent auditor"],
+          };
         }
         if (rounds <= 0) {
           process.stderr.write(`${red("⏹ goal not met after auto-continue rounds — stopping")} (${verdict.reason})\n`);
@@ -1521,6 +1633,9 @@ async function cmdWorkflow(
         compactContext: () => compactTodoContext(log, process.cwd()),
         ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
+      // MEA — write-action Guardian reviewer for this workflow run (default-on).
+      const guardian = buildGuardianReviewer(flags, { loop: () => loop });
+      if (guardian) gate.setGuardian(guardian);
       const send = async (prompt: string): Promise<string> => {
         const result = await loop.send(prompt);
         const events = log.all();
@@ -1676,6 +1791,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
+  // MEA — attach the write-action Guardian reviewer (default-on). It wraps the
+  // "ask" floor: write actions are independently reviewed before the human
+  // prompt; low-risk auto-approve, denials inject a no-circumvention notice.
+  const guardian = buildGuardianReviewer(flags, {
+    loop: () => loop,
+    tui: () => tuiRef.current,
+  });
+  if (guardian) gate.setGuardian(guardian);
   const streaming = !bool(flags, "no-stream") && !bool(flags, "mock");
   const bgChildren = new Map<string, ChildProcess>();
   // On TUI exit, in-flight background children can't be waited on synchronously;
@@ -2438,6 +2561,34 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     store?.save(log);
   }
 
+  /** MEA — verified-state ledger from real session-log evidence (LH). */
+  function collectVerifiedState(): VerifiedStateLedger {
+    return collectSessionLedger(log);
+  }
+
+  /** MEA — independent completion audit (LH Auditor). Returns {passed, missing}.
+   * No reviewer LLM → {passed:true, skipped} (keeps current judge-only path). */
+  async function runCompletionAudit(): Promise<{
+    passed: boolean;
+    missing: string[];
+    note: string;
+    report?: AuditReport;
+  }> {
+    let llm;
+    try {
+      llm = buildLlm(flags);
+    } catch {
+      return { passed: true, missing: [], note: "no reviewer LLM — judge-only" };
+    }
+    const outcome = await runAudit({ llm, goal: goalCondition, ledger: collectVerifiedState() });
+    return {
+      passed: outcome.passed,
+      missing: outcome.report.missing,
+      note: outcome.report.blockers.concat(outcome.report.findings).join("; ") || outcome.report.missing.join("; "),
+      report: outcome.report,
+    };
+  }
+
   async function runGoalCheck(): Promise<void> {
     if (!goalCondition) return;
     for (;;) {
@@ -2452,11 +2603,31 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       if (verdict.met) {
-        goalCondition = "";
-        goalRoundsLeft = 0;
-        recordGoalJudge(verdict, 0);
-        tui.pushSystem(`✅ goal met — ${verdict.reason}`);
-        return;
+        // MEA (LH#1) — before declaring done, an independent Auditor verifies
+        // the REAL product state via the verified-state ledger. Only a passed
+        // audit becomes trusted state; gaps downgrade the result to not-met.
+        const audit = await runCompletionAudit();
+        if (audit.passed) {
+          goalCondition = "";
+          goalRoundsLeft = 0;
+          recordGoalJudge(verdict, 0);
+          tui.pushSystem(`✅ goal met — ${verdict.reason}`);
+          return;
+        }
+        tui.pushSystem(`[auditor] independent audit found gaps — ${audit.note || "completion not verifiable"}`);
+        verdict = {
+          met: false,
+          reason: `independent auditor found gaps: ${audit.note || "completion not verifiable"}`,
+          unmet: audit.missing.length ? audit.missing : ["completion not verified by independent auditor"],
+        };
+        if (goalRoundsLeft <= 0) {
+          goalCondition = "";
+          recordGoalJudge(verdict, 0);
+          tui.pushSystem(
+            `⏹ goal not met after audit — stopping (${verdict.reason})`,
+          );
+          return;
+        }
       }
       if (goalRoundsLeft <= 0) {
         goalCondition = "";

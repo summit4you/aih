@@ -8,6 +8,23 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **MEA 独立判定层（LH#1 + CX-R#1 合并实施，roadmap 最高优先级项）**：融合
+  LongHorizon Auditor 与 codex Guardian 双源，为 AIH 补齐此前未实施的"独立判定角色"。
+  - **写动作 Guardian（默认开启，接管 ask 流程）**：需批准（ask）的写操作在弹人工确认前，
+    先由独立无工具 LLM 按声明式 policy 评估 risk×authorization → allow/deny/ask。
+    低风险 allow 自动放行、deny 拒绝并注入"不得规避达成同一结果"提示、连续 deny≥3
+    触发 circuit-breaker 注入停止指令（对齐 codex MAX_CONSECUTIVE=3）。fail-closed：
+    超时/解析失败/LLM 错误 → deny（`AIH_GUARDIAN_FAIL_CLOSED=1`），否则安全降级为
+    人工确认。无可配 LLM 时自动降级为原人工 gate（零行为变化）。README/帮助见
+    `--no-guardian`、`AIH_GUARDIAN=0`、`AIH_GUARDIAN_POLICY`、`AIH_GUARDIAN_FAIL_CLOSED`。
+    （`cli/src/mea.ts`、`cli/src/gate.ts`、`cli/src/index.ts`）
+  - **完成产物 Auditor（/goal 独立验证）**：goal 裁判判 met 后，再由独立 Auditor LLM
+    依据 verified-state ledger（从会话日志采集真实工具输出，非 agent 自述）审计真实产物，
+    产出 AuditReport；只有 complete+contract_aligned+integrity≥0.9 才算 trusted state，
+    缺缺失/阻塞则降级为 not-met 并注入续跑。交互 `/goal` 与 `aih run --goal` 两条路径均接入。
+    （`cli/src/mea.ts`、`cli/src/index.ts`）
+
 ## [0.5.2] - 2026-09-03
 
 ### Added
