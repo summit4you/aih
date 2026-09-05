@@ -51,6 +51,13 @@ export class SessionGate implements ApprovalGate {
   /** MEA — optional Guardian reviewer for write "ask" floor. */
   #guardian?: GuardianReviewer;
   #guardianBreaker = new GuardianCircuitBreaker();
+  /**
+   * Who answered the most recent ask: "guardian" (reviewer auto-deny) or
+   * "human". The tool registry duck-types this to render an accurate
+   * rejection — "guardian auto-denied" instead of the misleading "user
+   * rejected" when nobody pressed anything.
+   */
+  lastDenySource?: "guardian" | "human";
 
   constructor(
     fallback: ApprovalGate,
@@ -182,6 +189,10 @@ export class SessionGate implements ApprovalGate {
     // MEA — before the human prompt, an optional Guardian reviewer independently
     // assesses WRITE actions (default-on when a reviewer LLM is configured).
     const guardian = this.#guardian;
+    /** MEA — set when the Guardian denied; carried into the human prompt's
+     *  detail below so the person at the keyboard sees the same rationale the
+     *  model was injected with. */
+    let guardianDenyNote: string | undefined;
     if (guardian && req.kind === "write") {
       const llm = guardian.llm();
       if (llm) {
@@ -217,11 +228,23 @@ export class SessionGate implements ApprovalGate {
             // proceeding."`.
             const denialNoticeTail =
               "这不是工具或系统故障，请向用户澄清后再继续（不要自动重试、不要将其当作终止信号）。";
-            const notice = `[guardian] ✗ denied ${req.tool}${r.assessment?.rationale ? ` — ${r.assessment.rationale}` : ""}\n${denialNoticeTail}\n${GUARDIAN_CIRCUMVENTION_NOTICE}`;
+            const rationale = r.assessment?.rationale ? ` — ${r.assessment.rationale}` : "";
+            const notice = `[guardian] ✗ denied ${req.tool}${rationale}\n${denialNoticeTail}\n${GUARDIAN_CIRCUMVENTION_NOTICE}`;
             guardian.inject?.(notice);
-            if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}`);
-            else process.stderr.write(`[guardian] ✗ denied ${req.tool}\n`);
+            if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}${rationale}`);
+            else process.stderr.write(`[guardian] ✗ denied ${req.tool}${rationale}\n`);
             if (interrupt) guardian.interrupt?.("guardian circuit breaker: consecutive denials reached threshold");
+            // Execution-first semantics (user-confirmed): a guardian DENY does
+            // NOT open a second interactive prompt — in a long unattended loop
+            // that would stall the run on every reviewer misjudgment (a
+            // harmless `tar tzf … | grep | head` was once mis-read as
+            // "truncated/malformed"). Instead: refuse immediately, tell the
+            // model who denied and why (via the injected notice + the
+            // lastDenySource flag the tool error surfaces), and let the user
+            // PRE-authorize the pattern via the `permissions` grant bridge —
+            // a ruleset allow short-circuits the gate before the guardian ever
+            // runs, so granted loops never stall.
+            this.lastDenySource = "guardian";
             return false;
           }
           case "timeout":
@@ -282,6 +305,7 @@ export class SessionGate implements ApprovalGate {
         return false; // copy never runs the command
       }
       this.#tui.pushSystem("denied");
+      this.lastDenySource = "human";
       return false; // "no"
     }
 
@@ -296,6 +320,7 @@ export class SessionGate implements ApprovalGate {
       if (this.#tui) this.#tui.pushSystem(line);
       else process.stderr.write(`${line}\n`);
     }
+    this.lastDenySource = answer === "deny" ? "human" : undefined;
     return answer !== "deny";
   }
 

@@ -161,11 +161,20 @@ export class ToolRegistry {
         // blindly retry; clarify with the user before continuing). Without it
         // the model reads a policy rejection as a transient failure and
         // retries, or as a termination signal and stops.
+        // Attribution: when the gate exposes `lastDenySource` (SessionGate
+        // does), a guardian auto-deny must NOT be surfaced as "user rejected"
+        // — no human pressed anything, and the mislabel made the user think
+        // they had answered the prompt themselves.
+        const denySource = (this.#gate as { lastDenySource?: string }).lastDenySource;
+        const rejectedBy =
+          doomLoop
+            ? "user stopped the repeated (doom-loop) call"
+            : denySource === "guardian"
+              ? `guardian auto-denied ${name} (no human prompt answered — the reviewer rejected it)`
+              : `user rejected ${name}`;
         return {
           ok: false,
-          error: doomLoop
-            ? `user stopped the repeated (doom-loop) call${REJECTION_SUFFIX}`
-            : `user rejected ${name}${REJECTION_SUFFIX}`,
+          error: `${rejectedBy}${REJECTION_SUFFIX}`,
           permission: "denied",
         };
       }

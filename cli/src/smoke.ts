@@ -291,6 +291,40 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     const denied = await gateWithGuardian(denyLlm).request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
     assert(denied === false, "MEA SessionGate+Guardian: deny rejects the write");
     assert(injected.includes("circumvention"), "MEA SessionGate+Guardian: deny injects no-circumvention notice");
+    // Execution-first semantics: the deny must NOT open a second interactive
+    // prompt (that stalled unattended loops on reviewer misjudgments), and it
+    // must be ATTRIBUTED — the registry reads lastDenySource to say "guardian
+    // auto-denied" instead of the misleading "user rejected" (no human
+    // pressed anything).
+    const denyGate = gateWithGuardian(denyLlm);
+    await denyGate.request({ tool: "rm", kind: "write", args: { path: "/x" }, source: "tty" });
+    assert((denyGate as unknown as { lastDenySource?: string }).lastDenySource === "guardian", "MEA SessionGate+Guardian: deny is attributed to the guardian (lastDenySource)");
+    {
+      const { ToolRegistry } = await import("@aih/core");
+      const attribGate = new (class {
+        lastDenySource = "guardian";
+        async request() { return false; }
+      })();
+      const reg2 = new ToolRegistry(attribGate as never);
+      reg2.register({
+        name: "rm", description: "d", kind: "write", permission: "ask",
+        parameters: { type: "object", properties: {}, required: [] },
+        execute: async () => ({}),
+      });
+      const res = await reg2.invoke("rm", {}, { turnId: "t", inject: () => {} });
+      assert(
+        String(res.error).startsWith("guardian auto-denied") && String(res.error).includes("no human prompt answered"),
+        `tool error attributes a guardian auto-deny (got "${String(res.error).slice(0, 60)}")`,
+      );
+      const reg3 = new ToolRegistry({ async request() { return false; } });
+      reg3.register({
+        name: "rm", description: "d", kind: "write", permission: "ask",
+        parameters: { type: "object", properties: {}, required: [] },
+        execute: async () => ({}),
+      });
+      const res2 = await reg3.invoke("rm", {}, { turnId: "t", inject: () => {} });
+      assert(String(res2.error).startsWith("user rejected"), "tool error keeps 'user rejected' for a plain human deny");
+    }
     injected = "";
     const autoAllowed = await gateWithGuardian(lowLlm).request({ tool: "fmt", kind: "write", args: {}, source: "tty" });
     assert(autoAllowed === true, "MEA SessionGate+Guardian: low-risk allow auto-approves");

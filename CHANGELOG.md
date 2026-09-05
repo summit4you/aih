@@ -61,6 +61,13 @@ the versions listed here (`scripts/package` derives the version from
   （`cli/src/tui.ts`）
 
 ### Fixed
+- **Guardian 自动拒绝的归因修正（执行优先保持）**：guardian deny 曾被 surface 成
+  "user rejected"——实际没有任何人按键，远程无人值守场景下用户误以为是自己答了确认框
+  （实例：无害的 `tar tzf … | grep | head` 验证命令被 reviewer 误判为
+  "truncated/malformed"）。现在 `SessionGate.lastDenySource` 区分来源，tool error
+  显示 "guardian auto-denied <tool> (no human prompt answered)"。**刻意不弹二次确认**：
+  长 loop 中每次 reviewer 误判都等人的话会卡死无人值守运行；预先经 `permissions`
+  grant 授权的规则直接放行，guardian 根本不介入。（`cli/src/gate.ts`、`core/src/tool-registry.ts`）
 - **bare-Esc 残留不再吞掉下一个按键**：question 提示里按单次 Esc 后，escape 机的
   `#held` 残留会把下一个 backspace/tab/回车当"双击检测的计时样本"吞掉（表现为
   退格失灵、回车要按两次）；现在被消化裸 Esc 的跟随字节回退到答案处理；完整序列
