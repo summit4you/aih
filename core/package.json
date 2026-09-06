@@ -1,6 +1,6 @@
 {
   "name": "@aih/core",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "AIH kernel: session log, guarded tool registry, agent loop, capability seams",
   "type": "module",
   "license": "MIT",

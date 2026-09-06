@@ -8,6 +8,8 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-06
+
 ### Changed
 - **Windows/PowerShell TUI 显示修复**（对齐 opencode / mimo-coder）：
   - **键盘 expand**：legacy conhost（无 WT_SESSION/TERM_PROGRAM）不发鼠标事件，
