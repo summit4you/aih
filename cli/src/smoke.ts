@@ -513,6 +513,37 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(declined === false && declineRules.every((r) => r.action !== "allow"), "MEA C: declining the grant adds no allow rule — still denied");
     assert(injected.slice(injectedBefore).includes("denied") && !injected.slice(injectedBefore).includes("pre-authorized"), "MEA C (decline): denial still surfaced, but no supersede/retry notice is injected");
 
+    // C#2 (2026-09-06) — the guarded-write-tool grant regression: the [g]
+    // one-key grant writes an allow rule for a GUARDED write tool (run_cmd).
+    // Before the KL-R#4 refinement, the guarded floor re-floored every such
+    // allow back to "ask", so a granted scope kept re-prompting / re-denying
+    // forever. Now an explicit session-sourced human grant is exempt from the
+    // config floor and STICKS: the same run_cmd request passes with zero
+    // further reviewer calls, while a CONFIG allow rule (no human grant) is
+    // still floored to ask — the KL-R#4 contract is intact.
+    const guardedDenyLlm = { async complete() { return { text: '{\"outcome\":\"deny\",\"risk_level\":\"high\"}' }; } };
+    const gGate = new gateMod.SessionGate(
+      DenyHuman as never, [], undefined, false,
+      { llm: () => guardedDenyLlm as never, inject: (t: string) => { injected += t; } },
+    );
+    (gGate as { attachTui(t: unknown): void }).attachTui({
+      pushSystem: () => {},
+      askGrantScope: async (_tool: string, _scope: string) => true,
+    });
+    const gFirst = await gGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" }, source: "tty" });
+    assert(gFirst === false, "MEA C#2: guardian deny still refuses THIS run_cmd action");
+    const gRules = (gGate as unknown as { rulesSnapshot(): { action: string }[] }).rulesSnapshot();
+    assert(gRules.some((r) => r.action === "allow"), "MEA C#2: [g] grant wrote an allow rule for the guarded tool");
+    const gSecond = await gGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" }, source: "tty" });
+    assert(gSecond === true, "MEA C#2: granted run_cmd scope STICKS — auto-approved after the human grant (no re-floor to ask)");
+    // Config allow rule (no human grant) is STILL floored to ask — KL-R#4 holds.
+    const cfgGate = new RulesetGate(
+      { async request() { return true; } },
+      [{ tool: "run_cmd", action: "allow" as const, pattern: "**" }],
+    );
+    assert(cfgGate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === "ask",
+      "MEA C#2: config allow rule for a guarded tool is still floored to ask (KL-R#4 intact)");
+
     console.log("ok: MEA 判定层（parse / circuit-breaker / auditor / ledger / describeAction / SessionGate）passed");
   }
 

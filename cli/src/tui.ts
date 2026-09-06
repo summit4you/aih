@@ -525,7 +525,7 @@ export class Tui {
   #confirm: ((ans: "once" | "always" | "deny") => void) | null = null;
   #confirmText = "";
   /** IT#5 — "confirm" = [y]/[n]/[a]; "runorcopy" = [R]un/[C]opy/[N]o. */
-  #confirmMode: "confirm" | "runorcopy" = "confirm";
+  #confirmMode: "confirm" | "runorcopy" | "grant" = "confirm";
   #question: { resolve: (answer: string) => void; reject: (err: Error) => void } | null = null;
   #qbuf = "";
   #queue: string[] = [];
@@ -860,6 +860,9 @@ constructor(opts: TuiOptions) {
    */
   askGrantScope(tool: string, scope: string): Promise<boolean> {
     this.pushSystem(`guardian denied ${tool} — allow this scope anyway?`);
+    // The key handler branches on #confirmMode to map g→"always" (grant) and
+    // n/Enter/Esc→deny; without "grant" the [g] key was unhandled.
+    this.#confirmMode = "grant";
     this.#confirmText = `[g] grant ${scope}   [n] no`;
     this.requestPaint();
     return new Promise((resolve) => {
@@ -1286,13 +1289,21 @@ constructor(opts: TuiOptions) {
         const done = this.#confirm;
         const roc = this.#confirmMode === "runorcopy";
         // IT#5 — run-or-copy keys: r=run(once), c=copy(always), n/no.
+        // C — grant-scope prompt (after a Guardian deny): g=grant → maps to
+        // "always" (askGrantScope resolves granted = ans === "always"), so the
+        // gate writes the allow rule; n/Enter/Esc decline. Previously the [g]
+        // key was unhandled (only y/n/a were wired) and fell into the ignore
+        // branch, so pressing g did nothing — the reported Linux bug.
+        const grant = this.#confirmMode === "grant";
         // confirm keys (unchanged): y=once, a=always, n/deny.
         // Esc denies: the footer advertises Esc as the cancel affordance and
         // a bare Esc here used to fall through all branches and get eaten by
         // the double-Esc detector, leaving the approval wedged.
         const accept = roc
           ? ch === "r" || ch === "R"
-          : ch === "y" || ch === "Y";
+          : grant
+            ? ch === "g" || ch === "G"
+            : ch === "y" || ch === "Y";
         const secondary = roc ? ch === "c" || ch === "C" : ch === "a" || ch === "A";
         const refuse =
           ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03" || ch === "\x1b";
