@@ -396,9 +396,19 @@ assert(
 );
 assert(matchPattern(scope, resolve(process.cwd(), "README.md")), "deriveScope(bare file) matches the resolved absolute path");
 const crossTool = new RulesetGate(new DenyAll(), [{ tool: "edit", pattern: scope, action: "allow" }]);
+// KL-R#4: the path-scoped rule STILL covers the sibling write tool (it matches),
+// but a *guarded* write tool (write_file) floors at "ask" — a config rule can
+// never auto-allow it. The sibling coverage is preserved; only the resolution
+// changed from allow→ask for guarded tools.
 assert(
-  (await crossTool.request({ tool: "write_file", kind: "write", args: { path: "README.md" } })) === true,
-  "path-scoped rule covers sibling write tools on the same file",
+  crossTool.evaluate({ tool: "write_file", kind: "write", args: { path: "README.md" } }) === "ask",
+  "KL-R#4: path-scoped allow rule covers sibling write_file but floors it at ask (guarded)",
+);
+// Contrast: the floor is tool-specific (keyed on GUARDED_WRITE_TOOLS), not a
+// blanket downgrade — a non-guarded path-bearing write still auto-allows.
+assert(
+  crossTool.evaluate({ tool: "non_guarded_write", kind: "write", args: { path: "README.md" } }) === "allow",
+  "KL-R#4: guarded floor is tool-specific — non-guarded path-bearing write still auto-allows",
 );
 const wildcard = new RulesetGate(new DenyAll(), [{ tool: "run_cmd", pattern: "*", action: "allow" }]);
 assert(

@@ -8,6 +8,34 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **OMP-R#2 — `read_file` 双预算 + 四态截断**（`cli/src/dev-tools.ts` `truncateReadLines`）：
+  读文件改「读全量 → 行预算切片（`offset_line`/`max_lines`）→ 字符预算投影」，
+  双预算 3000 行 / 50KB + 逐行 512 字符；`full`/`head`/`tail`/`middle` 四态——
+  `middle` 保 head 起始 + tail 结尾（verdict 行）+ `… N lines elided …` 标记，
+  巨型行只留字节窗口（`tail_windowed_bytes`）不物化全串，首行超限发
+  `first_line_exceeds_limit` 信号；返回 `state`/`lines_shown`/`lines_elided`/
+  `total_lines_in_file`。
+- **M-R#1 — compaction 文件改动清单（file manifest）**（`core/src/agent-loop.ts`
+  `buildFileManifest`/`renderFileManifest` + `core/src/types.ts` `FileManifestEntry`）：
+  压缩时从 read/patch 工具事件重建被触碰文件清单（`edited`/`written`/`read: full`/
+  `read: lines x-y`，同路径按最后触碰去重），作摘要附加输入注入，减少压缩后
+  重读/重改；全量落 `compaction` 事件 `fileManifest` 字段（可审计），渲染层封顶
+  `MAX_FILE_MANIFEST_ENTRIES`(120) 条 + 溢出 `… N more`。
+- **KL-R#4 — 只读 bash 护栏 + guarded 写工具**（`cli/src/readonly-allow.ts`
+  `hasDefensiveVeto` + `core/src/seams/permissions.ts` `GUARDED_WRITE_TOOLS`）：
+  ① 防御性黑名单在只读判定**之前**否决借只读外壳的注入命令（`;`/`&&`/`|`/`>`/
+  反引号/`$(`/`sudo`/`eval`/`rg --pre`/`man -P`/`sh -c`/`rm`/`curl` 等），阻断
+  `ls; rm -rf`、`grep … | sh` 一类任意执行路径；② guarded 写工具（`run_cmd`/
+  `write_file`/`edit`/`apply_patch`/`append_text`/`patch`/`permissions`/
+  `toggle_todo`/`remove_todo`/`add_todo`）的 `allow` 规则被降为 `ask`（`deny` 仍
+  优先）——配置规则（含 allow-everything/机器写配置）永远无法自动放行它们，
+  人工确认是不可被配置绕过的人类地板。
+
+### Changed
+- `core/src/smoke.ts`：path-scoped 兄弟写工具断言对齐 KL-R#4 guarded 语义
+  （`write_file` 由 `allow` 降为 `ask`），新增 non-guarded 写工具仍 `allow` 的对照断言。
+
 ## [0.7.1] - 2026-09-06
 
 ### Changed

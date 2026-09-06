@@ -581,6 +581,12 @@ agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化
 - **手动**：输入框 `/compact [focus]` 随时压缩（focus 可定向摘要，如"保留所有文件路径"）；
   无旧头部时仍压缩整段对话（刷新滚动摘要）；回显压缩前后 token 数与降幅，
   会话 JSONL 保持 append-only（摘要只是视图，历史可审计）
+- **文件改动清单（M-R#1 file manifest）**：压缩时 `buildFileManifest` 从会话的
+  read/patch 工具事件重建**被触碰文件清单**（每个文件记 `edited`/`written`/
+  `read: full`/`read: lines x-y`，同路径按最后触碰去重），作为摘要附加输入注入——
+  压缩后 agent 直接知道"哪些文件被改/被读、读到哪几行"，减少重读/重改；
+  清单全量落 `compaction` 事件的 `fileManifest` 字段（可审计），渲染层
+  `renderFileManifest` 封顶 `MAX_FILE_MANIFEST_ENTRIES`(120) 条展示，溢出附 `… N more`
 
 **窗口按模型设置 + 自动检测**（优先级：`--context-window` > `AIH_CONTEXT_WINDOW` >
 **实时探测**（llama.cpp `/slots`，取各 slot `n_ctx` 最小值=单请求有效窗口）> `aih.json` 的
@@ -751,6 +757,22 @@ TUI 内联确认：`⚠ approval requested: <tool> <args>` → `[y] once · [n] 
 [a] always <scope>`；`scope` 由目标路径自动推导为父目录，选 `a` 按 last-match-wins
 持久化到 aih.json（项目 > 全局）。
 
+**只读 bash 护栏 + guarded 写工具（KL-R#4，纵深防御非沙箱）**：
+- **只读自动放行**：`autoAllowReadonly` 下，`run_cmd` 走 `isReadonlyCommand`
+  前缀白名单（`ls`/`git status`/`grep`…）判定只读，命中即免确认直接执行；
+  非只读命令回落人工确认。
+- **防御性黑名单**（`hasDefensiveVeto`，在只读判定**之前**否决）：即便命令以只读
+  前缀开头，只要含 `;`/`&&`/`||`/`|`/`>`/`<`/`&`/反引号/`$(`/`${`/`sudo`/`env`/
+  `eval`/`exec`/`source`/`--pre`/`-exec`/`-delete`/`--pager`/`sh -c`/`bash -c`/
+  `rm`/`mv`/`cp`/`chmod`/`curl`/`wget`/`nc` 等注入/执行/危险子串，一律**否决只读
+  判定**（回落人工确认）——阻断 `ls; rm -rf`、`grep … | sh`、`rg --pre '…'`、
+  `man -P '…'` 一类借只读外壳执行任意命令的注入路径。
+- **guarded 写工具地板**（`GUARDED_WRITE_TOOLS`）：`run_cmd`/`write_file`/`edit`/
+  `apply_patch`/`append_text`/`patch`/`permissions`/`toggle_todo`/`remove_todo`/
+  `add_todo` 这类**作者标记需人工**的写工具，其 `allow` 规则在 `RulesetGate` 里被
+  **降为 `ask`**（`deny` 仍优先）——配置规则（含 allow-everything 或机器写出的配置）
+  **永远无法自动放行**它们，人工确认是不可被配置绕过的人类地板。只读调用不受影响。
+
 ### 信任模型（OC#4 — 本地单算子，非多租户安全边界）
 
 AIH 的威胁模型是**本地单算子**：
@@ -814,7 +836,7 @@ AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认
 
 | 工具 | 说明 | 权限 |
 |---|---|---|
-| `list_dir` / `read_file` | 列目录 / 读文件（64KB 截断、行偏移） | allow |
+| `list_dir` / `read_file` | 列目录 / 读文件（双预算 3000 行/50KB + 逐行 512 字符；full/head/tail/middle 四态截断，middle 保 head+tail + `… N lines elided …` 标记，巨型行只留字节窗口不物化全串；行偏移） | allow |
 | `write_file` / `run_cmd` | 写文件 / 执行命令（默认 120s 超时、可传 timeout_ms 至 600s；后台子进程不阻塞返回） | ask |
 | `edit` | 精确字符串替换编辑（歧义时报错，`replace_all` 全量） | ask |
 | `glob` | `**/*.ts` 模式找文件（无 `/` 的模式任意深度匹配） | allow |

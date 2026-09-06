@@ -12,10 +12,17 @@ import { scanCommand, formatScanSummary } from "./shell-scan.js";
 import { generateShellDescription } from "./shell-prompt.js";
 import { CodeIntelPool, flattenDocumentSymbols, navtoLocate, navtreeToSymbols, pathToUri, uriToPath, openDocument } from "./codeintel.js";
 
-const MAX_READ = 64 * 1024;
 const MAX_OUT = 32 * 1024;
 const CMD_TIMEOUT_DEFAULT_MS = Number(process.env.AIH_CMD_TIMEOUT_MS ?? "") || 120_000;
 const CMD_TIMEOUT_MAX_MS = 600_000;
+
+// OMP-R#2 — read_file dual budgets: line cap + char cap. A file that exceeds
+// either is truncated in one of three states instead of a naive head slice
+// (which loses the tail where a file's verdict/format often lives).
+const MAX_READ_LINES = 3000;
+const MAX_READ_CHARS = 50 * 1024;
+/** Per-column cap applied to an oversized single line (truncateTail). */
+const MAX_LINE_CHARS = 512;
 
 /** Detect the user's shell (for tool-description adaptation). */
 function detectShellName(): string {
@@ -70,6 +77,139 @@ export function truncateMiddle(
     text: `${head}\n… ${elided} chars elided …\n${tail}`,
     truncated: true,
     elidedChars: elided,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// OMP-R#2 — read_file dual-budget three-state truncation.
+//
+// oh-my-pi reads with TWO budgets (3000 lines / 50KB) and picks one of three
+// truncation states instead of a naive head slice:
+//   · truncateHead   — the FIRST line alone exceeds the char budget: never
+//     return a partial line; signal `firstLineExceedsLimit` instead.
+//   · truncateTail   — an oversized line (e.g. minified JS) is kept as a
+//     bounded BYTE WINDOW (never materialize the giant string anywhere).
+//   · truncateMiddle — head + tail with a `[…Nln elided…]` marker between.
+//
+// All pure (no I/O) so each state is unit-testable. `content` is the joined
+// line text of the selected slice; the budget is the char cap.
+// ---------------------------------------------------------------------------
+
+export interface ReadTruncation {
+  /** The text to show (head/tail/marker), already within the char budget. */
+  content: string;
+  /** One of the three states; "full" when nothing was cut. */
+  state: "full" | "head" | "tail" | "middle";
+  /** Total lines in the source slice (before cutting). */
+  totalLines: number;
+  /** Lines shown in `content` (elided marker does NOT count). */
+  linesShown: number;
+  /** Lines elided in the middle (0 for head/tail/full). */
+  linesElided: number;
+  /** First-line-too-big signal (state "head"). The caller surfaces it so the
+   *  model knows the line exists but is too large to inline. */
+  firstLineExceedsLimit?: boolean;
+  /** Bytes of the oversized line that were windowed (state "tail"). */
+  tailWindowedBytes?: number;
+}
+
+/**
+ * Truncate a slice of lines under a char budget, choosing the state by shape.
+ * `lines` is the FULL selected line array (already line-budgeted); the only
+ * char limit applied here is `maxChars`. Never splits a line mid-way.
+ */
+export function truncateReadLines(
+  lines: string[],
+  maxChars: number,
+): ReadTruncation {
+  const totalLines = lines.length;
+  if (totalLines === 0) return { content: "", state: "full", totalLines: 0, linesShown: 0, linesElided: 0 };
+
+  // Quick full pass: everything fits.
+  let joined = lines.join("\n");
+  if (joined.length <= maxChars) {
+    return { content: joined, state: "full", totalLines, linesShown: totalLines, linesElided: 0 };
+  }
+
+  // STATE head — the first line alone overshoots the budget. never return a
+  // partial line: signal instead (the caller can window it via offset).
+  if (lines[0].length > maxChars) {
+    return {
+      content: "",
+      state: "head",
+      totalLines,
+      linesShown: 0,
+      linesElided: 0,
+      firstLineExceedsLimit: true,
+    };
+  }
+
+  // STATE tail — a LATER line is a giant (e.g. minified source). Keep the
+  // head lines that fit, then a bounded byte window of the giant line so the
+  // model still sees its character (never materialize the whole line).
+  const giantIdx = lines.findIndex((l) => l.length > maxChars);
+  if (giantIdx >= 1) {
+    // Head up to (excluding) the giant line, as many complete lines as fit.
+    const head: string[] = [];
+    let acc = 0;
+    for (let i = 0; i < giantIdx; i += 1) {
+      const cost = lines[i].length + 1; // +1 newline
+      if (acc + cost > maxChars) break;
+      acc += cost;
+      head.push(lines[i]);
+    }
+    const budget = Math.max(1, maxChars - acc - 1);
+    const window = lines[giantIdx].slice(0, Math.min(budget, MAX_LINE_CHARS));
+    const full = head.length
+      ? `${head.join("\n")}\n${window}`
+      : window;
+    return {
+      content: full,
+      state: "tail",
+      totalLines,
+      linesShown: head.length + 1,
+      linesElided: totalLines - head.length - 1,
+      tailWindowedBytes: lines[giantIdx].length,
+    };
+  }
+
+  // STATE middle — many normal lines: keep head + tail, mark the middle.
+  // The tail carries the verdict (like shell output) so it gets PRIORITY:
+  // head gets half the budget, the marker a fixed allowance, and the rest
+  // (minus marker) goes to the tail — the tail line is never squeezed by the
+  // marker the way a symmetric split allows.
+  const markerBudget = 24; // "… N lines elided …" + margins
+  const headBudget = Math.floor((maxChars - markerBudget) / 2);
+  const headLines: string[] = [];
+  let headLen = 0;
+  for (const line of lines) {
+    const cost = line.length + 1;
+    if (headLen + cost > headBudget) break;
+    headLen += cost;
+    headLines.push(line);
+  }
+  // Tail = last lines that fit in the remaining budget (never overlap head).
+  const tailBudget = Math.max(1, maxChars - headLen - markerBudget);
+  const tailLines: string[] = [];
+  let tailLen = 0;
+  for (let i = lines.length - 1; i >= headLines.length; i -= 1) {
+    const cost = lines[i].length + 1;
+    if (tailLen + cost > tailBudget) break;
+    tailLen += cost;
+    tailLines.unshift(lines[i]);
+  }
+  const elided = totalLines - headLines.length - tailLines.length;
+  const marker = `\n… ${elided} lines elided …\n`;
+  const body = headLines.join("\n") + (elided > 0 ? marker : "\n") + tailLines.join("\n");
+  // The marker may push the head already at budget over maxChars — trim the
+  // tail window if so (marker is part of the cost, like oh-my-pi's marker).
+  const bodyFinal = body.length <= maxChars ? body : body.slice(0, maxChars);
+  return {
+    content: bodyFinal,
+    state: "middle",
+    totalLines,
+    linesShown: headLines.length + tailLines.length,
+    linesElided: elided,
   };
 }
 
@@ -197,7 +337,7 @@ export function registerDevTools(
 
   registry.register({
     name: "read_file",
-    description: "Read a text file (first 64KB).",
+    description: "Read a text file (dual budget: 3000 lines / 50KB; three-state truncation with head/tail preserved and elided-marker).",
     kind: "read",
     permission: "allow",
     parameters: {
@@ -214,11 +354,26 @@ export function registerDevTools(
       const file = safePath(cwd, String(a.path));
       if (!existsSync(file)) throw new Error(`not found: ${file}`);
       if (!statSync(file).isFile()) throw new Error(`not a file: ${file}`);
-      let text = readFileSync(file, "utf8").slice(0, MAX_READ);
+      // OMP-R#2 — read the FULL file (no head slice), then apply the line
+      // budget first (offset/max_lines slice), then the three-state char
+      // truncation. Reading full keeps line numbering honest when the tail
+      // matters; the char cap applies at projection time.
+      const full = readFileSync(file, "utf8");
       const start = Math.max(0, Number(a.offset_line ?? 1) - 1);
-      const maxLines = Number(a.max_lines ?? 400);
-      const lines = text.split("\n").slice(start, start + maxLines);
-      return { path: file, total_lines_shown: lines.length, content: lines.join("\n").slice(0, MAX_READ) };
+      const maxLines = Number(a.max_lines ?? MAX_READ_LINES);
+      const lines = full.split("\n").slice(start, start + maxLines);
+      const t = truncateReadLines(lines, MAX_READ_CHARS);
+      return {
+        path: file,
+        total_lines_shown: t.totalLines,
+        total_lines_in_file: lines.length >= maxLines ? undefined : lines.length,
+        state: t.state,
+        lines_shown: t.linesShown,
+        lines_elided: t.linesElided,
+        ...(t.firstLineExceedsLimit ? { first_line_exceeds_limit: true } : {}),
+        ...(t.tailWindowedBytes !== undefined ? { tail_windowed_bytes: t.tailWindowedBytes } : {}),
+        content: t.content,
+      };
     },
   });
 

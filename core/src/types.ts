@@ -20,6 +20,21 @@ export type ToolKind = "read" | "write";
  * .aih/workspace.json) so restore/resume can prove "same workspace" across
  * path moves — path equality is diagnostic, uuid equality is the gate.
  */
+/**
+ * M-R#1 — one touched file in a compaction file manifest. Built from
+ * tool/call args (pure, deterministic); the model sees a compact ledger of
+ * which files were edited/written/read and how much, so a compacted agent
+ * doesn't re-read or re-edit from scratch.
+ */
+export interface FileManifestEntry {
+  /** Path as touched by the tool (relative or absolute, verbatim). */
+  path: string;
+  /** How the file was touched. */
+  action: "edited" | "written" | "read";
+  /** Read detail — "full" or "lines x-y" (only for action "read"). */
+  read?: string;
+}
+
 export interface WorktreeSummary {
   /** Current branch name (`null` = detached HEAD or undetermined). */
   branch: string | null;
@@ -169,6 +184,13 @@ export type SessionEvent =
        * the stale pre-compaction size (last turn/end predates the summary).
        */
       contextAfter?: number;
+      /**
+       * M-R#1 — file manifest: which files the compacted prefix touched and
+       * HOW (edited/written/read full or read lines x-y), so a compacted agent
+       * does not re-read/re-edit from scratch. Built by parsing tool/call args
+       * (`file_path`/`path`) — pure, deterministic, no extra LLM call.
+       */
+      fileManifest?: FileManifestEntry[];
     }
   | {
       seq: number;

@@ -22,7 +22,7 @@ export {
   stampConfigVersion,
   stampSessionVersion,
 } from "./schema-version.js";
-export { AgentLoop, estimateTokensText } from "./agent-loop.js";
+export { AgentLoop, estimateTokensText, buildFileManifest, renderFileManifest, MAX_FILE_MANIFEST_ENTRIES } from "./agent-loop.js";
 export type { AgentLoopOptions } from "./agent-loop.js";
 export {
   BudgetTracker,
@@ -103,6 +103,7 @@ export {
   DenyAll,
   PolicyGate,
   RulesetGate,
+  GUARDED_WRITE_TOOLS,
   deriveScope,
   matchPattern,
   targetOf,

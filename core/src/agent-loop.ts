@@ -41,7 +41,7 @@ function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
 }
 import { coverageDigest, SessionLog } from "./session-log.js";
 import type { ToolRegistry } from "./tool-registry.js";
-import type { ChatMessage, ContentBlock, LLMResponse, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
+import type { ChatMessage, ContentBlock, FileManifestEntry, LLMResponse, SessionEvent, TokenUsage, ToolCall, TurnResult } from "./types.js";
 import { BudgetExceeded, BudgetTracker } from "./budget.js";
 import type { BudgetVerdict } from "./budget.js";
 
@@ -76,6 +76,96 @@ async function mapConcurrent<T, R>(
   });
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * M-R#1 — build a file manifest from session events (pure, deterministic).
+ *
+ * MiMo-Code's compaction projection carries a buildFileManifest (from
+ * read/patch/tool events): each touched file records edited / written /
+ * `read: full` / `read: lines x-y`. This shrinks re-reading/re-editing after
+ * a compaction — the agent keeps a compact ledger of what the transcript was
+ * looking at, without an extra LLM call.
+ *
+ * Parsing rules (all string-arg JSON.parse per the roadmap):
+ *  · write_file            → { path }            action "written"
+ *  · edit / apply_patch    → { path }            action "edited"
+ *  · read_file / read_*    → { path }            action "read"
+ *                              + read detail from offset_line/max_lines
+ *  · git/tool events with `file_path` arg        action "edited"
+ * Invalid/unparseable args are skipped silently (best-effort ledger, never
+ * blocks compaction). Entries are deduped with the LAST touch winning and a
+ * stable (last-seen) order.
+ */
+export function buildFileManifest(events: readonly SessionEvent[]): FileManifestEntry[] {
+  const entries = new Map<string, FileManifestEntry>();
+  for (const e of events) {
+    if (e.type !== "tool/call") continue;
+    const args = typeof e.args === "string" ? safeParseJson(e.args) : e.args;
+    if (!args || typeof args !== "object") continue;
+    const a = args as Record<string, unknown>;
+    const path = pickPath(a);
+    if (!path) continue;
+    const entry: FileManifestEntry = { path, action: actionFor(e.name, a) };
+    if (entry.action === "read") {
+      const off = Number(a.offset_line ?? 1);
+      const max = Number(a.max_lines ?? 0);
+      if (Number.isFinite(off) && Number.isFinite(max) && max > 0) {
+        entry.read = `lines ${off}-${off + max - 1}`;
+      } else {
+        entry.read = "full";
+      }
+    }
+    entries.set(path, entry);
+  }
+  return [...entries.values()];
+}
+
+function pickPath(a: Record<string, unknown>): string | undefined {
+  for (const key of ["path", "file_path", "file", "dir"] as const) {
+    const v = a[key];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+function actionFor(name: string, a: Record<string, unknown>): FileManifestEntry["action"] {
+  if (name === "write_file") return "written";
+  if (name === "edit" || name === "apply_patch" || name === "append_text" || name === "patch") return "edited";
+  if (name.startsWith("read") || name === "grep" || name === "glob" || name === "list_dir") return "read";
+  // Unknown/misc tool with a path arg → treat as edited (conservative:
+  // the agent touched it).
+  return "edited";
+}
+
+function safeParseJson(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Cap the manifest so a huge transcript can't blow the summary budget. */
+export const MAX_FILE_MANIFEST_ENTRIES = 120;
+
+export function renderFileManifest(entries: FileManifestEntry[]): string {
+  if (entries.length === 0) return "";
+  const capped = entries.slice(0, MAX_FILE_MANIFEST_ENTRIES);
+  const lines = capped.map((e) => {
+    const detail = e.action === "read" ? `read:${e.read ?? "full"}` : e.action;
+    return `- ${e.path} (${detail})`;
+  });
+  const overflow = entries.length > capped.length ? `\n… ${entries.length - capped.length} more files …` : "";
+  return (
+    `\n\n### Files touched in this conversation (file manifest)\n` +
+    `Carry this forward: the following files were written, edited, or read. ` +
+    `Do NOT re-read files you already have fresh content for, and do NOT ` +
+    `re-edit files whose current state you know. Only re-read when you need ` +
+    `new content beyond what is shown.\n\n` +
+    lines.join("\n") +
+    overflow
+  );
 }
 
 export interface AgentLoopOptions {
@@ -1437,11 +1527,17 @@ export class AgentLoop {
     // Fold authoritative current state (e.g. todo list) into the summary so a
     // compacted agent never forgets what is already done vs still pending.
     const contextSnapshot = this.#compactContext?.()?.trim();
+    // M-R#1 — file manifest from the compacted prefix: which files were
+    // written/edited/read, so the post-compaction agent doesn't re-read or
+    // re-edit from scratch. Pure, deterministic, no extra LLM call.
+    const fileManifest = buildFileManifest(this.#log.all());
+    const manifestText = renderFileManifest(fileManifest);
     const effectiveInstructions = [
       opts?.instructions?.trim(),
       contextSnapshot
         ? `Authoritative CURRENT STATE (carry this forward verbatim; it overrides any stale "Objective" entry in the summary):\n${contextSnapshot}`
         : undefined,
+      manifestText || undefined,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -1480,6 +1576,9 @@ export class AgentLoop {
       coverage,
       ...(recent.length > 0 ? { recent } : {}),
       ...(opts?.trigger ? { trigger: opts.trigger } : {}),
+      // M-R#1 — persist the file manifest structurally so resume/tools can
+      // read it back without re-parsing the transcript.
+      ...(fileManifest.length > 0 ? { fileManifest } : {}),
       // Stamp the post-compaction context size (estimate of the projected
       // message list AFTER the append below — computed from the summary text
       // + tail we are about to persist). UI/resume read this instead of the

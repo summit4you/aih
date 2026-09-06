@@ -129,6 +129,30 @@ export function deriveScope(req: ApprovalRequest): string {
   return `${dir}/**`;
 }
 
+/**
+ * KL-R#4 — guarded tools: write tools that a config rule must NOT be able to
+ * re-open to automatic allow. kilocode calls these "guarded" (bash/task/write/
+ * agent_manager/repo_clone) — configuration rules cannot lift them because
+ * allow-everything config or a malicious machine-written config would
+ * otherwise grant arbitrary execution with no human in the loop.
+ *
+ * AIH equivalent: the app's own write tools + shell. A rule of "allow" for
+ * these still resolves to "ask" (the human floor). Deny stays deny — you may
+ * always forbid, you may never auto-allow.
+ */
+export const GUARDED_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  "run_cmd",
+  "write_file",
+  "edit",
+  "apply_patch",
+  "append_text",
+  "patch",
+  "permissions",
+  "toggle_todo",
+  "remove_todo",
+  "add_todo",
+]);
+
 export class RulesetGate implements ApprovalGate {
   rules: PermissionRule[] = [];
   #base: ApprovalGate;
@@ -172,6 +196,9 @@ export class RulesetGate implements ApprovalGate {
    * If ANY matching rule is "deny", the request is denied. Else if ANY is
    * "ask", it must be confirmed by a human (a later "allow" cannot lift this
    * floor). Only when no ask/deny matches does "allow" (or the base) apply.
+   * KL-R#4 — a "guarded" write tool can never be auto-allowed by a rule: the
+   * final result is at most "ask" even when every matching rule says allow
+   * (deny still wins).
    */
   evaluate(req: ApprovalRequest): "allow" | "ask" | "deny" | undefined {
     const raw = targetOf(req);
@@ -185,6 +212,12 @@ export class RulesetGate implements ApprovalGate {
       if (rule.action === "deny") action = "deny";
       else if (rule.action === "ask" && action !== "deny") action = "ask";
       else if (rule.action === "allow" && action !== "ask" && action !== "deny") action = "allow";
+    }
+    // KL-R#4 — guarded write tools floor at "ask": config cannot auto-allow a
+    // write that the tool author marked as needing a human. (Deny already
+    // dominated above.)
+    if (action === "allow" && GUARDED_WRITE_TOOLS.has(req.tool) && req.kind === "write") {
+      return "ask";
     }
     return action;
   }

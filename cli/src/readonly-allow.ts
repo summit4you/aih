@@ -35,6 +35,42 @@ const DANGEROUS_SUBSTRINGS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * KL-R#4 — defensive blacklist: command chaining / arbitrary-execution
+ * affordances that must NEVER pass as "read-only", even when the head of the
+ * command is a whitelisted read-only binary. kilocode blocks `*;*`, `*>*`,
+ * `*&*`, `*$(*`, `rg --pre`, `man -P` — a read-only allowlist is only as
+ * strong as the proviso that a whitelisted binary cannot be turned into an
+ * arbitrary executor via flags or chaining. This is defense-in-depth, NOT a
+ * sandbox: the real boundary remains the approval gate.
+ */
+export const READONLY_DEFENSIVE_BLACKLIST: readonly string[] = [
+  ";", "&&", "||", "|", ">", "<", "&",
+  "`", "$(", "${", "\\n",
+  "sudo", "su ", "env ", "eval ", "exec ", "source ",
+  "--pre", "--exec", "-exec", "-execdir", "-delete",
+  "--pager", "--color=always", "--no-ignore",
+  "sh -c", "bash -c", "zsh -c", "cmd /c",
+  "rm ", "mv ", "cp ", "chmod", "chown", "mkdir", "touch", "tee ",
+  "curl ", "wget ", "nc ", "ncat ", "telnet ",
+];
+
+/**
+ * Is `cmd` provably read-only per the KL-R#4 defense-in-depth blacklist?
+ * Returns true when the command is HEURISTICALLY SAFE (no blacklisted
+ * affordance), false when it carries any. This is checked IN ADDITION to the
+ * allowlist prefix scan — the allowlist decides what commands may pass at
+ * all, this decides whether a given invocation of an allowed command is safe.
+ */
+export function hasDefensiveVeto(cmd: string): boolean {
+  const trimmed = cmd.trim();
+  if (!trimmed) return true; // empty → veto (nothing to run)
+  for (const bad of READONLY_DEFENSIVE_BLACKLIST) {
+    if (trimmed.includes(bad)) return true;
+  }
+  return false;
+}
+
+/**
  * Is `cmd` a provably read-only command per the deterministic whitelist?
  * `cmd` should be the run_cmd command string. Parsing is intentionally
  * shallow (prefix + danger scan) — if we can't prove it read-only, it isn't.
@@ -42,6 +78,9 @@ const DANGEROUS_SUBSTRINGS: ReadonlySet<string> = new Set([
 export function isReadonlyCommand(cmd: string): boolean {
   const trimmed = cmd.trim();
   if (!trimmed) return false;
+  // KL-R#4 — defensive blacklist first: chaining / arbitrary-exec flags
+  // veto even a whitelisted binary (`rg --pre`, `man -P`, `…; …`).
+  if (hasDefensiveVeto(trimmed)) return false;
   // Reject anything with write/chaining/substitution affordances up front.
   for (const bad of DANGEROUS_SUBSTRINGS) {
     if (trimmed.includes(bad)) return false;

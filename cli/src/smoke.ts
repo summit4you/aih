@@ -7597,3 +7597,133 @@ function mkFinding(file: string, start: number, end: number, title: string): Fin
   }
   console.log("ok: CL-R#1/KL-R#1/KL-R#5/OMP-R#1+OCL-R#4 patch guard + search timeout + provenance + retry hints passed");
 }
+
+// ---------------------------------------------------------------------------
+// OMP-R#2 — read_file three-state truncation (pure, no I/O).
+// M-R#1 — compaction file manifest (pure, deterministic).
+// KL-R#4 — readOnlyBash defensive blacklist + guarded write tools.
+// ---------------------------------------------------------------------------
+async function testOmpMKlBatch(): Promise<void> {
+  // OMP-R#2 — truncateReadLines states.
+  {
+    const { truncateReadLines } = await import("./dev-tools.js");
+    // full: everything fits.
+    const full = truncateReadLines(["a", "b", "c"], 100);
+    assert(full.state === "full" && full.content === "a\nb\nc" && full.linesElided === 0,
+      "OMP-R#2: fits → full, no elision");
+    // head: first line alone exceeds budget → signal, never a partial line.
+    const head = truncateReadLines(["x".repeat(200), "b"], 100);
+    assert(head.state === "head" && head.content === "" && head.firstLineExceedsLimit === true,
+      "OMP-R#2: first-line-too-big → head state + signal, empty content");
+    // tail: later giant line → keep head lines + bounded window.
+    const tail = truncateReadLines(["a", "b", "y".repeat(500)], 100);
+    assert(tail.state === "tail" && tail.linesElided === 0 && typeof tail.tailWindowedBytes === "number",
+      "OMP-R#2: later giant line → tail state + windowed bytes");
+    assert(tail.content.length <= 100, `OMP-R#2: tail content within budget (${tail.content.length})`);
+    assert(!tail.content.includes("y".repeat(500)), "OMP-R#2: giant line not materialized in full");
+    // middle: many normal lines → head + tail + elided marker.
+    const many = Array.from({ length: 40 }, (_, i) => `line-${i}`.padEnd(10, " "));
+    const mid = truncateReadLines(many, 100);
+    assert(mid.state === "middle" && mid.linesElided > 0, "OMP-R#2: many lines → middle state + elided count");
+    assert(mid.content.includes("… ") && mid.content.includes(" lines elided …"), "OMP-R#2: middle marker present");
+    assert(mid.content.startsWith("line-0"), "OMP-R#2: middle keeps head start");
+    assert(mid.content.trimEnd().endsWith("line-39"), "OMP-R#2: middle keeps tail end (verdict line)");
+    assert(mid.content.length <= 100, `OMP-R#2: middle within budget (${mid.content.length})`);
+    // empty input.
+    const empty = truncateReadLines([], 100);
+    assert(empty.state === "full" && empty.content === "", "OMP-R#2: empty slice → full empty");
+    console.log("ok: OMP-R#2 read_file three-state truncation (head/tail/middle/full)");
+  }
+
+  // M-R#1 — buildFileManifest from tool/call events.
+  {
+    const { buildFileManifest, renderFileManifest, MAX_FILE_MANIFEST_ENTRIES } = await import("@aih/core");
+    const events = [
+      { type: "tool/call", turnId: "t1", callId: "c1", name: "write_file", args: { path: "src/a.ts" } },
+      { type: "tool/call", turnId: "t1", callId: "c2", name: "edit", args: { path: "src/a.ts" } },
+      { type: "tool/call", turnId: "t1", callId: "c3", name: "read_file", args: { path: "src/b.ts", offset_line: 5, max_lines: 20 } },
+      { type: "tool/call", turnId: "t1", callId: "c4", name: "read_file", args: { path: "src/b.ts" } },
+      { type: "tool/call", turnId: "t1", callId: "c5", name: "grep", args: { path: "src/c.ts" } },
+      { type: "tool/call", turnId: "t1", callId: "c6", name: "run_cmd", args: '{"command":"ls"}' },
+      { type: "tool/call", turnId: "t1", callId: "c7", name: "read_file", args: "not-json" },
+    ] as const;
+    const manifest = buildFileManifest(events as unknown as import("@aih/core").SessionEvent[]);
+    assert(manifest.length === 3, `M-R#1: 3 unique files (a.ts, b.ts deduped, c.ts) from 6 path-bearing calls (got ${manifest.length})`);
+    const aEntry = manifest.find((e) => e.path === "src/a.ts");
+    assert(!!(aEntry && aEntry.action === "edited"), `M-R#1: write then edit → last touch 'edited' (got ${aEntry?.action})`);
+    const bEntry = manifest.find((e) => e.path === "src/b.ts");
+    assert(!!(bEntry && bEntry.action === "read" && bEntry.read === "full"),
+      `M-R#1: read_file deduped, last read without offset → 'read: full' (got ${JSON.stringify(bEntry)})`);
+    assert(manifest.every((e) => !(e.action === "read" && !e.read)), "M-R#1: read entries always carry a read detail");
+    const cEntry = manifest.find((e) => e.path === "src/c.ts");
+    assert(!!(cEntry && cEntry.action === "read"), "M-R#1: grep with path → read entry");
+    // Dedup with offset detail preserved when only ONE read touches the file.
+    const detail = buildFileManifest([
+      { type: "tool/call", turnId: "t1", callId: "d1", name: "read_file", args: { path: "only.ts", offset_line: 5, max_lines: 20 } },
+    ] as unknown as import("@aih/core").SessionEvent[]);
+    assert(detail[0]?.read === "lines 5-24", `M-R#1: read detail preserved for single touch (got ${detail[0]?.read})`);
+    const text = renderFileManifest(manifest);
+    assert(text.includes("- src/a.ts (edited)") && text.includes("- src/b.ts (read:full)"),
+      "M-R#1: render lists each entry with action detail");
+    // Cap.
+    const many = Array.from({ length: MAX_FILE_MANIFEST_ENTRIES + 10 }, (_, i) => ({
+      type: "tool/call" as const, turnId: "t1", callId: `c${i}`, name: "read_file", args: { path: `f${i}.ts` },
+    })) as unknown as import("@aih/core").SessionEvent[];
+    const capped = buildFileManifest(many);
+    const cappedText = renderFileManifest(capped);
+    assert(capped.length === MAX_FILE_MANIFEST_ENTRIES + 10, "M-R#1: build keeps all entries (render caps display)");
+    assert(cappedText.includes("more files"), "M-R#1: overflow marker present when capped");
+    // Empty → "".
+    assert(renderFileManifest([]) === "", "M-R#1: empty manifest renders empty string");
+    console.log("ok: M-R#1 compaction file manifest (build/render/cap)");
+  }
+
+  // KL-R#4 — defensive blacklist + guarded write tools.
+  {
+    const { isReadonlyCommand, hasDefensiveVeto } = await import("./readonly-allow.js");
+    // Whitelisted binaries still vetoed when carrying chain/exec affordances.
+    assert(!isReadonlyCommand("rg --pre x"), "KL-R#4: rg --pre vetoed (arbitrary exec via preprocessor)");
+    assert(!isReadonlyCommand("ls; rm -rf /"), "KL-R#4: chained with ; vetoed");
+    assert(!isReadonlyCommand("cat a > b"), "KL-R#4: redirect vetoed");
+    assert(!isReadonlyCommand("grep x & echo y"), "KL-R#4: background & vetoed");
+    assert(!isReadonlyCommand("ls $(rm -rf /)"), "KL-R#4: $() substitution vetoed");
+    assert(!isReadonlyCommand("man -P cat ls"), "KL-R#4: man -P pager vetoed");
+    assert(!isReadonlyCommand("cat a | sh"), "KL-R#4: pipe-to-sh vetoed");
+    assert(isReadonlyCommand("ls -la"), "KL-R#4: clean ls passes");
+    assert(isReadonlyCommand("git status"), "KL-R#4: clean git status passes");
+    assert(isReadonlyCommand("grep -rn pattern src/"), "KL-R#4: clean grep passes");
+    assert(hasDefensiveVeto("rm -rf /"), "KL-R#4: hasDefensiveVeto true for rm");
+    assert(!hasDefensiveVeto("ls -la"), "KL-R#4: hasDefensiveVeto false for clean ls");
+
+    // Guarded write tools: a config allow rule is floored to ask.
+    const { RulesetGate, GUARDED_WRITE_TOOLS } = await import("@aih/core");
+    assert(GUARDED_WRITE_TOOLS.has("run_cmd") && GUARDED_WRITE_TOOLS.has("toggle_todo"),
+      "KL-R#4: guarded set covers shell + app write tools");
+    const gate = new RulesetGate(
+      { async request() { return true; } },
+      [{ tool: "run_cmd", action: "allow" as const, pattern: "**" }],
+    );
+    const guardedEval = gate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "x" } });
+    assert(guardedEval === "ask", `KL-R#4: run_cmd allow rule → floored to ask (got ${guardedEval})`);
+    const readEval = gate.evaluate({ tool: "run_cmd", kind: "read", args: { command: "ls" } });
+    assert(readEval === "allow", `KL-R#4: run_cmd read not floored (guarded covers write only) (got ${readEval})`);
+    // A non-guarded write tool stays allowable.
+    const unguarded = new RulesetGate(
+      { async request() { return true; } },
+      [{ tool: "webfetch", action: "allow" as const, pattern: "**" }],
+    );
+    assert(unguarded.evaluate({ tool: "webfetch", kind: "read", args: {} }) === "allow",
+      "KL-R#4: non-guarded read tool stays allow");
+    // Deny still wins over guarded floor.
+    const denyGate = new RulesetGate(
+      { async request() { return true; } },
+      [{ tool: "run_cmd", action: "deny" as const, pattern: "**" }],
+    );
+    assert(denyGate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "x" } }) === "deny",
+      "KL-R#4: deny dominates the guarded floor");
+    console.log("ok: KL-R#4 readOnlyBash defensive veto + guarded write tools floor-at-ask");
+  }
+  console.log("ok: OMP-R#2 + M-R#1 + KL-R#4 batch passed");
+}
+
+await testOmpMKlBatch();
