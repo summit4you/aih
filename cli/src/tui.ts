@@ -545,16 +545,16 @@ export class Tui {
   /** P2#9 — /vivid: concise (plain) render mode — no borders/surface/panel/chrome. */
   #plain = false;
   /**
-   * Keyboard focus for expand/collapse (A). Legacy Windows console (conhost)
-   * sends no mouse events, so click-to-expand is structurally impossible
-   * there; Enter/o on a focused unit is the keyboard path. Default = the
-   * most recently rendered tool unit, so Enter/o just works after a turn.
+   * Keyboard focus for expand/collapse (A). Mouse click also works (Win10+
+   * conhost supports ?1000/?1006 SGR mouse). Enter/o on a focused unit is the
+   * keyboard path. Default = the most recently rendered tool unit.
    */
   #focusUnit = -1;
   /**
-   * Legacy Windows console (conhost, no WT_SESSION/TERM_PROGRAM): no mouse
-   * events, unreliable bracketed paste, and GBK codepage mis-renders Unicode
-   * block chars. Set in start(); consumers (panel sparkline) degrade to ASCII.
+   * Legacy Windows console (conhost, no WT_SESSION/TERM_PROGRAM): mouse
+   * tracking works (Win10+), but bracketed paste is unreliable and GBK
+   * codepage mis-renders Unicode block chars. Set in start(); consumers
+   * (panel sparkline) degrade to ASCII.
    */
   #legacyWin = false;
 
@@ -636,9 +636,12 @@ constructor(opts: TuiOptions) {
     this.#legacyWin = legacyWin;
     // Legacy conhost: NO alt-screen (?1049) — its resize handler has a buffer
     // overflow bug that crashes when the TUI writes during reallocation.
-    // No mouse tracking, no bracketed paste (conhost predates both).
-    const modes = legacyWin ? "" : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
-    if (modes) process.stdout.write(modes);
+    // Mouse tracking (?1000/?1006) IS supported on Win10+ conhost — enable it
+    // so click-to-expand works. Bracketed paste (?2004) is unreliable there.
+    const modes = legacyWin
+      ? `${CSI}?1000h${CSI}?1006h`
+      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
+    process.stdout.write(modes);
     this.#timer = setInterval(this.#tick, 120);
     this.#paint();
   }
@@ -652,8 +655,10 @@ constructor(opts: TuiOptions) {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
-    // Legacy conhost: no alt-screen/mouse to restore — just show cursor.
-    const restore = this.#legacyWin ? SHOW : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`;
+    // Legacy conhost: restore mouse tracking (no alt-screen/bracketed-paste).
+    const restore = this.#legacyWin
+      ? `${CSI}?1000l${CSI}?1006l${SHOW}`
+      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`;
     process.stdout.write(restore);
   }
 
