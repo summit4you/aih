@@ -3087,6 +3087,27 @@ await srv.connect(new StdioServerTransport());
     // small tolerance for transient (already-closing) fds; a leak adds 8
     assert(fdCount() <= before + 2, `spawnCapture must not leak fds (grew ${fdCount() - before} over 8 runs)`);
   }
+  // Windows shell picker (pure logic, testable on any platform): Git Bash
+  // preferred for POSIX command compat; WSL's System32 bash must be rejected
+  // (different filesystem context — cwd/paths would silently point elsewhere);
+  // PowerShell is the fallback. mimo-code parity: prefer a real POSIX shell on
+  // Windows, force UTF-8 for PS children.
+  {
+    const { pickWin32Shell } = await import("./sandbox.js");
+    assert(
+      pickWin32Shell("C:\\Program Files\\Git\\bin\\bash.exe", undefined)?.kind === "bash",
+      "win32 shell picker: Git Bash selected when present",
+    );
+    assert(
+      pickWin32Shell("C:\\Windows\\System32\\bash.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")?.kind === "powershell",
+      "win32 shell picker: WSL System32 bash rejected → PowerShell fallback",
+    );
+    assert(
+      pickWin32Shell(undefined, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")?.kind === "powershell",
+      "win32 shell picker: bare PowerShell resolves",
+    );
+    assert(pickWin32Shell(undefined, undefined) === undefined, "win32 shell picker: no candidates → undefined (caller supplies hardcoded powershell.exe)");
+  }
   // default resolution is local
   const prev = process.env.AIH_SANDBOX;
   delete process.env.AIH_SANDBOX;
@@ -3123,6 +3144,44 @@ await srv.connect(new StdioServerTransport());
     result?: { stdout?: string; sandbox?: string };
   };
   assert(r3.ok && !!r3.result?.stdout && r3.result.stdout.includes("via-sandbox") && r3.result?.sandbox === "local", "run_cmd reports the sandbox backend used");
+}
+
+{
+  // Windows backspace: conhost (and some emulators) send BS \x08 for
+  // Backspace instead of DEL \x7f — aih only handled \x7f, so backspace did
+  // nothing on Windows. #feed now normalizes \x08 → \x7f for every input
+  // path (composer / question / confirm / overlay / paste).
+  const { Tui } = await import("./tui.js");
+  {
+    const lines: string[] = [];
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: (s: string) => lines.push(s),
+    });
+    tui.feed("abc\x08\x7f\r"); // BS deletes 'c', DEL deletes 'b' → "a" submits
+    assert(lines.length === 1 && lines[0] === "a", `win32 BS backspace works in the composer (got ${JSON.stringify(lines)})`);
+  }
+  {
+    // question path: type "ok", BS once → "o"
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+    const qp = tui.askQuestion("q?");
+    tui.feed("ok\x08\r"); // \x08 deletes 'k' → answer "o" submitted
+    const ans = await Promise.race([qp, new Promise((r) => setTimeout(() => r("TIMEOUT"), 300))]);
+    assert(ans === "o", `win32 BS backspace works in question prompts (got ${JSON.stringify(ans)})`);
+  }
 }
 
 {

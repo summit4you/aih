@@ -76,7 +76,8 @@ export class TodoAppAdapter implements AppAdapter {
         permission: "allow",
       },
       add_todo: {
-        description: "Add a new todo item",
+        description:
+          "Add todo item(s) — pass `items` (array) to add several in one call, or `text` for a single one",
         kind: "write",
         permission: "allow",
       },
@@ -107,8 +108,23 @@ export class TodoAppAdapter implements AppAdapter {
       description: this.descriptor.actions.add_todo.description,
       kind: "write",
       permission: "allow",
-      parameters: z.object({ text: z.string().min(1) }),
-      run: async (args) => this.#add((args as { text: string }).text),
+      // Batch form: `items` adds several todos in ONE call. Without it a
+      // re-planning model issues one call per todo (observed: 6 calls per
+      // replan, 76 in a single 1.5-hour session) — churn the loop can do
+      // without.
+      parameters: z
+        .object({
+          text: z.string().min(1).optional(),
+          items: z.array(z.string().min(1)).min(1).max(50).optional(),
+        })
+        .refine((v) => v.text !== undefined || v.items !== undefined, {
+          message: "provide `text` (single) or `items` (batch)",
+        }),
+      run: async (args) => {
+        const { text, items } = args as { text?: string; items?: string[] };
+        if (items?.length) return { added: items.map((t) => this.#add(t)) };
+        return this.#add(text as string);
+      },
     },
     toggle_todo: {
       description: this.descriptor.actions.toggle_todo.description,

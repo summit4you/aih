@@ -17,11 +17,86 @@
  * exit-code propagation. They return merged stdout+stderr (the same shape
  * run_cmd has always returned).
  */
-import { spawn } from "node:child_process";
-import { closeSync, openSync, readFileSync, unlinkSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+/**
+ * Windows shell resolution (mimo-code parity): Linux commands (`tar`, `grep`,
+ * `sed`…) cannot run under cmd/PowerShell, so prefer **Git Bash** when Git for
+ * Windows is installed — it provides a real POSIX environment (and maps /tmp,
+ * /c/... paths) — and fall back to Windows PowerShell with UTF-8 forced on the
+ * spawned process (mimo-code documents GBK mojibake on zh-CN systems: child
+ * output inherits the legacy code page and garbles the TUI, whose width math
+ * then disagrees with what is on screen).
+ *
+ * `AIH_WINDOWS_SHELL` overrides: "bash" | "powershell" | an absolute path.
+ */
+export type Win32Shell =
+  | { kind: "bash"; path: string }
+  | { kind: "powershell"; path: string };
+
+/** Known Git-for-Windows install locations (checked in order). */
+function gitBashCandidates(): string[] {
+  const pf = process.env["ProgramFiles"] ?? "C:\\Program Files";
+  const lf = process.env["LOCALAPPDATA"] ?? join(process.env.USERPROFILE ?? "C:", "AppData", "Local");
+  return [
+    join(pf, "Git", "bin", "bash.exe"),
+    join(pf, "Git", "usr", "bin", "bash.exe"),
+    join(lf, "Programs", "Git", "bin", "bash.exe"),
+  ];
+}
+
+/** Pure candidate picker (unit-testable): prefer Git Bash, never WSL bash. */
+export function pickWin32Shell(
+  pathBash: string | undefined,
+  pathPowershell: string | undefined,
+): Win32Shell | undefined {
+  // WSL's bash (System32) runs in a different filesystem context — cwd and
+  // POSIX paths would silently point elsewhere; only real Git Bash counts.
+  if (pathBash && /git/i.test(pathBash) && /bash\.exe$/i.test(pathBash)) {
+    return { kind: "bash", path: pathBash };
+  }
+  if (pathPowershell && /powershell(\.exe)?$/i.test(pathPowershell)) {
+    return { kind: "powershell", path: pathPowershell };
+  }
+  return undefined;
+}
+
+let win32ShellCache: Win32Shell | undefined;
+
+/** Resolve the shell to run commands with on win32 (cached). */
+export function resolveWin32Shell(): Win32Shell | undefined {
+  if (process.platform !== "win32") return undefined;
+  if (win32ShellCache) return win32ShellCache;
+  const override = process.env.AIH_WINDOWS_SHELL;
+  if (override) {
+    if (/^powershell$/i.test(override)) win32ShellCache = { kind: "powershell", path: "powershell.exe" };
+    else win32ShellCache = { kind: "bash", path: override };
+    return win32ShellCache;
+  }
+  let pathBash: string | undefined;
+  try {
+    const where = spawnSync("where.exe", ["bash"], { encoding: "utf8", timeout: 3000 });
+    pathBash = where.status === 0 ? where.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) : undefined;
+  } catch {
+    /* where.exe missing — fall through to known locations */
+  }
+  let pathPowershell: string | undefined;
+  try {
+    const where = spawnSync("where.exe", ["powershell"], { encoding: "utf8", timeout: 3000 });
+    pathPowershell = where.status === 0 ? where.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) : undefined;
+  } catch {
+    /* fall through */
+  }
+  win32ShellCache =
+    pickWin32Shell(pathBash, pathPowershell) ??
+    gitBashCandidates().filter(existsSync).map((path) => ({ kind: "bash" as const, path }))[0] ??
+    { kind: "powershell", path: "powershell.exe" };
+  return win32ShellCache;
+}
 
 export interface SandboxRunOptions {
   command: string;
@@ -101,7 +176,21 @@ function spawnCapture(
 /** Default backend: run the command directly in the workspace. */
 export const localBackend: SandboxBackend = {
   name: "local",
-  run: (opts) => spawnCapture("/bin/sh", ["-c", opts.command], opts),
+  run: (opts) => {
+    if (process.platform === "win32") {
+      const shell = resolveWin32Shell();
+      if (shell?.kind === "bash") {
+        return spawnCapture(shell.path, ["-c", opts.command], opts);
+      }
+      // PowerShell fallback: force UTF-8 output (zh-CN systems default to the
+      // GBK code page — child output garbles and breaks TUI width math) and
+      // silence the progress bar.
+      const preamble =
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; ";
+      return spawnCapture("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", preamble + opts.command], opts);
+    }
+    return spawnCapture("/bin/sh", ["-c", opts.command], opts);
+  },
 };
 
 /**

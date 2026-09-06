@@ -604,7 +604,14 @@ constructor(opts: TuiOptions) {
     // ?1049 alt screen, ?1000 mouse, ?1006 SGR mouse, ?2004 bracketed paste —
     // pastes arrive wrapped in ESC[200~…ESC[201~ so their newlines are never
     // mistaken for Enter presses.
-    process.stdout.write(`${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`);
+    // Legacy Windows console (no WT_SESSION → not Windows Terminal): mouse
+    // tracking and bracketed paste are unreliable there (conhost predates
+    // both; unknown CSIs either no-op or leak into the buffer), so skip them
+    // and keep only the alt-screen toggle, which conhost understands. Windows
+    // Terminal / VS Code get the full set.
+    const legacyWin = process.platform === "win32" && !process.env.WT_SESSION && !process.env.TERM_PROGRAM;
+    const modes = legacyWin ? `${CSI}?1049h` : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
+    process.stdout.write(modes);
     this.#timer = setInterval(this.#tick, 120);
     this.#paint();
   }
@@ -1118,6 +1125,13 @@ constructor(opts: TuiOptions) {
       this.#dark = 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5;
       data = data.slice(m[0].length);
     }
+    // Windows consoles (conhost, and some emulators) report Backspace as BS
+    // (\x08) instead of DEL (\x7f). Normalize ONCE here so every input path —
+    // composer, question, confirm, overlay filter, paste — treats \x08 as
+    // backspace (readline tradition also conflates Ctrl+H this way). Doing it
+    // in #feed rather than at each `case "\x7f"` keeps the key grammar in one
+    // place. (opencode tracks the same Windows quirk in its win32 TUI shims.)
+    data = data.replace(/\x08/g, "\x7f");
     for (const ch of data) this.#char(ch);
   }
 

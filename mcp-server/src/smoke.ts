@@ -92,6 +92,16 @@ async function main(): Promise<void> {
     "app_describe self-describes permissions",
   );
 
+  // batch form — one call adds several todos (a re-planning model used to
+  // issue one call per todo: 76 add_todo calls in a single 1.5-hour session).
+  const batch = await callTool(6, "add_todo", { items: ["batch-a", "batch-b", "batch-c"] });
+  assert(
+    JSON.stringify(batch).includes("batch-a") && JSON.stringify(batch).includes("batch-c"),
+    "add_todo batch form adds all items in one call",
+  );
+  const ctxBatch = await callTool(7, "app_context", { query: "stats" });
+  assert(ctxBatch?.total === 4, "batch items counted alongside the single add");
+
   child.kill();
   console.log("\nAIH mcp-server smoke test passed.");
 

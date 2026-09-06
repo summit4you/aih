@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { platform } from "node:os";
 import { randomUUID } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import type { ToolRegistry } from "@aih/core";
@@ -6,7 +7,7 @@ import { lineDiff } from "./diff.js";
 import { publishFile } from "./atomic.js";
 import { buildChildEnv } from "./env-policy.js";
 import { formatAfterWrite } from "./formatter.js";
-import { resolveSandboxBackend } from "./sandbox.js";
+import { resolveSandboxBackend, resolveWin32Shell } from "./sandbox.js";
 import { scanCommand, formatScanSummary } from "./shell-scan.js";
 import { generateShellDescription } from "./shell-prompt.js";
 import { CodeIntelPool, flattenDocumentSymbols, navtoLocate, navtreeToSymbols, pathToUri, uriToPath, openDocument } from "./codeintel.js";
@@ -18,6 +19,13 @@ const CMD_TIMEOUT_MAX_MS = 600_000;
 
 /** Detect the user's shell (for tool-description adaptation). */
 function detectShellName(): string {
+  if (platform() === "win32") {
+    // The resolved backend shell (Git Bash → POSIX notes, PowerShell → PS
+    // notes) matters more than the login shell that spawns the CLI.
+    const shell = resolveWin32Shell();
+    if (shell?.kind === "bash") return "bash (Git Bash)";
+    return "powershell";
+  }
   const s = process.env.SHELL ?? "";
   if (/powershell|pwsh/i.test(s)) return "powershell";
   if (/zsh/i.test(s)) return "zsh";
