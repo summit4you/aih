@@ -178,6 +178,14 @@ export class LspClient {
     // Keep the server out of the parent's ref-count: when the CLI exits the
     // pipes close and the server sees EOF and terminates on its own.
     child.unref();
+    // unref() alone is NOT enough: the stdio streams (socket/Pipe handles)
+    // carry their own ref-count and keep the event loop alive after main()
+    // finishes. Unref every stream too — a language server must never hold
+    // the agent's process open (the smoke suite hung 5+ minutes on exactly
+    // this: three PipeWraps from a live tsserver left running).
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      (stream as { unref?: () => void })?.unref?.();
+    }
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       for (const msg of this.#parser.push(chunk)) this.#onMessage(msg);
@@ -491,6 +499,11 @@ export function createTsServerClient(root: string): TsServerClient {
     // Same lifecycle rule as LspClient: never keep the agent alive for a
     // language server.
     c.unref();
+    // Unref the stdio streams too — see LspClient.#doStart for the full
+    // rationale (stream-level ref-counts outlive child.unref()).
+    for (const stream of [c.stdin, c.stdout, c.stderr]) {
+      (stream as { unref?: () => void })?.unref?.();
+    }
     c.stdout.setEncoding("utf8");
     c.stdout.on("data", (chunk: string) => {
       buf += chunk;

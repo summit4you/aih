@@ -573,6 +573,20 @@ export function registerGeneralTools(
         const existing = existsSync(path) ? readFileSync(path, "utf8") : `${header}\n`;
         writeFileSync(path, `${existing.replace(/\s+$/, "")}\n\n- ${stamp} — ${text}\n`);
       }
+      // CC-R#7 — over-budget memory is an EXPLICIT warning, never a silent
+      // truncation: the per-turn injection caps at AIH_MEMORY_BUDGET (default
+      // 4000 chars); once the file outgrows it the OLDEST entries silently
+      // stop reaching future sessions. Tell the writer now so it can tidy
+      // (/tidy) or consolidate instead of wondering later why a fact vanished.
+      const budget = Number(process.env.AIH_MEMORY_BUDGET ?? "") || 4000;
+      const written = existsSync(path) ? readFileSync(path, "utf8") : "";
+      if (written.length > budget) {
+        const note =
+          `warning: memory file is now ${written.length} chars, over the ${budget}-char injection budget — ` +
+          `the oldest entries will NOT reach future sessions (per-turn injection truncates at budget). ` +
+          `Consider /tidy to dedupe, or consolidate with remember action=set.`;
+        return { path, action, scope, warning: note, sizeChars: written.length, budgetChars: budget };
+      }
       return { path, action, scope };
     },
   });

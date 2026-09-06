@@ -212,7 +212,14 @@ export async function createFakeLLMServer(
         },
         close() {
           return new Promise<void>((res, rej) => {
-            server.close((err) => (err ? rej(err) : res()));
+            server.close((err) => {
+              // Node ≥18.2: undici's fetch (used by OpenAICompatibleLLM and the
+              // smoke tests) keeps keep-alive sockets open indefinitely; without
+              // this the server ref-count never drops to zero and the smoke
+              // process hangs after printing its final "passed" line.
+              server.closeAllConnections();
+              err ? rej(err) : res();
+            });
           });
         },
       });

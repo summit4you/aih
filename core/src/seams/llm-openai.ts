@@ -150,6 +150,8 @@ import {
   QuotaError,
   ReasoningRunawayError,
   StallError,
+  isNetworkErrorFinish,
+  NetworkFinishError,
 } from "./llm-sse.js";
 
 // CC#49 — stream-stall guards. Headers received but no data frame within
@@ -367,8 +369,7 @@ export class OpenAICompatibleLLM implements LLMAdapter {
             stalled = true;
             stallMs = ms;
             reader.cancel().catch(() => {});
-          };
-          const firstTimer = armStallTimer(FIRST_TOKEN_TIMEOUT_MS(), () => fire(FIRST_TOKEN_TIMEOUT_MS()));
+          };          const firstTimer = armStallTimer(FIRST_TOKEN_TIMEOUT_MS(), () => fire(FIRST_TOKEN_TIMEOUT_MS()));
           let stallTimer = armStallTimer(0, () => {});
           const activity = () => {
             // First activity disarms the first-token guard; every activity
@@ -400,6 +401,13 @@ export class OpenAICompatibleLLM implements LLMAdapter {
           if (stalled) {
             throw new StallError(accOut.text, stallMs);
           }
+          // OC-R#1 — a stream that ends with finish_reason network_error (HTTP
+          // 200) is a connection cut masquerading as a normal end. Same family
+          // as a stall: with partial text throw immediately so the AgentLoop
+          // resumes honestly; without text fold into the retry budget below.
+          if (isNetworkErrorFinish(accOut.finishReason)) {
+            throw new NetworkFinishError(accOut.text, accOut.finishReason ?? "network_error");
+          }
           this.#notifySuccess();
           return {
             text: accOut.text,
@@ -421,6 +429,16 @@ export class OpenAICompatibleLLM implements LLMAdapter {
         // caller (AgentLoop) resumes from the partial text. With NO content,
         // fold into the normal retry budget like any transient failure.
         if (err instanceof StallError) {
+          if (err.partialText.trim() !== "") throw err;
+          if (attempt < maxAttempts - 1) {
+            lastError = err;
+            continue;
+          }
+        } else if (err instanceof NetworkFinishError) {
+          // OC-R#1 — the stream ended cleanly (HTTP 200) but declared a
+          // network error. With partial text, propagate so the AgentLoop
+          // resumes honestly (the partial is preserved in the transcript);
+          // without text it is a blind retry — fold into the budget.
           if (err.partialText.trim() !== "") throw err;
           if (attempt < maxAttempts - 1) {
             lastError = err;

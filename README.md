@@ -427,6 +427,21 @@ aih quality [--mock] [--json]   # 跑 evals/quality.tasks.json + 对基线做回
 - 无价目表匹配时成本显示 `—` 并提示配置 `prices`；mock 模式无 usage 数据，成本/TPS 不显示
 - 冒烟测试覆盖：价格解析（精确/子串/大小写/用户覆盖/未命中）、成本计算、TPS 边界、格式化
 
+### 前缀稳定性（prompt-cache prefix stability，CC-R#3）
+
+provider 的 prompt cache 按请求的**精确字节前缀**（系统提示 + 工具定义 + 消息前缀）命中；
+任何字节变化都会让整段缓存失效并按全价重读。AIH 的三层防护：
+
+- **纪律进系统提示**：`PREFIX_STABILITY_RULES`（稳定内容进前缀且跨轮不变、易变内容走
+  消息、避免触发工具集/系统提示变更）随 guard 段注入；
+- **工具集指纹**：`toolsetFingerprint()`（SHA-256、对象键序归一、列表序敏感）；chat
+  TUI registry 重建（plan↔build 切换是最常见破坏源）时比对，变化→系统行一次性警告
+  （"provider prompt cache will miss on the next request"）+ 记录破坏点；
+- **/usage 归因**：`cachePrefixMissAttribution()` 把「上报了缓存但大半 uncached 的轮次」
+  归因——首个上报轮 = 冷启不归因；空闲 > TTL 的 miss 已由 TTL 浪费归因（不重复计）；
+  其余 miss 按前缀破坏列出（含破坏时间与说明），末行附 byte-stable 提示。
+  归因是可观测事实启发式（provider 只报 cached_tokens），不冒充账本。
+
 ### 记分卡（harness scorecard，PE#3）
 
 「不要数 token，要数**无需人工干预且产出可接受证据的完成任务数**」（Production Agent

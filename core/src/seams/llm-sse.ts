@@ -146,6 +146,43 @@ export class StallError extends Error {
   }
 }
 
+// ── OC-R#1 — in-stream network_error finish_reason (HTTP 200) ──────────
+//
+// Some gateways cut the upstream connection but still return HTTP 200 and
+// end the stream with `finish_reason: "network_error"` (opencode v1.18.20:
+// "retry responses ending in finish_reason network_error / network-error").
+// Without a check, the cut is silently treated as a NORMAL end: whatever
+// partial text survived is presented as a complete answer. This classifier
+// treats the finish_reason as a transient connection failure — same family
+// as a stall — so the adapter folds it into its retry budget and, when
+// partial content already streamed, the AgentLoop resumes honestly (the
+// partial text is kept in the transcript, never presented as complete).
+
+const NETWORK_FINISH_RE = /^network[-_ ]?error$/i;
+
+/** True when a finish_reason value marks a network-level cut, not a normal end. */
+export function isNetworkErrorFinish(
+  finishReason: string | undefined | null,
+): boolean {
+  return typeof finishReason === "string" && NETWORK_FINISH_RE.test(finishReason);
+}
+
+/**
+ * OC-R#1 — the stream ENDED (HTTP 200) but with a network-error finish_reason:
+ * the response is partial by definition. Carries the partial text so the
+ * caller can either resume honestly (AgentLoop, same path as StallError) or
+ * fold the empty-partial case into the adapter retry budget.
+ */
+export class NetworkFinishError extends Error {
+  /** Text received before the network cut (may be empty). */
+  partialText: string;
+  constructor(partialText: string, finishReason: string) {
+    super(`stream ended with finish_reason "${finishReason}" (network error)`);
+    this.name = "NetworkFinishError";
+    this.partialText = partialText;
+  }
+}
+
 // ── Core parser ────────────────────────────────────────────────────────
 
 function parseArguments(raw: string): unknown {

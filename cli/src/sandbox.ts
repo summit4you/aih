@@ -18,7 +18,7 @@
  * run_cmd has always returned).
  */
 import { spawn } from "node:child_process";
-import { openSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -73,6 +73,15 @@ function spawnCapture(
       finish(c ?? 1);
     });
     function finish(code: number) {
+      // Close the capture fd BEFORE reading/unlinking: run_cmd opens one log
+      // fd per call, and a long unattended turn issues hundreds of them —
+      // leaked fds accumulate toward the process limit and eventually EMFILE
+      // (129 stale handles were found open on one 1.5-hour session).
+      try {
+        closeSync(fd);
+      } catch {
+        /* already closed */
+      }
       let output = "";
       try {
         output = readFileSync(logPath, "utf8");

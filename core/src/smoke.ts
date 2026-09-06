@@ -26,8 +26,10 @@ import {
   isQuotaExhaustion,
   isTerminalQuota,
   isUnrecoverableTurnError,
+  isNetworkErrorFinish,
   QuotaError,
   StallError,
+  NetworkFinishError,
   ReasoningRunawayError,
   isReasoningRunaway,
   capTurnToolBudget,
@@ -825,6 +827,95 @@ assert(streamTurn.steps === 1, "streamed turn completes normally");
 }
 
 {
+  // OC-R#1 — a stream that ENDS with finish_reason network_error (HTTP 200) is
+  // a connection cut masquerading as a normal end. It must never be presented
+  // as a complete answer: adapter folds empty-partial into the retry budget,
+  // propagates partial text for honest resume, and normal finish_reasons pass.
+  assert(isNetworkErrorFinish("network_error"), "OC-R#1 network_error finish classified");
+  assert(isNetworkErrorFinish("network-error"), "OC-R#1 network-error finish classified");
+  assert(isNetworkErrorFinish("Network Error"), "OC-R#1 variant spelling classified");
+  assert(!isNetworkErrorFinish("stop"), "OC-R#1 normal finish not classified");
+  assert(!isNetworkErrorFinish("length"), "OC-R#1 length finish not classified");
+  assert(!isNetworkErrorFinish(undefined), "OC-R#1 missing finish not classified");
+
+  // 1) partial text + network finish → NetworkFinishError propagates
+  //    immediately (no blind retry — the partial goes to honest resume).
+  let netPartialCalls = 0;
+  const netPartialLlm = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 2, // budget that would normally survive — must NOT be used
+    fetchImpl: (async () => {
+      netPartialCalls += 1;
+      return sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: "Hel" } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "network_error" }] }),
+      ]);
+    }) as typeof fetch,
+  });
+  const netPartialErr = (await netPartialLlm
+    .complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      onDelta: () => {},
+    })
+    .catch((e: unknown) => e)) as NetworkFinishError;
+  assert(
+    netPartialErr instanceof NetworkFinishError,
+    "partial-text network finish throws NetworkFinishError",
+  );
+  assert(netPartialErr.partialText === "Hel", "NetworkFinishError carries the partial text");
+  assert(netPartialCalls === 1, "partial-text network finish is NOT retried (honest resume)");
+
+  // 2) no text + network finish → folded into the retry budget.
+  let netEmptyCalls = 0;
+  const netEmptyLlm = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 1,
+    fetchImpl: (async () => {
+      netEmptyCalls += 1;
+      return sseResponse([
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "network_error" }] }),
+      ]);
+    }) as typeof fetch,
+  });
+  const netEmptyErr = (await netEmptyLlm
+    .complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      onDelta: () => {},
+    })
+    .catch((e: unknown) => e)) as NetworkFinishError;
+  assert(
+    netEmptyErr instanceof NetworkFinishError,
+    "empty-partial network finish throws NetworkFinishError",
+  );
+  assert(netEmptyCalls === 2, "empty-partial network finish consumes the retry budget (2 attempts)");
+
+  // 3) a NORMAL finish_reason still returns a complete response.
+  const okLlm = new OpenAICompatibleLLM({
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "k",
+    model: "m",
+    fetchImpl: (async () =>
+      sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: "done" } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }),
+      ])) as typeof fetch,
+  });
+  const okRes = await okLlm.complete({
+    messages: [{ role: "user", content: "hi" }],
+    tools: [],
+    onDelta: () => {},
+  });
+  assert(okRes.text === "done", "OC-R#1 normal finish returns complete response");
+  console.log("ok: OC-R#1 network_error finish_reason classification");
+}
+
+{
   // FA#3 — reasoning-runaway watchdog.
   // 1) pure decision (isReasoningRunaway): reasoning-only past the char cap →
   //    runaway; with text or a tool call → healthy; under budget → not runaway.
@@ -1270,6 +1361,44 @@ assert(
     "rolling summary instructions forbid keeping finished work in Objective",
   );
   console.log("ok: rolling compaction warns against re-doing finished work after compaction");
+}
+
+// Summary truncation retry — if the summary LLM output is cut off by the
+// token cap (finishReason=length), the TAIL sections (Next Move, Relevant
+// Files) are silently lost and the next turn starts half-blind. The loop
+// must retry with a doubled maxTokens instead of storing the truncated text.
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const tLog = new SessionLog();
+  const tGate = new PolicyGate([{ match: (r) => r.tool === "echo", action: "allow" }]);
+  const tTools = new ToolRegistry(tGate);
+  tTools.register(echo);
+  const tReq: Array<{ messages: ChatMessage[]; maxTokens?: number }> = [];
+  // Call #1 (summary): truncated at 4096. Call #2 (summary retry): complete.
+  // Call #3 (turn response after compaction): end_turn.
+  const tScripted = new MockLLM([
+    { text: "## Objective\n- cut off" , stopReason: "end_turn", finishReason: "length" },
+    { text: "## Objective\n- full\n\n## Next Move\n1. done" , stopReason: "end_turn" },
+    { text: "final", stopReason: "end_turn" },
+  ]);
+  const tLoop = new Loop({
+    llm: { complete: (req) => { tReq.push({ messages: req.messages, maxTokens: req.maxTokens }); return tScripted.complete(req); } },
+    tools: tTools,
+    log: tLog,
+    systemPrompt: "sys",
+    contextWindow: 5000,
+    compactAt: 0.8,
+  });
+  tLog.append({ type: "user/message", turnId: "s1", text: `bulk: ${"q".repeat(400)}` });
+  tLog.append({ type: "assistant/message", turnId: "s1", text: `answer: ${"r".repeat(400)}`, toolCalls: [] });
+  const tRes = await tLoop.compactNow();
+  assert(tRes.applied, "summary-retry: compaction applies");
+  const summary = tLog.all().filter((e) => e.type === "compaction").map((e) => (e as { summary: string }).summary).join("\n");
+  assert(summary.includes("full") && summary.includes("Next Move"), "summary-retry: stored summary is the COMPLETE retry, not the truncated first call");
+  const summaryCalls = tReq.slice(0, 2);
+  assert(summaryCalls[0].maxTokens === 4096, "summary-retry: first attempt uses the base cap (4096)");
+  assert(summaryCalls[1].maxTokens === 8192, "summary-retry: retry doubles the cap (8192)");
+  console.log("ok: summary retry on finishReason=length stores the complete summary");
 }
 
 // compactContext — an authoritative state snapshot (e.g. todo list) must be

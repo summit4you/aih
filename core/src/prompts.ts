@@ -119,6 +119,21 @@ A single tool result is capped (≈8KB); a whole turn's tool output is capped (�
 - If you have already gathered enough to answer, stop issuing tools and deliver your result.`;
 
 /**
+ * CC-R#3 — prompt-cache prefix stability discipline. The provider caches the
+ * exact byte prefix of each request (system prompt + tool definitions +
+ * messages so far); any byte change in that prefix re-reads every cached
+ * token at full price. The harness keeps ITS side stable; the model must not
+ * be the source of avoidable prefix churn either (no mid-session announcements
+ * that belong in the prefix, no re-stating static context per turn).
+ */
+export const PREFIX_STABILITY_RULES = `# Prompt-cache prefix stability
+The provider's prompt cache is keyed on the exact byte prefix of the request. Repeated content is cheap only while the prefix stays byte-identical:
+- Put STABLE content (facts, conventions, long references) early; keep it unchanged across turns — never restate or rephrase it.
+- Put VOLATILE content (per-turn findings, questions, working notes) in your messages, not in a place that rewrites earlier text.
+- Do not repeat previous answers verbatim; reference them ("as shown above").
+- A tool set or system-prompt change mid-session invalidates the cache for the WHOLE conversation — expect the next request to cost a full re-read; don't trigger avoidable changes.`;
+
+/**
  * COMPACTION_STATE_GUARD — injected alongside every compaction summary to
  * prevent the agent from re-doing work it already completed BEFORE the
  * context was folded. Observed failure (same turn, two implementations of

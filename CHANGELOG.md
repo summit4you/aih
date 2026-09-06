@@ -8,6 +8,30 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **OC-R#1 — 流内 `finish_reason: network_error` 重试**（opencode v1.18.20 parity）：
+  HTTP 200 但流尾以 `network_error` 结束的连接掐断不再被当成正常结束——partial 文本
+  立即上抛走 AgentLoop 诚实续跑（partial 落 transcript + 有界续跑提示），空文本折入
+  既有重试预算。`isNetworkErrorFinish()` + `NetworkFinishError`（`core/src/seams/llm-sse.ts`），
+  与 CC#49 stall 同族不同源，共用 MAX_STALL_RESUMES。
+- **CC-R#3 — prompt-cache 前缀稳定性**：① 系统提示新增前缀稳定性纪律段
+  （稳定内容进前缀、易变内容走消息）；② `toolsetFingerprint()` 工具集字节级指纹，
+  chat TUI registry 重建（plan↔build、extension 注册）时比对，变化→系统行警告 +
+  记录破坏点；③ `/usage` 新增 prefix stability 归因（冷启不归因、空闲 TTL 由
+  cacheTtlWaste 归因不重复计、其余 miss 按前缀破坏列出）。
+- **CC-R#7 — remember 超预算显式警告**：memory.md 写入后超过 `AIH_MEMORY_BUDGET`
+  时结果携带显式 `warning`（最旧条目将不再注入 + 建议 /tidy），不再静默截断。
+- **OCL-R#1 — upstream-review 技能 hard gate**：上游机制断言必须本机源码实读 +
+  强制 `file:line` 引用；CHANGELOG/PR 文本/子代理报告/memory/旧 review 均不算证据；
+  失据降级为「未验证」。
+
+### Fixed
+- **冒烟挂起根因修复（AC#2 副作用）**：live tsserver 子进程 spawn 后从不关闭，三条
+  stdio Pipe handle 把事件循环钉死——`cli/dist/smoke.js` 跑完所有断言后悬挂 5+ 分钟。
+  修复：① `codeintel.ts` LspClient/TsServerClient spawn 时对 stdio 三流逐一 `unref()`
+  （此前仅 child.unref()，流级 ref-count 仍持有）；② AC#2 live 块结束显式
+  `pool.close()`。cli smoke 从挂起 5+ 分钟 → 83s 正常退出（1591 ok / 0 FAIL）。
+
 ## [0.6.0] - 2026-09-05
 
 ### Added

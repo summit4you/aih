@@ -1,5 +1,5 @@
 import type { LLMAdapter } from "./seams/llm.js";
-import { CONTEXT_LENGTH_RE, QuotaError, StallError } from "./seams/llm-sse.js";
+import { CONTEXT_LENGTH_RE, NetworkFinishError, QuotaError, StallError } from "./seams/llm-sse.js";
 import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT, TRUNCATED_RETRY_PROMPT } from "./prompts.js";
 import type { LoopObserver } from "./observers.js";
 import { LoopAbort, notifyObservers } from "./observers.js";
@@ -611,7 +611,13 @@ export class AgentLoop {
         // bounded continuation message asks the model to finish the thought.
         // (Stream-level retries without content are handled inside the LLM
         // adapter; reaching here means content existed or retries ran out.)
-        if (err instanceof StallError && stallResumes < MAX_STALL_RESUMES) {
+        // OC-R#1 — finish_reason "network_error" (HTTP 200) lands on the SAME
+        // honest-resume path: the response was a connection cut, the partial
+        // text must never be presented as a complete answer.
+        if (
+          (err instanceof StallError || err instanceof NetworkFinishError) &&
+          stallResumes < MAX_STALL_RESUMES
+        ) {
           stallResumes += 1;
           const partial = err.partialText.trim();
           if (partial) {
@@ -1330,7 +1336,7 @@ export class AgentLoop {
 
   // Summarize the head. Single call when it fits the top budget; otherwise
   // chunk the head, summarize each piece, and merge (map-reduce fallback).
-  async #summarizeHead(
+  #summarizeHead(
     head: ChatMessage[],
     previousSummary: string | undefined,
     instructions: string | undefined,
@@ -1339,42 +1345,55 @@ export class AgentLoop {
     const headText = this.#serializeMessages(head);
     const fullPrompt = this.#buildSummaryPrompt(headText, previousSummary, instructions);
     if (this.#estimateTokens([{ role: "user", content: fullPrompt }]) <= budget) {
+      return this.#completeSummary([{ role: "user", content: fullPrompt }]);
+    }
+    return (async () => {
+      const chunks = this.#chunkMessages(head, budget);
+      const partials: string[] = [];
+      let usage: TokenUsage | undefined;
+      for (let i = 0; i < chunks.length; i += 1) {
+        const first = i === 0;
+        const prompt = this.#buildSummaryPrompt(
+          this.#serializeMessages(chunks[i]),
+          first ? previousSummary : undefined,
+          first ? instructions : undefined,
+        );
+        const response = await this.#completeSummary([{ role: "user", content: prompt }]);
+        if (response.text.trim()) partials.push(response.text.trim());
+        usage = addUsage(usage, response.usage);
+      }
+      if (partials.length === 0) return { text: "", usage };
+      if (partials.length === 1) return { text: partials[0], usage };
+      const merged = await this.#completeSummary([
+        { role: "user", content: this.#mergePrompt(partials, previousSummary) },
+      ]);
+      return { text: merged.text, usage: addUsage(usage, merged.usage) };
+    })();
+  }
+
+  /**
+   * Summary completion with a bounded retry when the output is cut off by the
+   * token cap: a truncated summary silently loses its TAIL sections (Next
+   * Move, Relevant Files) — exactly the parts the next turn needs — and
+   * nothing else checks `finishReason` on this path. Each retry doubles the
+   * cap (SUMMARY_OUTPUT_TOKENS → 2× → 4×), so one round-trip fixes a slightly
+   * over-budget summary and a pathological session still terminates.
+   */
+  async #completeSummary(messages: ChatMessage[]): Promise<{ text: string; usage?: TokenUsage }> {
+    let maxTokens = SUMMARY_OUTPUT_TOKENS;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       const response = await this.#llm.complete({
-        messages: [{ role: "user", content: fullPrompt }],
+        messages,
         tools: [],
-        maxTokens: SUMMARY_OUTPUT_TOKENS,
+        maxTokens,
         ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
       });
-      return { text: response.text, usage: response.usage };
+      if (response.finishReason !== "length" || attempt === 2) {
+        return { text: response.text, usage: response.usage };
+      }
+      maxTokens *= 2;
     }
-    const chunks = this.#chunkMessages(head, budget);
-    const partials: string[] = [];
-    let usage: TokenUsage | undefined;
-    for (let i = 0; i < chunks.length; i += 1) {
-      const first = i === 0;
-      const prompt = this.#buildSummaryPrompt(
-        this.#serializeMessages(chunks[i]),
-        first ? previousSummary : undefined,
-        first ? instructions : undefined,
-      );
-      const response = await this.#llm.complete({
-        messages: [{ role: "user", content: prompt }],
-        tools: [],
-        maxTokens: SUMMARY_OUTPUT_TOKENS,
-        ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
-      });
-      if (response.text.trim()) partials.push(response.text.trim());
-      usage = addUsage(usage, response.usage);
-    }
-    if (partials.length === 0) return { text: "", usage };
-    if (partials.length === 1) return { text: partials[0], usage };
-    const merged = await this.#llm.complete({
-      messages: [{ role: "user", content: this.#mergePrompt(partials, previousSummary) }],
-      tools: [],
-      maxTokens: SUMMARY_OUTPUT_TOKENS,
-      ...(this.#summarySid ? { sessionId: this.#summarySid } : {}),
-    });
-    return { text: merged.text, usage: addUsage(usage, merged.usage) };
+    /* unreachable */ return { text: "" };
   }
 
   #compactOrSkip(

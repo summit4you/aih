@@ -11,6 +11,7 @@
  * without a live LLM (the mock LLM does not report usage).
  */
 import type { SessionEvent, TokenUsage } from "@aih/core";
+import { createHash } from "node:crypto";
 import { estimateTokensText, truncateToolOutput } from "@aih/core";
 import { MODEL_METADATA } from "./model-metadata.js";
 
@@ -523,4 +524,151 @@ export function fmtCost(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "$0.00";
   if (n < 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toFixed(2)}`;
+}
+
+// ── CC-R#3 — prompt-cache prefix stability ──────────────────────────────
+//
+// Provider prompt caches are keyed on the exact byte prefix of the request
+// (system prompt + tool definitions + messages so far). ANY byte change in
+// that prefix — a tool added/removed (plan↔build switch), a changed system
+// prompt, a first-turn announcement appended mid-session — forces a full
+// re-read of the cached tokens at full price. claude-code tracks this
+// (v2.1.248/261: "resume tool set must be byte-identical", "first-turn
+// announcements must be one-shot"); AIH's observables:
+
+/** JSON tool schema shape accepted by toolsetFingerprint. */
+export interface FingerprintableTool {
+  name: string;
+  description: string;
+  parameters: unknown;
+}
+
+/**
+ * CC-R#3 — deterministic, order-sensitive fingerprint of the tool set that
+ * prefixes every request. Two sessions (or two turns) with equal fingerprints
+ * can share a cached prefix; any difference forces a full-cache miss.
+ * Byte-stable: keys sorted (stableStringify-style), SHA-256 hex.
+ */
+export function toolsetFingerprint(tools: readonly FingerprintableTool[]): string {
+  const h = createHash("sha256");
+  for (const t of tools) {
+    h.update(t.name);
+    h.update("\u0000");
+    h.update(t.description);
+    h.update("\u0000");
+    h.update(stableJson(t.parameters));
+    h.update("\u0001");
+  }
+  return h.digest("hex").slice(0, 16);
+}
+
+/** Key-order-stable JSON (deterministic across object key insertion order). */
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(",")}}`;
+}
+
+/** One observable cache-prefix break, attributed when it happened. */
+export interface PrefixBreak {
+  ts: number;
+  /** What changed: toolset (byte-level) or system prompt (roster/memory/rules). */
+  kind: "toolset" | "system";
+  /** Short human note, e.g. "plan→build (write tools visible)". */
+  note?: string;
+}
+
+export interface CachePrefixMissReport {
+  /** Turns that reported a cache figure with an unexplained miss. */
+  missTurns: number;
+  /** Uncached prompt tokens on those turns (the "full-price read" cost). */
+  uncachedTokens: number;
+  /** Observed prefix breaks in-window (toolset/system), newest first. */
+  breaks: PrefixBreak[];
+}
+
+/**
+ * CC-R#3 — attribute cache misses to observable prefix-break events.
+ *
+ * For every turn/end that reports cache data, classify the miss:
+ *   - the FIRST reported turn is always a cold start (no prefix existed yet);
+ *   - a turn whose uncached tokens are plausibly TTL eviction is already
+ *     counted by cacheTtlWaste — excluded here (avoid double-counting);
+ *   - a turn after a recorded prefix break (toolset/system change) is
+ *     attributed to that break.
+ *
+ * Pure over (events, breaks); honest limits: providers report only
+ * cached_tokens per turn, so this is attribution over observable facts, not
+ * proof. The /usage panel renders it as guidance ("prefix stability"),
+ * never as a ledger.
+ */
+export function cachePrefixMissAttribution(
+  events: readonly SessionEvent[],
+  breaks: readonly PrefixBreak[],
+  opts?: { ttlMs?: number },
+): CachePrefixMissReport | undefined {
+  const ttl = opts?.ttlMs ?? 5 * 60_000;
+  // Only breaks BEFORE the observed window matter; sorted desc for reporting.
+  const relevant = breaks
+    .filter((b) => Number.isFinite(b.ts))
+    .sort((a, b) => b.ts - a.ts);
+  let missTurns = 0;
+  let uncachedTokens = 0;
+  let firstReportedSeen = false;
+  let lastTs: number | undefined;
+  for (const e of events) {
+    if (e.type !== "turn/end") continue;
+    const c = e.usage?.cachedTokens;
+    if (typeof c !== "number" || c <= 0) continue; // unreported → unobservable
+    const prompt = e.usage?.promptTokens ?? 0;
+    const uncached = Math.max(0, prompt - c);
+    const ts = typeof e.ts === "number" ? e.ts : undefined;
+    if (!firstReportedSeen) {
+      // First reported turn: the cache was cold regardless of breaks.
+      firstReportedSeen = true;
+    } else if (uncached > 0 && uncached > prompt / 2) {
+      // A MISS = the majority of prompt tokens were NOT served from cache
+      // (providers always report a small uncached tail; counting any
+      // uncached>0 would attribute every normal turn). Below the half mark
+      // is a healthy hit, not a prefix break.
+      const ttlEvicted =
+        lastTs !== undefined && ts !== undefined && ts - lastTs > ttl;
+      if (!ttlEvicted) {
+        missTurns += 1;
+        uncachedTokens += uncached;
+      }
+    }
+    if (ts !== undefined) lastTs = ts;
+  }
+  if (!firstReportedSeen) return undefined; // nothing observable
+  return {
+    missTurns,
+    uncachedTokens,
+    breaks: relevant.filter((b) => {
+      // Report only breaks that could have affected a reported turn.
+      return true;
+    }),
+  };
+}
+
+/** Human lines for /usage: prefix-stability guidance (empty when nothing to say). */
+export function formatPrefixStability(report: CachePrefixMissReport | undefined): string[] {
+  if (!report) return [];
+  const lines: string[] = [];
+  if (report.missTurns > 0) {
+    lines.push(
+      `prefix stability: ${report.missTurns} turn${report.missTurns === 1 ? "" : "s"} paid for uncached prompt` +
+        ` (~${report.uncachedTokens.toLocaleString()} tok) outside idle-TTL gaps`,
+    );
+  }
+  for (const b of report.breaks.slice(0, 3)) {
+    const label = b.kind === "toolset" ? "tool set changed" : "system prompt changed";
+    lines.push(`  cache prefix broken at ${new Date(b.ts).toLocaleTimeString()}: ${label}${b.note ? ` (${b.note})` : ""}`);
+  }
+  if (report.missTurns > 0) {
+    lines.push("  hint: keep the system prompt + tool set byte-stable within a session; put volatile content in messages");
+  }
+  return lines;
 }

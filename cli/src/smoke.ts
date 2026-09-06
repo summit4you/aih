@@ -240,6 +240,49 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     }
   }
 
+  // CC-R#3 — prompt-cache prefix stability: fingerprint determinism, miss
+  // attribution (cold start excluded / TTL excluded / break attributed), and
+  // the /usage rendering.
+  {
+    const { toolsetFingerprint, cachePrefixMissAttribution, formatPrefixStability } = await import("./cost.js");
+    const tA = [
+      { name: "read_file", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+      { name: "run_cmd", description: "run a command", parameters: { type: "object", properties: { command: { type: "string" } } } },
+    ];
+    const tB = [
+      { name: "run_cmd", description: "run a command", parameters: { command: { type: "string" }, type: "object" } },
+      { name: "read_file", description: "read a file", parameters: { required: ["path"], type: "object", properties: { path: { type: "string" } } } },
+    ];
+    const tChanged = [{ ...tA[0], description: "read a file (renamed)" }, tA[1]];
+    // Same tool set with different OBJECT key order AND different list order:
+    // list order is byte-visible on the wire (different prefix → different fp)
+    // but object key order is NOT byte-visible (JSON key order is normalized).
+    // The fingerprint normalizes key order so "same logical schema, different
+    // insertion order" does NOT look like a break.
+    assert(toolsetFingerprint(tA) !== toolsetFingerprint(tB), "toolsetFingerprint is order-sensitive for tool list order (byte-true)");
+    const tSameKeys = [{ name: "read_file", description: "read a file", parameters: { properties: { path: { type: "string" } }, required: ["path"], type: "object" } }, tA[1]];
+    assert(toolsetFingerprint(tA) === toolsetFingerprint(tSameKeys), "toolsetFingerprint normalizes object key order");
+    assert(toolsetFingerprint(tA) !== toolsetFingerprint(tChanged), "toolsetFingerprint changes when a tool byte changes");
+    const t0 = 2_000_000;
+    const evs = [
+      mkCached(0, t0, 10_000, 1_000), // first reported turn → cold start, never attributed
+      mkCached(1, t0 + 10_000, 10_000, 2_000), // miss within TTL after a toolset break → attributed
+      mkCached(2, t0 + 20_000, 10_000, 9_000), // hit → not attributed
+    ];
+    const rep = cachePrefixMissAttribution(evs, [{ ts: t0 + 5_000, kind: "toolset", note: "plan→build" }]);
+    assert(rep !== undefined && rep.missTurns === 1, `one non-cold non-TTL miss attributed (got ${rep?.missTurns})`);
+    assert(rep !== undefined && rep.uncachedTokens === 8_000, `attributed uncached tokens = 8000 (got ${rep?.uncachedTokens})`);
+    assert(rep !== undefined && rep.breaks.length === 1 && rep.breaks[0].note === "plan→build", "prefix break recorded with note");
+    const repNone = cachePrefixMissAttribution([mkCached(0, t0, 10_000, 9_000)], []);
+    assert(repNone !== undefined && repNone.missTurns === 0 && repNone.uncachedTokens === 0, "cold-start miss is not attributed to a break");
+    assert(cachePrefixMissAttribution([mk(0, 1, 10_000, 0)], []) === undefined, "no reported cache figures → undefined");
+    const linesRep = formatPrefixStability(rep);
+    assert(linesRep.some((l) => l.includes("prefix stability")), "formatPrefixStability names the stability line");
+    assert(linesRep.some((l) => l.includes("plan→build")), "formatPrefixStability renders the break note");
+    assert(linesRep.some((l) => l.includes("byte-stable")), "formatPrefixStability ends with the stability hint");
+    assert(formatPrefixStability(undefined).length === 0, "formatPrefixStability of undefined → no lines");
+  }
+
   // --- MEA: 独立判定层（写动作 Guardian + 完成 Auditor）----------------------
   {
     const mea = await import("./mea.js");
@@ -1919,6 +1962,31 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     readFileSync(`${workdir}/.aih/memory.md`, "utf8").includes("smoke memory entry"),
     "remember appends to .aih/memory.md",
   );
+  // CC-R#7 — over-budget write returns an explicit warning (never silent).
+  {
+    const tinyBudget = 200;
+    const prevBudget = process.env.AIH_MEMORY_BUDGET;
+    process.env.AIH_MEMORY_BUDGET = String(tinyBudget);
+    try {
+      const over = await call("remember", {
+        action: "append",
+        text: "x".repeat(tinyBudget + 300),
+      });
+      const warning = String((over as { warning?: string }).warning ?? "");
+      assert(warning.includes("over the 200-char injection budget"), "CC-R#7: over-budget remember carries an explicit warning");
+      assert(warning.includes("/tidy"), "CC-R#7: warning suggests /tidy consolidation");
+      assert(
+        (over as { sizeChars?: number }).sizeChars !== undefined &&
+          (over as { sizeChars?: number }).sizeChars! > tinyBudget,
+        "CC-R#7: sizeChars > budget",
+      );
+    } finally {
+      if (prevBudget === undefined) delete process.env.AIH_MEMORY_BUDGET;
+      else process.env.AIH_MEMORY_BUDGET = prevBudget;
+    }
+    const within = await call("remember", { action: "append", text: "small entry stays quiet" });
+    assert((within as { warning?: string }).warning === undefined, "CC-R#7: under-budget remember has no warning");
+  }
   // P0#2: user-level memory (cross-project) + injection budget.
   // AIH_HOME is redirected in-process so scope=user never touches real user data.
   const memHome = mkdtempSync("/tmp/aih-mem-");
@@ -3002,6 +3070,23 @@ await srv.connect(new StdioServerTransport());
   // local backend actually runs a command
   const lr = await localBackend.run({ command: "echo hello-sandbox", cwd: process.cwd(), env: { ...process.env } as NodeJS.ProcessEnv, timeoutMs: 10000 });
   assert(lr.code === 0 && lr.output.includes("hello-sandbox") && lr.timed_out === false, "local backend runs and captures output");
+  // fd-leak regression: spawnCapture opens a capture-log fd per run and must
+  // CLOSE it when the child exits. Previously each run_cmd leaked one (129
+  // stale handles were found open after a 1.5-hour unattended session — a
+  // long turn would eventually EMFILE). Count /proc/self/fd around a burst
+  // of runs; each leaked fd would show up as +1.
+  {
+    const fdCount = () => readdirSync("/proc/self/fd").length;
+    for (let i = 0; i < 3; i += 1) {
+      await localBackend.run({ command: "true", cwd: process.cwd(), env: {} as NodeJS.ProcessEnv, timeoutMs: 5000 });
+    }
+    const before = fdCount();
+    for (let i = 0; i < 8; i += 1) {
+      await localBackend.run({ command: "echo fd-leak-probe", cwd: process.cwd(), env: {} as NodeJS.ProcessEnv, timeoutMs: 5000 });
+    }
+    // small tolerance for transient (already-closing) fds; a leak adds 8
+    assert(fdCount() <= before + 2, `spawnCapture must not leak fds (grew ${fdCount() - before} over 8 runs)`);
+  }
   // default resolution is local
   const prev = process.env.AIH_SANDBOX;
   delete process.env.AIH_SANDBOX;
@@ -6677,6 +6762,8 @@ console.log("══════════════════════�
   process.chdir(savedCwd);
   assert(sp.includes("Project rules"), "rules: loadSystemPrompt injects the Project rules section");
   assert(sp.includes("Always use tabs"), "rules: system prompt carries rule content");
+  // CC-R#3 — the prefix-stability discipline rides in the system prompt guard.
+  assert(sp.includes("Prompt-cache prefix stability"), "CC-R#3: system prompt carries the prefix-stability rules");
   rmSync(ruleDir, { recursive: true, force: true });
   rmSync(fallbackDir, { recursive: true, force: true });
 
@@ -7167,8 +7254,7 @@ function mkFinding(file: string, start: number, end: number, title: string): Fin
     } catch { /* exists */ }
     const gate2 = { async decide() { return "allow" as const; }, async ask() { throw new Error("no ask"); } };
     const registry2 = new TR(gate2 as never);
-    rdt(registry2 as never, workdir);
-    const call2 = async (name: string, args: unknown): Promise<Record<string, unknown>> => {
+    rdt(registry2 as never, workdir);    const call2 = async (name: string, args: unknown): Promise<Record<string, unknown>> => {
       const r = await registry2.invoke(name, args, { turnId: "smoke", inject: () => {} } as never);
       if (!r.ok) throw new Error(`${name}: ${r.error}`);
       return r.result as Record<string, unknown>;
@@ -7182,6 +7268,10 @@ function mkFinding(file: string, start: number, end: number, title: string): Fin
     assert(Number(fr.count) >= 2, `AC#2 live find_references: >=2 refs (got ${fr.count})`);
     assert(refs.some((x) => String(x.file).includes("main.ts")), "AC#2 live find_references: cross-file hit");
     rmS(workdir, { recursive: true, force: true });
+    // Kill the live tsserver before moving on: a leaked child holds three
+    // stdio Pipe handles and the smoke process never exits after its final
+    // "passed" line (observed as a multi-minute post-assert hang).
+    (registry2 as unknown as { __aihCodeIntel?: { close(): void } }).__aihCodeIntel?.close();
     console.log("ok: AC#2 live tsserver round-trip (list_symbols / read_symbol / find_references)");
   } else {
     console.log("ok: AC#2 live tsserver round-trip SKIPPED (no typescript install)");
