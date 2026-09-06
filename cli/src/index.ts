@@ -1888,6 +1888,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   let busy = false;
   let goalCondition = "";
   let goalRoundsLeft = 0;
+  // OMP-R#5 — goal token budget: auto-pause when tokensUsed ≥ budget.
+  let goalTokenBudget = 0; // 0 = no budget (unlimited)
   let echoEvents = false;
   // Seed the context-usage counter from the restored session's last completed
   // turn so `-c`/`--session` resume shows the real context immediately instead
@@ -2685,6 +2687,16 @@ async function cmdChat(flags: Record<string, string | boolean>) {
 
   async function runGoalCheck(): Promise<void> {
     if (!goalCondition) return;
+    // OMP-R#5 — token budget check: auto-pause when exceeded.
+    if (goalTokenBudget > 0 && usedTokens >= goalTokenBudget) {
+      goalCondition = "";
+      goalRoundsLeft = 0;
+      tui.pushSystem(
+        `⏸ goal paused — token budget reached (${usedTokens.toLocaleString()} / ${goalTokenBudget.toLocaleString()})\n` +
+          `resume with: /goal ${"(previous condition)"} (budget resets on re-set)`,
+      );
+      return;
+    }
     for (;;) {
       let verdict: { met: boolean; reason: string; unmet: string[] };
       try {
@@ -3552,15 +3564,24 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       return;
     }
     if (input.startsWith("/goal ")) {
-      const cond = input.slice(6).trim();
+      let cond = input.slice(6).trim();
+      // OMP-R#5 — parse optional --budget <tokens> flag
+      const budgetMatch = /--budget\s+(\d+)/.exec(cond);
+      if (budgetMatch) {
+        goalTokenBudget = Number(budgetMatch[1]);
+        cond = cond.replace(/--budget\s+\d+/, "").trim();
+      } else {
+        goalTokenBudget = 0;
+      }
       if (!cond) {
-        tui.pushSystem("usage: /goal <condition> · /goal clear");
+        tui.pushSystem("usage: /goal <condition> [--budget <tokens>] · /goal clear");
         return;
       }
       goalCondition = cond;
       goalRoundsLeft = Number(process.env.AIH_GOAL_ROUNDS ?? "") || 3;
+      const budgetNote = goalTokenBudget > 0 ? `\ntoken budget: ${goalTokenBudget.toLocaleString()} (auto-pause when exceeded)` : "";
       tui.pushSystem(
-        `goal set: ${cond}\nafter each turn an independent judge checks acceptance criteria against real evidence and auto-continues if unmet (up to ${goalRoundsLeft} extra rounds)\n` +
+        `goal set: ${cond}\nafter each turn an independent judge checks acceptance criteria against real evidence and auto-continues if unmet (up to ${goalRoundsLeft} extra rounds)${budgetNote}\n` +
           `tip — structure it as:\n${GOAL_CONTRACT_TEMPLATE}`,
       );
       return;
