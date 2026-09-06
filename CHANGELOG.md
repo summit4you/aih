@@ -8,6 +8,19 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Changed
+- **Windows/PowerShell TUI 显示修复**（对齐 opencode / mimo-coder）：
+  - **键盘 expand**：legacy conhost（无 WT_SESSION/TERM_PROGRAM）不发鼠标事件，
+    `click to expand` 结构性失效——改为空输入框 `Enter`/`o` 展开/折叠选中工具块
+    （含工具分组），提示文案改 `enter to expand/collapse`；帮助行补 `enter expand`。
+  - **行距**：assistant 消息块加 1 行 margin（首条除外，opencode `marginTop=1` 语义），
+    `#viewHeight` 基线 `rows-7` → `rows-8` 补偿。
+  - **输入区 padding**：输入框上、下各加 1 空行；`┃` 左侧留白 1 → 2 空格。
+  - **上下文进度条**：`█░` 块字符改 ASCII `#`/`-`（GBK 代码页下块字符按 2 格渲染错位），
+    conhost 下同时跳过 block 字符 sparkline；文本行 `Nk / Mk · X%` 保留。
+  - **install.ps1**：`aih.cmd` 启动器注入 `chcp 65001`（UTF-8），legacy conhost
+    框线/块字符不再乱码（代码页随 cmd 会话退出自动恢复）。
+
 ## [0.7.0] - 2026-09-06
 
 ### Added

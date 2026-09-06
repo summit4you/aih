@@ -3560,6 +3560,10 @@ await srv.connect(new StdioServerTransport());
   assert(costIdx >= 0, "F#30 panel: cost line present");
   assert(panel[costIdx] === "cost 0.01", `F#30 panel: cost alone on its line (got ${panel[costIdx]})`);
   assert(speedIdx === costIdx + 1, `F#30 panel: throughput directly under cost (got gap ${speedIdx - costIdx})`);
+  // Windows GBK fix: the usage bar must stay ASCII (#/-), never block chars
+  // (█░) which legacy conhost renders as two cells each and misaligns.
+  const barIdx = panel.findIndex((l) => /^[#-]+$/.test(l));
+  assert(barIdx >= 0 && !/[█░▁▂▃▄▅▆▇]/.test(panel[barIdx] ?? ""), `F#30 panel: usage bar is ASCII #/- (got ${panel[barIdx]})`);
   assert(
     panel[speedIdx] === "143 tok/s · stream 38.5 tok/s",
     `F#30 panel: tps + stream tps share ONE line (got ${panel[speedIdx]})`,
@@ -4005,6 +4009,65 @@ await srv.connect(new StdioServerTransport());
   // Mutating the streaming item invalidates its cache (re-render picks up new text).
   tui.pushDelta("APPENDED");
   assert(tui.transcriptLines().some((l) => l.includes("APPENDED")), "pushDelta after cache invalidates and re-renders");
+}
+
+// --- A: keyboard expand/collapse (Enter/o on empty composer) ------------------
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const tl = () => tui.transcriptLines().map(strip);
+
+  // one tool with a 5-line output → collapsed shows 3 + "more · enter to expand"
+  tui.pushTool("run_cmd", { command: "echo hi" }, "k1");
+  tui.resolveTool("k1", true, { stdout: "l1\nl2\nl3\nl4\nl5" });
+  let body = tl();
+  assert(body.some((l) => l.includes("more · enter to expand")), "collapsed tool hints enter-to-expand (keyboard path)");
+  assert(body.some((l) => l.includes("l1")) && !body.some((l) => l.includes("l5")), "collapsed shows first 3 lines only");
+
+  // Enter on empty composer toggles the focused (last) tool block → expands
+  tui.feed("\r");
+  body = tl();
+  assert(body.some((l) => l.includes("l5")), "Enter on empty composer expands the last tool block");
+  assert(body.some((l) => l.includes("enter to collapse")), "expanded tool hints enter-to-collapse");
+
+  // o on empty composer collapses it again
+  tui.feed("o");
+  body = tl();
+  assert(!body.some((l) => l.includes("l5")), "o on empty composer collapses the tool block back");
+
+  // group: two same-name tool items WITHOUT output collapse into one row;
+  // Enter expands (grouping only applies to tools with no output/diff).
+  const g = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const gPlain = () => g.transcriptLines().map(strip);
+  g.pushTool("run_cmd", { command: "a" }, "g1");
+  g.pushTool("run_cmd", { command: "b" }, "g2");
+  g.resolveTool("g1", true);
+  g.resolveTool("g2", true);
+  let gb = gPlain().join("\n");
+  assert(gb.includes("×2") && gb.includes("enter to expand"), "collapsed group shows ×2 + enter-to-expand hint");
+  g.feed("\r");
+  gb = gPlain().join("\n");
+  assert(gb.includes("run_cmd") && gb.includes("a") && gb.includes("b"), "Enter expands the group into its tool rows");
+  g.feed("o");
+  gb = gPlain().join("\n");
+  assert(gb.includes("×2"), "o collapses the group back to the summary row");
 }
 
 // --- F#28 increment: worktree snapshot on checkpoints ------------------------

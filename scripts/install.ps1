@@ -143,9 +143,13 @@ function Install-Aih {
     # Copy contents
     Copy-Item -Path (Join-Path $SourceDir "*") -Destination $target -Recurse -Force
 
-    # Create aih.cmd wrapper
+    # Create aih.cmd wrapper — switch the console to UTF-8 (code page 65001)
+    # so the TUI's box-drawing/block/emoji chars render correctly on legacy
+    # Windows console (conhost), which defaults to the system ANSI codepage
+    # (e.g. GBK 936) and mangles them. The codepage is per-console-session
+    # and resets when the cmd window closes; NUL-redirection hides chcp output.
     $nodeExe = (Get-Command node).Source
-    $cmdContent = "@echo off`r`n`"$nodeExe`" `"%~dp0aih`" %*"
+    $cmdContent = "@echo off`r`nchcp 65001 >nul`r`n`"$nodeExe`" `"%~dp0aih`" %*`r`n"
     Set-Content -Path $launcher -Value $cmdContent -Encoding ASCII
 
     # Add to user PATH if needed

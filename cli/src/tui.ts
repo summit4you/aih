@@ -129,7 +129,7 @@ const HELP_LINES: string[] = [
   bold("keys"),
   "    enter send · esc clear · esc escape twice cancels the turn",
   "    up/down recall history · Alt+Up recall queued · tab complete · ctrl-p palette",
-  "    ? help (empty input) · mouse scroll/click",
+  "    ? help (empty input) · mouse scroll/click · enter expand",
   bold("state"),
   "    ▶ running   ✓ ok   ✗ failed   ● active model",
   bold("commands"),
@@ -544,6 +544,19 @@ export class Tui {
   #dark = true;
   /** P2#9 — /vivid: concise (plain) render mode — no borders/surface/panel/chrome. */
   #plain = false;
+  /**
+   * Keyboard focus for expand/collapse (A). Legacy Windows console (conhost)
+   * sends no mouse events, so click-to-expand is structurally impossible
+   * there; Enter/o on a focused unit is the keyboard path. Default = the
+   * most recently rendered tool unit, so Enter/o just works after a turn.
+   */
+  #focusUnit = -1;
+  /**
+   * Legacy Windows console (conhost, no WT_SESSION/TERM_PROGRAM): no mouse
+   * events, unreliable bracketed paste, and GBK codepage mis-renders Unicode
+   * block chars. Set in start(); consumers (panel sparkline) degrade to ASCII.
+   */
+  #legacyWin = false;
 
 constructor(opts: TuiOptions) {
     this.#opts = opts;
@@ -610,6 +623,7 @@ constructor(opts: TuiOptions) {
     // and keep only the alt-screen toggle, which conhost understands. Windows
     // Terminal / VS Code get the full set.
     const legacyWin = process.platform === "win32" && !process.env.WT_SESSION && !process.env.TERM_PROGRAM;
+    this.#legacyWin = legacyWin;
     const modes = legacyWin ? `${CSI}?1049h` : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
     process.stdout.write(modes);
     this.#timer = setInterval(this.#tick, 120);
@@ -1302,12 +1316,15 @@ constructor(opts: TuiOptions) {
       case "\r":
       case "\n": {
         const line = this.#edit;
-        this.#edit = "";
-        this.#cursor = 0;
+        // A — empty composer Enter expands/collapses the focused tool block
+        // (only path to expand on legacy Windows conhost, which has no mouse).
         if (!line.trim()) {
+          this.#toggleFocus();
           this.requestPaint();
           return;
         }
+        this.#edit = "";
+        this.#cursor = 0;
         if (line.trim() === "exit" || line.trim() === "/quit") {
           if (this.#opts.busy()) {
             this.#pendingExit = true;
@@ -1367,6 +1384,21 @@ constructor(opts: TuiOptions) {
           this.requestPaint();
         }
         return;
+      case "o":
+      case "O": {
+        // A — `o` on an empty composer toggles the focused tool block too
+        // (mnemonic "open"; keyboard-only path for legacy Windows conhost).
+        if (!this.#edit.trim()) {
+          this.#toggleFocus();
+          this.requestPaint();
+        } else {
+          this.#edit =
+            this.#edit.slice(0, this.#cursor) + ch + this.#edit.slice(this.#cursor);
+          this.#cursor += 1;
+          this.requestPaint();
+        }
+        return;
+      }
       case "\t": {
         const ghost = this.#ghost();
         if (ghost) {
@@ -1563,6 +1595,7 @@ constructor(opts: TuiOptions) {
     if (u.kind === "group") {
       this.#groupOpen.set(u.start, !this.#groupOpen.get(u.start));
       this.#groupCache.delete(u.start);
+      this.#focusUnit = ui;
       this.requestPaint();
       return;
     }
@@ -1570,6 +1603,49 @@ constructor(opts: TuiOptions) {
     if (!item?.tool || typeof item.tool.output !== "string") return;
     item.tool.expanded = !item.tool.expanded;
     this.#invalidateItem(item);
+    this.#focusUnit = ui;
+    this.requestPaint();
+  }
+
+  /**
+   * A — keyboard expand/collapse for the focused unit (Enter/o on an empty
+   * composer). On legacy Windows console there are no mouse events at all, so
+   * this is the only way to expand a tool output / group there.
+   * - groups: toggle the open flag.
+   * - tool items with output: toggle `expanded`.
+   * Falls back to the LAST collapsible unit when nothing is focused.
+   */
+  #toggleFocus(): void {
+    if (this.#overlay || this.#question || this.#confirm) return;
+    const units = this.#units();
+    if (!units.length) return;
+    let i = this.#focusUnit;
+    if (i < 0 || i >= units.length) {
+      // fall back: last unit that is expandable (tool w/ output, or group)
+      for (let k = units.length - 1; k >= 0; k -= 1) {
+        const u = units[k];
+        const can =
+          u.kind === "group" ||
+          (u.kind === "item" && !!u.item.tool && typeof u.item.tool.output === "string");
+        if (can) {
+          i = k;
+          break;
+        }
+      }
+      if (i < 0) return;
+    }
+    const u = units[i];
+    if (u.kind === "group") {
+      this.#groupOpen.set(u.start, !this.#groupOpen.get(u.start));
+      this.#groupCache.delete(u.start);
+    } else {
+      const it = u.item;
+      if (!it.tool || typeof it.tool.output !== "string") return;
+      it.tool.expanded = !it.tool.expanded;
+      this.#invalidateItem(it);
+    }
+    this.#focusUnit = i;
+    this.#follow();
     this.requestPaint();
   }
 
@@ -1629,7 +1705,7 @@ constructor(opts: TuiOptions) {
     const pw = this.#panelWidth();
     const w = pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : this.#cols;
     const k = this.#inputLineCount(w);
-    return Math.max(1, this.#rows - 7 - k);
+    return Math.max(1, this.#rows - 8 - k);
   }
 
   #inputLineCount(width: number): number {
@@ -1821,10 +1897,10 @@ constructor(opts: TuiOptions) {
     const t = g.items[0].tool!;
     const icon = TOOL_ICONS[t.name] ?? "⚙";
     if (!this.#groupOpen.get(g.start)) {
-      return [this.#clip(`${icon} ${accent(t.name)} ×${g.items.length}${muted("   click to expand")}`, this.#bodyCols())];
+      return [this.#clip(`${icon} ${accent(t.name)} ×${g.items.length}${muted("   enter to expand")}`, this.#bodyCols())];
     }
     const rows = g.items.flatMap((it) => this.#toolRow(it));
-    rows.push(this.#clip(muted("   click to collapse"), this.#bodyCols()));
+    rows.push(this.#clip(muted("   enter to collapse"), this.#bodyCols()));
     return rows;
   }
 
@@ -1905,9 +1981,15 @@ constructor(opts: TuiOptions) {
     return bg + s.split(RESET).join(RESET + bg) + RESET;
   }
 
+  /**
+   * Context-usage bar. Uses only ASCII fill (`#`/`-`) — block chars (█░) are
+   * ambiguous-width under legacy Windows console GBK codepages where they
+   * render as two cells each and misalign the panel. opencode uses a plain
+   * text line ("N tokens · X% used"); we keep a compact bar AND the text.
+   */
   #progressBar(pct: number, width: number): string {
     const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
-    const bar = "█".repeat(filled) + "░".repeat(width - filled);
+    const bar = "#".repeat(filled) + "-".repeat(width - filled);
     if (pct >= 95) return danger(bar);
     if (pct >= 80) return warn(bar);
     return success(bar);
@@ -1932,7 +2014,9 @@ constructor(opts: TuiOptions) {
       lines.push(accent(bold("CONTEXT")));
       const bw = Math.min(12, Math.max(8, pw - 8));
       lines.push(this.#progressBar(pct, bw));
-      const spark = Tui.sparkline(ctx.trend);
+      // Sparkline uses block glyphs (▁…█) which legacy conhost GBK renders as
+      // two cells each; drop it there — the text % is still readable.
+      const spark = this.#legacyWin ? "" : Tui.sparkline(ctx.trend);
       lines.push(muted(`${this.#fmtTok(used)} / ${this.#fmtTok(ctx.limit)} · ${pct}%${spark ? `  ${spark}` : ""}`));
       // F#30: cost + throughput (only when the model has a price table entry).
       // Layout: cost gets its own line; the two throughput figures share one
@@ -2010,16 +2094,17 @@ constructor(opts: TuiOptions) {
   #userRow(line: string): string {
     if (this.#plain) return this.#clip(line, this.#bodyCols());
     const bg = this.#surface();
-    const inner = Math.max(1, this.#bodyCols() - 2);
-    const raw = `${cyan("┃")} ${this.#clip(line, inner)}`;
+    const inner = Math.max(1, this.#bodyCols() - 3);
+    // ┃ + 2 spaces so multi-line user content does not hug the gutter
+    const raw = `${cyan("┃")}  ${this.#clip(line, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #boxLine(content: string, width: number): string {
     if (this.#plain) return this.#clip(content, width);
     const bg = this.#surface();
-    const inner = Math.max(1, width - 2);
-    const raw = `${cyan("┃")} ${this.#clip(content, inner)}`;
+    const inner = Math.max(1, width - 3);
+    const raw = `${cyan("┃")}  ${this.#clip(content, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
@@ -2027,7 +2112,14 @@ constructor(opts: TuiOptions) {
     const limit = Math.max(1, this.#bodyCols() - 3);
     if (item.role === "assistant") {
       const lines = this.#markdown(item.text, limit);
-      return lines.map((line) => `   ${line}`);
+      // opencode-style block spacing: a 1-line gap above each message block
+      // (except the very first item) makes consecutive turns visually
+      // separate — on Windows the small line-height made them look glued.
+      const first = this.#items[0] === item;
+      const row = (s: string): string => `   ${s}`;
+      const out = lines.map(row);
+      if (!first && lines.length) out.unshift("");
+      return out;
     }
     const body = item.text ? this.#wrap(item.text, limit) : [""];
     switch (item.role) {
@@ -2056,9 +2148,9 @@ constructor(opts: TuiOptions) {
           const shown = t.expanded ? all : all.slice(0, 3);
           for (const l of shown) rows.push(this.#clip(`   ${dim(l || " ")}`, this.#bodyCols()));
           if (!t.expanded && all.length > 3) {
-            rows.push(this.#clip(dim(`   … ${all.length - 3} more · click to expand`), this.#bodyCols()));
+            rows.push(this.#clip(dim(`   … ${all.length - 3} more · enter to expand`), this.#bodyCols()));
           } else if (t.expanded) {
-            rows.push(this.#clip(dim("   click to collapse"), this.#bodyCols()));
+            rows.push(this.#clip(dim("   enter to collapse"), this.#bodyCols()));
           }
           if (t.outputCapped) rows.push(this.#clip(dim("   … output truncated at 32KB"), this.#bodyCols()));
         }
@@ -2519,6 +2611,10 @@ constructor(opts: TuiOptions) {
     }
 
     rows.push(row(""));
+    // C — input box breathing room: one blank line above AND below (opencode
+    // pads its prompt box top/bottom by 1). The `-8` in #viewHeight already
+    // accounts for both pad rows.
+    rows.push(row(""));
     rows.push(row(this.#boxLine("", leftW)));
     let cursorIdx = -1;
     for (let i = 0; i < il.lines.length; i += 1) {
@@ -2526,6 +2622,7 @@ constructor(opts: TuiOptions) {
       if (i === il.ci) cursorIdx = rows.length - 1;
     }
     rows.push(row(this.#boxLine("", leftW)));
+    rows.push(row("")); // padding below the input box (see comment above)
     rows.push(row(this.#boxLine(this.#metaContent(), leftW)));
 
     const tag = this.#scrollTop > 0 ? ` ↑${this.#scrollTop}` : "";

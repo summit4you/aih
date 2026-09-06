@@ -774,15 +774,20 @@ opencode / MiMo-Code 风格全屏 TUI：
 - **轻 Markdown 渲染**：标题→粗体、代码块→暗色+**语法高亮**（关键字/字符串/数字/
   注释分色）、引用→暗色、列表→`•`/序号、行内代码→青色、行内链接双色下划线、
   表格 `|`→`·`；工具调用图标行内（`$` bash / `→` read / `✱` search / `%` web /
-  `←` write / `#` todo / `⚙` 其他）；同类工具自动分组折叠（`$ bash ×3 click to
-  expand`）；`run_cmd` 等结果前三行预览（`… N more · click to expand`）
+  `←` write / `#` todo / `⚙` 其他）；同类工具自动分组折叠（`$ bash ×3 · enter to
+  expand`）；`run_cmd` 等结果前三行预览（`… N more · enter to expand`）
 - **权限确认（文件夹级记忆）**：忙碌中提交自动排队（`queued: …`）
 - **多行输入框**：按显示宽度折行（CJK 宽字符感知、光标精确定位）、框内滚动；
   `/` 触发 Tab 幽灵补全；忙碌时旋转指示器 + 已用秒数
 - **底部**：重边线（滚动时 `↑N`）+ 提示行（cwd · 快捷键 · 右侧上下文用量
   `used/limit (pct%)`）+ 状态行（`⊙ N MCP` 徽章 · 应用 · 版本 · 会话名）
-- **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；`exit`（或 `/quit`，
-  `ctrl-c` 清空输入再按退出）还原终端；忙碌中 `ctrl-c` 取消当前轮不退出
+- **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；空输入框 `Enter` 或
+  `o` 展开/折叠选中工具块（**legacy Windows conhost 无鼠标事件，这是唯一展开路径**，
+  常规终端鼠标点击也可用）；`exit`（或 `/quit`，`ctrl-c` 清空输入再按退出）还原终端；
+  忙碌中 `ctrl-c` 取消当前轮不退出
+- **Windows 显示**：`install.ps1` 安装的 `aih.cmd` 启动器自动 `chcp 65001`（UTF-8），
+  legacy conhost 的框线/块字符不乱码；上下文进度条用 ASCII `#`/`-`（GBK 下块字符
+  按双宽渲染错位），侧栏其余用文本行（`Nk / Mk · X%`）
 - 斜杠命令：`/mode` `/goal` `/tools` `/model <id>`（热切换）`/usage` `/compact [focus]` `/clear`
   `/inject <text>` `/events` `/skills` `/vivid` `/bg <prompt>` `/find <text>` `/shell [--send]` `/fix [--show]` `/ <技能名>`
 - **`/find <text>`**：跨所有工具输出逐行检索（含 32KB 内带上限的展开内容），
