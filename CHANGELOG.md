@@ -8,6 +8,8 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-06
+
 ### Added
 - **OC-R#1 — 流内 `finish_reason: network_error` 重试**（opencode v1.18.20 parity）：
   HTTP 200 但流尾以 `network_error` 结束的连接掐断不再被当成正常结束——partial 文本
@@ -24,13 +26,21 @@ the versions listed here (`scripts/package` derives the version from
 - **OCL-R#1 — upstream-review 技能 hard gate**：上游机制断言必须本机源码实读 +
   强制 `file:line` 引用；CHANGELOG/PR 文本/子代理报告/memory/旧 review 均不算证据；
   失据降级为「未验证」。
-
-### Fixed
-- **冒烟挂起根因修复（AC#2 副作用）**：live tsserver 子进程 spawn 后从不关闭，三条
-  stdio Pipe handle 把事件循环钉死——`cli/dist/smoke.js` 跑完所有断言后悬挂 5+ 分钟。
-  修复：① `codeintel.ts` LspClient/TsServerClient spawn 时对 stdio 三流逐一 `unref()`
-  （此前仅 child.unref()，流级 ref-count 仍持有）；② AC#2 live 块结束显式
-  `pool.close()`。cli smoke 从挂起 5+ 分钟 → 83s 正常退出（1591 ok / 0 FAIL）。
+- **MCP add_todo 批量形式**：`items` 数组（1–50）一次调用新增多条，避免 re-planning
+  模型逐条调用（单次 replan 6 次、1.5 小时会话 76 次 add_todo 的churn）；`text`/`items`
+  二选一校验，批量全部计入 stats。
+- **Windows 兼容（mimo-code parity）**：① run_cmd/sandbox 在 win32 解析执行 shell——
+  优先 Git Bash（真 POSIX 环境，/tmp、/c/... 路径映射），回退 PowerShell 且子进程强制
+  UTF-8（zh-CN GBK 乱码会破坏 TUI 宽度计算）；`AIH_WINDOWS_SHELL` 可覆盖；纯函数
+  `pickWin32Shell()` 拒绝 WSL System32 bash。② dev-tools shell 探测跟随后端 shell
+  （Git Bash → bash 提示、PowerShell → PS 提示）。③ TUI：legacy conhost（无
+  WT_SESSION/TERM_PROGRAM）仅启用 alt-screen（mouse/括号粘贴 CSI 不可靠）；#feed 统一
+  把 BS `\x08` 归一为 DEL `\x7f`，composer/question/confirm/overlay/paste 全部生效。
+- **冒烟 suite 挂起修复（AC#2 副作用）**：live tsserver 子进程 spawn 后从不关闭，三条
+  stdio Pipe handle 把事件循环钉死。修复：`codeintel.ts` 对 stdio 三流逐一 `unref()`；
+  `sandbox.ts` spawnCapture 关闭 capture fd（一次 1.5 小时会话发现 129 个陈旧 handle）；
+  fake-llm-server `closeAllConnections()`；AC#2 显式 `pool.close()`。cli smoke 从挂起
+  5+ 分钟 → 83s 正常退出（1591 ok / 0 FAIL）。
 
 ## [0.6.0] - 2026-09-05
 
