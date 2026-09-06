@@ -221,7 +221,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.7.1";
+export const VERSION = "0.7.2";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );

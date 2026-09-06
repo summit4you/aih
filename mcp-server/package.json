@@ -1,6 +1,6 @@
 {
   "name": "@aih/mcp-server",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "AIH access layer: expose any application as Context/Action primitives over MCP",
   "type": "module",
   "license": "MIT",

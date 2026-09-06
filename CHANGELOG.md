@@ -8,6 +8,8 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-06
+
 ### Added
 - **OMP-R#2 — `read_file` 双预算 + 四态截断**（`cli/src/dev-tools.ts` `truncateReadLines`）：
   读文件改「读全量 → 行预算切片（`offset_line`/`max_lines`）→ 字符预算投影」，
@@ -35,6 +37,16 @@ the versions listed here (`scripts/package` derives the version from
 ### Changed
 - `core/src/smoke.ts`：path-scoped 兄弟写工具断言对齐 KL-R#4 guarded 语义
   （`write_file` 由 `allow` 降为 `ask`），新增 non-guarded 写工具仍 `allow` 的对照断言。
+
+### Fixed
+- **TUI 显示修复**（对齐 opencode / mimo-code，参考 agent-cli 审查后确认无适用组件）：
+  - **Linux 输入框光标偏移**：v0.7.1 输入框改 `┃`+2 空格留白后光标 CUP 常数未同步
+    （`curCol` 4→5），光标落在最后一个已输入字符上而非下一输入位——已修正并注释。
+  - **上下文进度条**：modern 终端恢复 `█░` 块字符（`Tui.bar(pct,width,legacy)` 纯函数，
+    legacy conhost GBK 代码页仍回退 `#`/`-`），smoke 单测覆盖 50/0/100/clamp。
+  - **meta 黑条割裂**：删除输入框下方的独立 meta 黑条行（agent·model·provider）与
+    虚线分隔行，身份并入底部单行 status（opencode/mimo 风格）；scroll 标记 `↑N`
+    移至 hints 行；`#viewHeight` -8→-6、palette 居中 -9→-7 同步补偿。
 
 ## [0.7.1] - 2026-09-06
 
