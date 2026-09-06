@@ -637,9 +637,10 @@ constructor(opts: TuiOptions) {
     // Legacy conhost: NO alt-screen (?1049) — its resize handler has a buffer
     // overflow bug that crashes when the TUI writes during reallocation.
     // Mouse tracking (?1000/?1006) IS supported on Win10+ conhost — enable it
-    // so click-to-expand works. Bracketed paste (?2004) is unreliable there.
+    // so click-to-expand works. Bracketed paste (?2004) enables Ctrl+Shift+V
+    // and right-click paste to arrive as literal text (not key events).
     const modes = legacyWin
-      ? `${CSI}?1000h${CSI}?1006h`
+      ? `${CSI}?1000h${CSI}?1006h${CSI}?2004h`
       : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
     process.stdout.write(modes);
     this.#timer = setInterval(this.#tick, 120);
@@ -655,9 +656,9 @@ constructor(opts: TuiOptions) {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
-    // Legacy conhost: restore mouse tracking (no alt-screen/bracketed-paste).
+    // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen).
     const restore = this.#legacyWin
-      ? `${CSI}?1000l${CSI}?1006l${SHOW}`
+      ? `${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
       : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`;
     process.stdout.write(restore);
   }
