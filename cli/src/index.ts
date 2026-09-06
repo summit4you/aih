@@ -952,6 +952,24 @@ export function collectSessionLedger(log: { all: () => readonly SessionEvent[] }
   return ledger;
 }
 
+/** CC-R#5 — record skill usage to .aih/skills/.usage (name + count + lastUsed). */
+function recordSkillUsage(name: string): void {
+  try {
+    const dir = join(process.cwd(), ".aih", "skills");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, ".usage");
+    let data: Record<string, { count: number; lastUsed: string }> = {};
+    if (existsSync(file)) {
+      try { data = JSON.parse(readFileSync(file, "utf8")); } catch { /* fresh start */ }
+    }
+    const entry = data[name] ?? { count: 0, lastUsed: "" };
+    entry.count += 1;
+    entry.lastUsed = new Date().toISOString();
+    data[name] = entry;
+    writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch { /* best-effort */ }
+}
+
 export function registerSkillTool(
   registry: ToolRegistry,
   opts?: { projectTrusted?: boolean; loadTracker?: SkillLoadTracker },
@@ -986,6 +1004,7 @@ export function registerSkillTool(
       // CC#52 — avoid re-appending a full duplicate copy on a repeat load.
       if (loadTracker.isLoaded(name)) {
         const recap = skill.body.trim().slice(0, 200);
+        recordSkillUsage(name); // CC-R#5: track usage for /skill-doctor
         return (
           `skill "${name}" was already loaded ${loadTracker.markLoaded(name)}; ` +
           `its full instructions are already in context — do not load again unless expired. ` +
@@ -993,6 +1012,7 @@ export function registerSkillTool(
         );
       }
       loadTracker.markLoaded(name);
+      recordSkillUsage(name); // CC-R#5: track usage for /skill-doctor
       return skill.body.slice(0, 6000);
     },
   });
@@ -3363,6 +3383,28 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       );
       return;
     }
+    // CC-R#5 — /skill-doctor: audit unused skills + context budget cost.
+    if (input === "/skill-doctor") {
+      const usageFile = join(process.cwd(), ".aih", "skills", ".usage");
+      let usage: Record<string, { count: number; lastUsed: string }> = {};
+      if (existsSync(usageFile)) {
+        try { usage = JSON.parse(readFileSync(usageFile, "utf8")); } catch { /* fresh */ }
+      }
+      const all = discoverSkills().filter((s) => s.scope !== "project" || projectTrustState() === "trusted");
+      const unused = all.filter((s) => !usage[s.name] || usage[s.name].count === 0);
+      const used = all.filter((s) => usage[s.name]?.count > 0);
+      const rosterBudget = Math.floor((resolveContextWindow(flags) ?? 8000) * 0.02);
+      const totalChars = all.reduce((sum, s) => sum + s.description.length + s.name.length + 30, 0);
+      tui.pushSystem(
+        `skill-doctor: ${all.length} installed · ${used.length} used · ${unused.length} unused\n` +
+          `roster budget: ~${rosterBudget} chars (2% of context window)\n` +
+          `total roster cost: ~${totalChars} chars (${Math.round((totalChars / Math.max(1, rosterBudget)) * 100)}% of budget)\n\n` +
+          (unused.length ? `unused skills (candidates for pruning):\n  ${unused.map((s) => `${s.name} (${s.scope})`).join("\n  ")}\n` : "all skills have been used at least once\n") +
+          (used.length ? `used skills:\n  ${used.map((s) => `${s.name} ×${usage[s.name].count} (last: ${usage[s.name].lastUsed.slice(0, 10)})`).join("\n  ")}\n` : "") +
+          "\nuse /skills to list all · remove with aih skills remove <name>",
+      );
+      return;
+    }
     if (input === "/usage") {
       const ends = log.all().filter((e) => e.type === "turn/end");
       let prompt = 0;
@@ -3631,7 +3673,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return;
       }
       tui.pushSystem(
-        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /connect /model /models /usage /compact /checkpoint /restore /fork /tree /skills /inject /events /clear /exit`,
+        `unknown command: ${input}\navailable: /help /commands(ctrl-p) /mode /goal /tools /connect /model /models /usage /compact /checkpoint /restore /fork /tree /skills /skill-doctor /inject /events /clear /exit`,
       );
       return;
     }
