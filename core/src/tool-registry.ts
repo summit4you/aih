@@ -233,8 +233,16 @@ export class ToolRegistry {
     }
 
     for (const after of this.#hookAfter) {
-      const next = await after(hookInfo, outcome);
-      if (next) outcome = next;
+      // CL-R#5 — hook fault isolation: an after-hook crash must not break the
+      // tool result. Log and continue (the tool already succeeded).
+      try {
+        const next = await after(hookInfo, outcome);
+        if (next) outcome = next;
+      } catch (err) {
+        // Hook infrastructure failure — degrade gracefully, don't crash core.
+        // The tool result is preserved; the hook's side effect is lost.
+        continue;
+      }
     }
 
     return outcome;

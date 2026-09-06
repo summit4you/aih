@@ -18,6 +18,19 @@ import { formatAfterWrite } from "./formatter.js";
 import { bestOfN, capAnswer, answerCapLimit } from "./maxmode.js";
 import { userAihDir } from "./paths.js";
 import { extractShellContext } from "./shell-context.js";
+
+/** CC-R#4 — subagent concurrency gate: max parallel task subagents. */
+let activeSubagents = 0;
+const SUBAGENT_CONCURRENCY_LIMIT = Math.max(1, Number(process.env.AIH_SUBAGENT_CONCURRENCY ?? "") || 8);
+async function acquireSubagentSlot(): Promise<void> {
+  while (activeSubagents >= SUBAGENT_CONCURRENCY_LIMIT) {
+    await new Promise((r) => setTimeout(r, 50)); // poll every 50ms
+  }
+  activeSubagents++;
+}
+function releaseSubagentSlot(): void {
+  activeSubagents = Math.max(0, activeSubagents - 1);
+}
 import { parseMemoryEntries } from "./memory-tidy.js";
 import { recall, type RecallEntry } from "./memory-recall.js";
 
@@ -1083,6 +1096,9 @@ export function registerGeneralTools(
       const llm = typeof opts.llm === "function" ? opts.llm() : opts.llm;
       const parent = opts.toolsProvider();
       if (!parent) throw new Error("task subagent has no parent tool registry");
+      // CC-R#4 — concurrency gate: wait for a slot if too many subagents in flight.
+      await acquireSubagentSlot();
+      try {
       // KL-R#3 — subagent permission inheritance (see makeSubagentGate):
       // parent's DENY rules propagate, ALLOW/ask do not; no human inside the
       // subagent, so writes resolve to deny and the subagent keeps exploring.
@@ -1106,10 +1122,17 @@ export function registerGeneralTools(
         maxStepsPerTurn: 8,
       });
       const result = await loop.send(prompt);
-      const lastAssistant = [...subLog.all()]
-        .reverse()
-        .find((e) => e.type === "assistant/message" && (e as { text?: string }).text);
-      const rawAnswer = lastAssistant ? String((lastAssistant as { text: string }).text) : "(no final answer)";
+      // OMP-R#4 — useLastTurn fallback: collect ALL assistant messages, not just the last.
+      // If the subagent produced incremental findings across multiple turns, merge them.
+      const allAssistant = subLog.all()
+        .filter((e) => e.type === "assistant/message" && (e as { text?: string }).text)
+        .map((e) => String((e as { text: string }).text));
+      const lastAssistant = allAssistant.length > 0 ? allAssistant[allAssistant.length - 1] : "(no final answer)";
+      // OMP-R#4 — if the last turn is short but earlier turns had substantive content,
+      // merge them (useLastTurn fallback: the final answer may be a summary of earlier findings).
+      const rawAnswer = allAssistant.length > 1 && lastAssistant.length < 200
+        ? allAssistant.join("\n\n")
+        : lastAssistant;
       // FB#5 — cap the answer that re-enters the parent context; spill the
       // full text to .aih/outputs/ and point the capped answer at it.
       const capped = capAnswer(rawAnswer, answerCapLimit(), opts.cwd ?? ".");
@@ -1120,6 +1143,10 @@ export function registerGeneralTools(
       const answer = finished
         ? capped.answer
         : `[partial — subagent stopped at ${result.stopReason ?? "step limit"}; re-delegate with a narrower prompt or ask it to continue] ${capped.answer}`;
+      // OMP-R#4 — schemaOverridden flag: when the subagent's output was capped
+      // (answer exceeded budget), mark it so the parent knows the result is
+      // a degraded view, not the full finding.
+      const schemaOverridden = capped.truncated;
       return {
         description: String(a.description ?? ""),
         steps: result.steps,
@@ -1127,7 +1154,11 @@ export function registerGeneralTools(
         answer,
         partial: !finished,
         ...(capped.truncated ? { truncated: true, fullOutputPath: capped.fullOutputPath } : {}),
+        ...(schemaOverridden ? { schemaOverridden: true } : {}),
       };
+      } finally {
+        releaseSubagentSlot(); // CC-R#4: release the concurrency slot
+      }
     },
   });
 

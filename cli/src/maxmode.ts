@@ -128,13 +128,16 @@ export async function runSubagent(o: SubagentOptions, prompt: string): Promise<S
  * Bounded-concurrency pool: run `jobs` with at most `limit` in flight;
  * results are returned in input order regardless of completion order.
  */
-export async function mapOrdered<T>(jobs: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+export async function mapOrdered<T>(jobs: Array<() => Promise<T>>, limit: number, staggerMs = 0): Promise<T[]> {
   const results: T[] = new Array<T>(jobs.length);
   let next = 0;
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, jobs.length)) }, async () => {
+  const workerCount = Math.max(1, Math.min(limit, jobs.length));
+  const workers = Array.from({ length: workerCount }, async (_, w: number) => {
     for (;;) {
       const i = next++;
       if (i >= jobs.length) return;
+      // CC-R#4 — stagger: delay each worker's first start to share prompt cache prefix.
+      if (staggerMs > 0 && w > 0) await new Promise((r) => setTimeout(r, staggerMs * w));
       results[i] = await jobs[i]();
     }
   });
@@ -253,6 +256,8 @@ export async function bestOfN(
       best: -1, judgeReason: "aborted before start", answer: "",
     };
   }
+  // CC-R#4 — stagger: delay sibling starts to share prompt cache prefix.
+  const staggerMs = Number(process.env.AIH_SUBAGENT_STAGGER_MS ?? "") || 250;
   const candidates: Candidate[] = await mapOrdered(
     Array.from({ length: n }, (_, i) => async () => {
       try {
@@ -270,6 +275,7 @@ export async function bestOfN(
       }
     }),
     limit,
+    staggerMs, // CC-R#4: stagger sibling starts to share prompt cache prefix
   );
 
   const base = { description, n, concurrency: limit, candidates, ...(strategies ? { strategies } : {}) };

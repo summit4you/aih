@@ -109,5 +109,5 @@ export {
   matchPattern,
   targetOf,
 } from "./seams/permissions.js";
-export type { ApprovalGate, ApprovalRequest, PermissionRule } from "./seams/permissions.js";
+export type { ApprovalGate, ApprovalRequest, PermissionRule, DenialDiagnostic } from "./seams/permissions.js";
 export type * from "./types.js";

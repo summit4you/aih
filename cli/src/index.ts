@@ -3218,6 +3218,26 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           return;
         }
       }
+      // CL-R#2 — worktree safety check: if the checkpoint recorded a HEAD sha,
+      // verify the current HEAD hasn't moved past it (commits made after the
+      // checkpoint would be lost on a file-level restore). Advisory only — we
+      // don't do file rollback, but the user should know.
+      const cpHead = target.worktree?.head;
+      if (cpHead) {
+        try {
+          const cur = gitStatusSummary({ cwd: process.cwd() });
+          if (cur?.head && cur.head !== cpHead) {
+            // Count commits between checkpoint and now (best-effort).
+            const { spawnSync } = await import("node:child_process");
+            const revList = spawnSync("git", ["rev-list", "--count", `${cpHead}..HEAD`], { cwd: process.cwd(), encoding: "utf8", timeout: 5000 });
+            const ahead = revList.status === 0 ? (revList.stdout ?? "").trim() : "?";
+            tui.pushSystem(
+              `⚠ worktree has moved since checkpoint #${target.seq}: HEAD ${cpHead} → ${cur.head} (${ahead} commit(s) ahead)\n` +
+                `context restore is safe; file-level rollback would discard those commits`,
+            );
+          }
+        } catch { /* git unavailable — advisory only */ }
+      }
       const restored = log.restoreTo(target.seq);
       // MK#47: identity gate — a checkpoint carries the workspace UUID it was
       // taken in. A mismatch means this session's checkpoints belong to a

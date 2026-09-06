@@ -15,8 +15,18 @@ export interface ApprovalRequest {
   source?: "tty" | "injected";
 }
 
+/** OCL-R#3 — permission denial diagnostic record (who denied / why / source). */
+export interface DenialDiagnostic {
+  tool: string;
+  reason: string;
+  source: "rule" | "gate" | "hook" | "unknown";
+  ts: number;
+}
+
 export interface ApprovalGate {
   request(req: ApprovalRequest): Promise<boolean>;
+  /** OCL-R#3 — optional: record a denial diagnostic (who denied / why / source). */
+  diagnose?(d: DenialDiagnostic): void;
 }
 
 /**
