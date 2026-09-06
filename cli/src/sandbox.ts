@@ -182,12 +182,9 @@ export const localBackend: SandboxBackend = {
       if (shell?.kind === "bash") {
         return spawnCapture(shell.path, ["-c", opts.command], opts);
       }
-      // PowerShell fallback: force UTF-8 output (zh-CN systems default to the
-      // GBK code page — child output garbles and breaks TUI width math) and
-      // silence the progress bar.
-      const preamble =
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; ";
-      return spawnCapture("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", preamble + opts.command], opts);
+      // cmd.exe fallback: simpler, faster, no PowerShell buffer overflow.
+      // Set code page to UTF-8 (chcp 65001) so zh-CN output doesn't garble.
+      return spawnCapture("cmd.exe", ["/c", "chcp 65001 >nul & " + opts.command], opts);
     }
     return spawnCapture("/bin/sh", ["-c", opts.command], opts);
   },
