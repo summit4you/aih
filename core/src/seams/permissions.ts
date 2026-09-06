@@ -204,18 +204,18 @@ export class RulesetGate implements ApprovalGate {
     const raw = targetOf(req);
     const abs = raw ? resolve(raw) : undefined;
     let action: "allow" | "ask" | "deny" | undefined;
-    // KL-R#4 refinement — an explicit HUMAN grant (the TUI [g] one-key grant /
-    // the `permissions` bridge, both stamped source "session (this run)") is a
-    // deliberate per-scope decision and must STICK: without this exemption the
-    // guarded floor below would re-floor every such allow back to "ask", so a
-    // granted scope kept re-prompting / re-denying forever (the reported bug).
-    // The floor's original purpose — blocking machine-written config from
-    // auto-allowing writes — is untouched: only session-sourced allows are
-    // exempt; config/env rules still floor. Deny still dominates everything.
-    const humanGrantedAllow = this.rules.some(
+    // KL-R#4 refinement (2026-09-06) — an EXPLICIT allow rule (config OR a
+    // session [g] grant) is a deliberate per-scope decision and must STICK:
+    // without this exemption the guarded floor below re-floors every such
+    // allow back to "ask", so a configured/granted scope kept prompting on
+    // every run_cmd (the reported bug: AIH_GUARDIAN=0 + config `run_cmd *`
+    // allow still prompted). The floor's original purpose — preventing
+    // AUTO-ALLOW when NO rule matched (base fallback) — is preserved: the
+    // floor only fires when action === "allow" came from the base, not from
+    // an explicit rule. Deny still dominates everything.
+    const explicitAllow = this.rules.some(
       (rule) =>
         rule.action === "allow" &&
-        rule.source === "session (this run)" &&
         (matchPattern(rule.pattern, raw) || matchPattern(rule.pattern, abs)),
     );
     for (const rule of this.rules) {
@@ -227,11 +227,12 @@ export class RulesetGate implements ApprovalGate {
       else if (rule.action === "ask" && action !== "deny") action = "ask";
       else if (rule.action === "allow" && action !== "ask" && action !== "deny") action = "allow";
     }
-    // KL-R#4 — guarded write tools floor at "ask": CONFIG cannot auto-allow a
-    // write that the tool author marked as needing a human. An explicit human
-    // grant (humanGrantedAllow) is exempt — it IS the human in the loop.
+    // KL-R#4 — guarded write tools floor at "ask" ONLY when no explicit allow
+    // rule matched (i.e. the "allow" came from the base fallback, not a
+    // deliberate config/grant decision). An explicit allow rule (config or
+    // session [g] grant) is exempt — it IS the human's deliberate choice.
     // (Deny already dominated above.)
-    if (action === "allow" && GUARDED_WRITE_TOOLS.has(req.tool) && req.kind === "write" && !humanGrantedAllow) {
+    if (action === "allow" && GUARDED_WRITE_TOOLS.has(req.tool) && req.kind === "write" && !explicitAllow) {
       return "ask";
     }
     return action;

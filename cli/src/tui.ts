@@ -1285,6 +1285,15 @@ constructor(opts: TuiOptions) {
       return;
     }
     if (this.#confirm) {
+      // Mouse/escape sequences must NOT be treated as answer keys: the first
+      // byte \x1b of an SGR mouse event (\x1b<0;col;rowM) would match `refuse`
+      // (ch === "\x1b") and auto-deny the prompt on every click. Route escape
+      // sequences through #escapeSeq (handles scroll/click); only plain keys
+      // reach the accept/refuse logic below.
+      if (ch === "\x1b" || this.#held) {
+        this.#escapeSeq(ch);
+        return;
+      }
       if (!(this.#inPaste && (ch === "\x1b" || this.#held))) {
         const done = this.#confirm;
         const roc = this.#confirmMode === "runorcopy";
@@ -1451,7 +1460,8 @@ constructor(opts: TuiOptions) {
       // treating the follow-up ESC as a second bare-Esc (double-Esc cancel).
       // Observed bug: tmux repainting its status line / title fired OSC/DCS
       // ESC bursts that were misread as double-Esc, cancelling an active turn.
-      if (ch === "[" || ch === "O") {
+      // '[' starts CSI, 'O' starts SS3, '<' starts SGR mouse (ESC < btn;col;row M/m).
+      if (ch === "[" || ch === "O" || ch === "<") {
         this.#escAt = 0;
         this.#held += ch;
         return;

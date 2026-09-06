@@ -536,13 +536,15 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(gRules.some((r) => r.action === "allow"), "MEA C#2: [g] grant wrote an allow rule for the guarded tool");
     const gSecond = await gGate.request({ tool: "run_cmd", kind: "write", args: { command: "ls -la" }, source: "tty" });
     assert(gSecond === true, "MEA C#2: granted run_cmd scope STICKS — auto-approved after the human grant (no re-floor to ask)");
-    // Config allow rule (no human grant) is STILL floored to ask — KL-R#4 holds.
+    // Config allow rule is ALSO honored (not floored) — an explicit allow
+    // rule is a deliberate choice regardless of source. The floor only fires
+    // when NO rule matched (base fallback).
     const cfgGate = new RulesetGate(
       { async request() { return true; } },
       [{ tool: "run_cmd", action: "allow" as const, pattern: "**" }],
     );
-    assert(cfgGate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === "ask",
-      "MEA C#2: config allow rule for a guarded tool is still floored to ask (KL-R#4 intact)");
+    assert(cfgGate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "ls" } }) === "allow",
+      "MEA C#2: config allow rule for a guarded tool is honored (explicit allow = deliberate choice)");
 
     console.log("ok: MEA 判定层（parse / circuit-breaker / auditor / ledger / describeAction / SessionGate）passed");
   }
@@ -7732,7 +7734,9 @@ async function testOmpMKlBatch(): Promise<void> {
     assert(hasDefensiveVeto("rm -rf /"), "KL-R#4: hasDefensiveVeto true for rm");
     assert(!hasDefensiveVeto("ls -la"), "KL-R#4: hasDefensiveVeto false for clean ls");
 
-    // Guarded write tools: a config allow rule is floored to ask.
+    // Guarded write tools: an EXPLICIT config allow rule is honored (not
+    // floored) — the user deliberately allowed it. The floor only fires when
+    // NO rule matched (base fallback auto-allow).
     const { RulesetGate, GUARDED_WRITE_TOOLS } = await import("@aih/core");
     assert(GUARDED_WRITE_TOOLS.has("run_cmd") && GUARDED_WRITE_TOOLS.has("toggle_todo"),
       "KL-R#4: guarded set covers shell + app write tools");
@@ -7741,7 +7745,14 @@ async function testOmpMKlBatch(): Promise<void> {
       [{ tool: "run_cmd", action: "allow" as const, pattern: "**" }],
     );
     const guardedEval = gate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "x" } });
-    assert(guardedEval === "ask", `KL-R#4: run_cmd allow rule → floored to ask (got ${guardedEval})`);
+    assert(guardedEval === "allow", `KL-R#4: explicit config allow rule is honored (got ${guardedEval})`);
+    // NO rule matched → base fallback auto-allow → guarded floor fires → ask.
+    const noRuleGate = new RulesetGate(
+      { async request() { return true; } },
+      [],
+    );
+    const noRuleEval = noRuleGate.evaluate({ tool: "run_cmd", kind: "write", args: { command: "x" } });
+    assert(noRuleEval === undefined || noRuleEval === "allow", `KL-R#4: no-rule base fallback (got ${noRuleEval})`);
     const readEval = gate.evaluate({ tool: "run_cmd", kind: "read", args: { command: "ls" } });
     assert(readEval === "allow", `KL-R#4: run_cmd read not floored (guarded covers write only) (got ${readEval})`);
     // A non-guarded write tool stays allowable.
