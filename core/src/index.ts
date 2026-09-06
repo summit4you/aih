@@ -23,6 +23,7 @@ export {
   stampSessionVersion,
 } from "./schema-version.js";
 export { AgentLoop, estimateTokensText, buildFileManifest, renderFileManifest, MAX_FILE_MANIFEST_ENTRIES } from "./agent-loop.js";
+export { estimateTokens as estimateTokensFamily, estimateTokensArray, cheapProbeSafe } from "./tokenizer.js";
 export type { AgentLoopOptions } from "./agent-loop.js";
 export {
   BudgetTracker,

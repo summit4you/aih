@@ -393,6 +393,9 @@ export class AgentLoop {
   #tripwireFired = false;
   /** CC#60 — "tty" | "injected"; injected turns cannot approve asks. */
   #inputSource: "tty" | "injected" = "tty";
+  /** OCL-R#2 — session generation fence: incremented on /restore, /session switch.
+   * In-flight commands from a stale generation are rejected. */
+  #generation = 0;
   #inbox: string[] = [];
   /** P#35 — user steering messages queued mid-turn; drained before the next LLM call. */
   #steering: string[] = [];
@@ -426,6 +429,16 @@ export class AgentLoop {
     this.#onTripwire = options.onTripwire;
     this.#sensors = options.sensors;
     this.#onEscalate = options.onEscalate;
+  }
+
+  /** OCL-R#2 — bump the session generation fence. Call on /restore, /session switch. */
+  bumpGeneration(): void {
+    this.#generation += 1;
+  }
+
+  /** OCL-R#2 — current generation (for stale-command detection). */
+  getGeneration(): number {
+    return this.#generation;
   }
 
   /**

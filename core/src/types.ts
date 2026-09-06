@@ -233,6 +233,12 @@ export type SessionEvent =
        * you what the code looked like. Absent when git is unavailable.
        */
       worktree?: WorktreeSummary;
+      /**
+       * PI-R#1 — resume pointer: the last committed step id + intent summary.
+       * On restore, validate state matches intent (goal/todo snapshot);
+       * mismatch → refuse or inject re-alignment. Absent when not available.
+       */
+      resumePointer?: { stepId?: string; intent?: string };
     }
   | {
       seq: number;

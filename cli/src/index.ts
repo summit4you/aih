@@ -3141,10 +3141,13 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         tui.pushSystem("finish the current turn before checkpointing");
         return;
       }
+      // PI-R#1 — resume pointer: capture the current goal + todo state as intent.
+      const rpIntent = goalCondition ? `goal: ${goalCondition}` : undefined;
       const cp = log.checkpoint(
         note || undefined,
         usedTokens || undefined,
         gitStatusSummary({ cwd: process.cwd() }),
+        rpIntent ? { intent: rpIntent } : undefined,
       );
       store?.save(log);
       const wtLines = cp.worktree ? formatWorktreeSummary(cp.worktree) : [];
@@ -3220,6 +3223,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         snapshot = snapName;
       }
       log.adopt(restored);
+      loop.bumpGeneration(); // OCL-R#2: stale-generation fence
       tui.clearItems();
       replayHistory(tui, restored.all());
       store?.save(log);
@@ -3228,10 +3232,22 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       // snapshot from the restored prefix and re-apply it to .aih/todos.json.
       const rolledTodos = todoStateFromLog(log.all(), target.seq);
       if (rolledTodos) applyTodoState(process.cwd(), rolledTodos);
+      // PI-R#1 — intent validation: if the checkpoint carried a goal intent,
+      // check whether the current goal still matches. Mismatch → advisory note.
+      const rpIntent = target.resumePointer?.intent;
+      let intentNote = "";
+      if (rpIntent) {
+        if (goalCondition && !goalCondition.includes(rpIntent.replace(/^goal:\s*/, ""))) {
+          intentNote = `\n⚠ checkpoint intent was "${rpIntent}" but current goal is "${goalCondition}" — verify alignment before continuing`;
+        } else if (!goalCondition) {
+          intentNote = `\nℹ checkpoint intent was "${rpIntent}" (no active goal now)`;
+        }
+      }
       tui.pushSystem(
         `restored to checkpoint #${target.seq}${target.note ? ` — ${target.note}` : ""}\n` +
           `context now rolls back to that point; the discarded suffix was snapshotted to ${snapshot || "(ephemeral — no session file)"} for audit` +
-          (rolledTodos ? `\ntodo state rolled back with the timeline (${rolledTodos.length} entr${rolledTodos.length === 1 ? "y" : "ies"})` : ""),
+          (rolledTodos ? `\ntodo state rolled back with the timeline (${rolledTodos.length} entr${rolledTodos.length === 1 ? "y" : "ies"})` : "") +
+          intentNote,
       );
       return;
     }

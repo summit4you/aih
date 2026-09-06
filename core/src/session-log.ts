@@ -211,12 +211,14 @@ export class SessionLog {
     note?: string,
     contextTokens?: number,
     worktree?: WorktreeSummary,
+    resumePointer?: { stepId?: string; intent?: string },
   ): SessionEvent & { type: "checkpoint" } {
     return this.append({
       type: "checkpoint",
       ...(note ? { note } : {}),
       ...(contextTokens != null ? { contextTokens } : {}),
       ...(worktree ? { worktree } : {}),
+      ...(resumePointer ? { resumePointer } : {}),
     }) as SessionEvent & { type: "checkpoint" };
   }
 
