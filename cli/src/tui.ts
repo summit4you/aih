@@ -1705,7 +1705,10 @@ constructor(opts: TuiOptions) {
     const pw = this.#panelWidth();
     const w = pw ? Math.max(20, this.#cols - pw - Tui.PANEL_GAP) : this.#cols;
     const k = this.#inputLineCount(w);
-    return Math.max(1, this.#rows - 8 - k);
+    // Fixed bottom rows: pad-above + box-top + box-bottom + pad-below +
+    // hints + status = 6 (the separate meta box row and dashed separator were
+    // folded into the status line, dropping 2).
+    return Math.max(1, this.#rows - 6 - k);
   }
 
   #inputLineCount(width: number): number {
@@ -1982,14 +1985,21 @@ constructor(opts: TuiOptions) {
   }
 
   /**
-   * Context-usage bar. Uses only ASCII fill (`#`/`-`) — block chars (█░) are
-   * ambiguous-width under legacy Windows console GBK codepages where they
-   * render as two cells each and misalign the panel. opencode uses a plain
-   * text line ("N tokens · X% used"); we keep a compact bar AND the text.
+   * Pure fill for the context-usage bar (testable without a platform mock).
+   * Block chars (█ filled / ░ empty) on modern terminals — the classic
+   * attractive bar. Legacy Windows conhost (GBK codepage) renders block chars
+   * as two cells each and misaligns the panel, so `legacy=true` falls back to
+   * ASCII #/-. opencode uses a plain text line ("N tokens · X% used"); we keep
+   * a compact bar AND the text.
    */
-  #progressBar(pct: number, width: number): string {
+  static bar(pct: number, width: number, legacy: boolean): string {
     const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
-    const bar = "#".repeat(filled) + "-".repeat(width - filled);
+    const [F, E] = legacy ? ["#", "-"] : ["█", "░"];
+    return F.repeat(filled) + E.repeat(width - filled);
+  }
+
+  #progressBar(pct: number, width: number): string {
+    const bar = Tui.bar(pct, width, this.#legacyWin);
     if (pct >= 95) return danger(bar);
     if (pct >= 80) return warn(bar);
     return success(bar);
@@ -2382,7 +2392,10 @@ constructor(opts: TuiOptions) {
     else if (this.#question) hint = "enter answer · esc cancel";
     else if (this.#opts.busy()) hint = "esc escape twice to cancel · enter queues";
     else hint = "? help · /commands · ctrl-p palette · tab complete";
-    const left = dim(`${this.#opts.cwd}   ${hint}`);
+    // Scroll-back indicator (used to ride the now-removed dashed separator
+    // row): shown on the hints row when scrolled up from the bottom.
+    const tag = this.#scrollTop > 0 ? `  ↑${this.#scrollTop}` : "";
+    const left = dim(`${this.#opts.cwd}   ${hint}${tag}`);
     if (!usage) return this.#clip(left, width);
     const right = usage;
     const pad = Math.max(1, width - cols(left) - cols(right) - 1);
@@ -2390,6 +2403,10 @@ constructor(opts: TuiOptions) {
   }
 
   #statusRow(width: number): string {
+    // The session identity (agent · model · provider) lives here now — folded
+    // into the single bottom status line (opencode/mimo-code style) instead of
+    // a separate boxed meta row above the footer.
+    const meta = this.#metaContent();
     const b = this.#opts.statusBadge?.() ?? null;
     const badge = b ? `${b.ok ? success(b.glyph) : danger(b.glyph)} ${muted(b.label)}` : "";
     // IT#2 — shell-failure indicator (red when a run_cmd failed; hidden when green).
@@ -2415,10 +2432,11 @@ constructor(opts: TuiOptions) {
         : "";
     const l =
       pending +
-      (badge ? `${badge}${muted("  ")}` : "") +
-      (shellBadge ? `${shellBadge}${muted("  ")}` : "") +
-      jobSeg +
-      (this.#opts.statusLeft ? muted(this.#opts.statusLeft) : "");
+      meta +
+      (badge ? `${muted("  ")}${badge}` : "") +
+      (shellBadge ? `${muted("  ")}${shellBadge}` : "") +
+      (jobSeg ? `${muted("  ")}${jobSeg}` : "") +
+      (this.#opts.statusLeft ? `${muted("  ")}${muted(this.#opts.statusLeft)}` : "");
     const r = this.#opts.statusRight ? muted(this.#opts.statusRight) : "";
     const pad = Math.max(1, width - cols(l) - cols(r) - 1);
     return this.#clip(`${l}${" ".repeat(Math.min(pad, 200))}${r}`, width);
@@ -2570,8 +2588,10 @@ constructor(opts: TuiOptions) {
       // vertically over the body area; right panel border stays put.
       const { lines: box, width: bw } = this.#paletteBox(leftW);
       const padLeft = Math.max(0, ((leftW - bw) >> 1));
-      // center over the full window minus the ~9-row input/footer block
-      const freeRows = Math.max(box.length, this.#rows - 9);
+      // center over the full window minus the ~7-row input/footer block
+      // (6 fixed rows + 1 input row; was 9 before the meta box row folded
+      // into the status line)
+      const freeRows = Math.max(box.length, this.#rows - 7);
       const padTop = Math.max(0, ((freeRows - box.length) >> 1));
       for (let i = 0; i < view; i += 1) {
         const bi = i - padTop;
@@ -2623,11 +2643,11 @@ constructor(opts: TuiOptions) {
     }
     rows.push(row(this.#boxLine("", leftW)));
     rows.push(row("")); // padding below the input box (see comment above)
-    rows.push(row(this.#boxLine(this.#metaContent(), leftW)));
-
-    const tag = this.#scrollTop > 0 ? ` ↑${this.#scrollTop}` : "";
-    rows.push(row(`${dim("-".repeat(Math.max(1, leftW - cols(tag))))}${tag ? dim(tag) : ""}`));
-
+    // The meta line (agent · model · provider) used to be a separate boxed
+    // row with its own BOX_BG surface here — a black bar visually splitting
+    // the input box from the footer. opencode/mimo-code fold that identity
+    // info into the single bottom status line; we do the same (see
+    // #statusRow), dropping the box row AND the dashed separator row.
     rows.push(row(this.#hintsRow(leftW)));
     rows.push(row(this.#statusRow(leftW)));
 
@@ -2639,7 +2659,12 @@ constructor(opts: TuiOptions) {
     // to full width, so a shorter replacement overwrites its old tail.
     const prevLen = this.#lastLines.length;
     const curRow = Math.max(1, cursorIdx + 1);
-    const curCol = Math.min(width - 1, 4 + cols((il.segs[il.ci] ?? "").slice(0, il.col)));
+    // Text starts at 0-based offset 5: ┃(1) + 2 spaces(2) + prompt(2: "❯ "/"⠋ ").
+    // The `4` was correct when #boxLine used ┃+1 space (v≤0.7.0); the v0.7.1
+    // 2-space padding shifted the text right by one cell but the constant was
+    // left stale, so the cursor landed one cell LEFT — on the last typed char
+    // instead of the next input position (the reported Linux bug).
+    const curCol = Math.min(width - 1, 5 + cols((il.segs[il.ci] ?? "").slice(0, il.col)));
     if (
       !this.#clearNext &&
       prevLen === lines.length &&

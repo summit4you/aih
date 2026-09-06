@@ -3560,10 +3560,16 @@ await srv.connect(new StdioServerTransport());
   assert(costIdx >= 0, "F#30 panel: cost line present");
   assert(panel[costIdx] === "cost 0.01", `F#30 panel: cost alone on its line (got ${panel[costIdx]})`);
   assert(speedIdx === costIdx + 1, `F#30 panel: throughput directly under cost (got gap ${speedIdx - costIdx})`);
-  // Windows GBK fix: the usage bar must stay ASCII (#/-), never block chars
-  // (█░) which legacy conhost renders as two cells each and misaligns.
-  const barIdx = panel.findIndex((l) => /^[#-]+$/.test(l));
-  assert(barIdx >= 0 && !/[█░▁▂▃▄▅▆▇]/.test(panel[barIdx] ?? ""), `F#30 panel: usage bar is ASCII #/- (got ${panel[barIdx]})`);
+  // Usage bar: modern terminals use block chars (█ filled / ░ empty) — the
+  // classic attractive bar. Legacy Windows conhost (GBK) falls back to ASCII
+  // #/- (block chars render as two cells each and misalign the panel). Both
+  // branches are pure (Tui.bar), so assert them directly.
+  const barIdx = panel.findIndex((l) => /^[█░]+$/.test(l));
+  assert(barIdx >= 0 && !/[#-]/.test(panel[barIdx] ?? ""), `panel: usage bar is block █/░ on modern terminals (got ${panel[barIdx]})`);
+  assert(Tui.bar(50, 10, false) === "█████░░░░░", "Tui.bar modern: 50% → █×5 ░×5");
+  assert(Tui.bar(50, 10, true) === "#####-----", "Tui.bar legacy: 50% → #×5 -×5 (conhost GBK fallback)");
+  assert(Tui.bar(0, 8, false) === "░░░░░░░░" && Tui.bar(100, 8, false) === "████████", "Tui.bar modern: 0%/100% edges");
+  assert(Tui.bar(150, 8, false) === "████████" && Tui.bar(-5, 8, false) === "░░░░░░░░", "Tui.bar clamps out-of-range pct");
   assert(
     panel[speedIdx] === "143 tok/s · stream 38.5 tok/s",
     `F#30 panel: tps + stream tps share ONE line (got ${panel[speedIdx]})`,
