@@ -610,7 +610,17 @@ constructor(opts: TuiOptions) {
     process.stdin.on("data", (data: Buffer) => this.#feed(data.toString("utf8")));
     process.stdout.on("resize", () => {
       this.#clearNext = true;
-      this.requestPaint();
+      // Legacy conhost (Win10/11 without Windows Terminal) crashes on
+      // synchronized-output + clear-screen during buffer reallocation.
+      // Delay the paint so conhost finishes resizing before we write.
+      const delay = this.#legacyWin ? 250 : 16;
+      if (this.#paintTimer) clearTimeout(this.#paintTimer);
+      this.#paintScheduled = true;
+      this.#paintTimer = setTimeout(() => {
+        this.#paintScheduled = false;
+        this.#paintTimer = null;
+        this.#paint();
+      }, delay);
     });
     process.on("exit", this.#restore);
     this.#running = true;
@@ -624,8 +634,11 @@ constructor(opts: TuiOptions) {
     // Terminal / VS Code get the full set.
     const legacyWin = process.platform === "win32" && !process.env.WT_SESSION && !process.env.TERM_PROGRAM;
     this.#legacyWin = legacyWin;
-    const modes = legacyWin ? `${CSI}?1049h` : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
-    process.stdout.write(modes);
+    // Legacy conhost: NO alt-screen (?1049) — its resize handler has a buffer
+    // overflow bug that crashes when the TUI writes during reallocation.
+    // No mouse tracking, no bracketed paste (conhost predates both).
+    const modes = legacyWin ? "" : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
+    if (modes) process.stdout.write(modes);
     this.#timer = setInterval(this.#tick, 120);
     this.#paint();
   }
@@ -639,7 +652,9 @@ constructor(opts: TuiOptions) {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`);
+    // Legacy conhost: no alt-screen/mouse to restore — just show cursor.
+    const restore = this.#legacyWin ? SHOW : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`;
+    process.stdout.write(restore);
   }
 
   requestPaint(): void {
@@ -2694,7 +2709,10 @@ constructor(opts: TuiOptions) {
       process.stdout.write(`${CSI}${curRow};${curCol + 1}H`);
       return;
     }
-    let out = `${CSI}?2026h${HIDE}${CSI}H`;
+    // Synchronized output (?2026) is unsupported on legacy conhost and can
+    // trigger buffer overflow during resize — skip it there.
+    const sync = this.#legacyWin ? "" : `${CSI}?2026h`;
+    let out = `${sync}${HIDE}${CSI}H`;
     if (this.#clearNext) out += `${CSI}2J`;
     const panelCol = width - pw + 1;
     for (let i = 0; i < rows.length; i += 1) {
@@ -2709,7 +2727,8 @@ constructor(opts: TuiOptions) {
     }
     this.#lastLines = lines;
     this.#clearNext = false;
-    out += `${CSI}${curRow};${curCol + 1}H${SHOW}${CSI}?2026l`;
+    const syncEnd = this.#legacyWin ? "" : `${CSI}?2026l`;
+    out += `${CSI}${curRow};${curCol + 1}H${SHOW}${syncEnd}`;
     process.stdout.write(out);
   }
 }
