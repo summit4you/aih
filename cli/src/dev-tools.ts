@@ -274,7 +274,10 @@ export async function runShellCommand(
     timeoutMs,
   });
   let outputFile: string | undefined;
-  if (input.keep_output === true) {
+  // CC-R#1: auto-persist when output exceeds the inline cap (or keep_output).
+  // The user gets `output_file` back and can re-read via read_file / /find.
+  const shouldPersist = input.keep_output === true || Buffer.byteLength(output) > MAX_OUT;
+  if (shouldPersist) {
     const dest = input.output_path
       ? safePath(cwd, String(input.output_path))
       : join(cwd, ".aih", "outputs", `cmd-${Date.now()}-${randomUUID().slice(0, 8)}.log`);
@@ -283,7 +286,7 @@ export async function runShellCommand(
       writeFileSync(dest, output);
       outputFile = dest;
     } catch {
-      /* keep_output is best-effort; the in-band stdout below still returns */
+      /* best-effort; the in-band stdout below still returns */
     }
   }
   const { text: stdout, truncated, elidedChars } = truncateMiddle(output, MAX_OUT);

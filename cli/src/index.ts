@@ -2821,7 +2821,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         const meta: string[] = [];
         if (r.timed_out) meta.push(`timed out (${Math.round(durMs / 1000)}s)`);
         else meta.push(`exited ${r.code} in ${(durMs / 1000).toFixed(1)}s`);
-        if (r.truncated) meta.push("output truncated — append keep_output (e.g. `!ls | tee /x`) or use run_cmd keep_output=true for the full log");
+        if (r.truncated) {
+          if (r.output_file) meta.push(`output truncated — full log: read_file ${r.output_file} · /find <text>`);
+          else meta.push("output truncated — use run_cmd keep_output=true for the full log");
+        }
         if (r.scan?.externalDirs?.length) meta.push(`touches outside workspace: ${r.scan.externalDirs.join(", ")}`);
         tui.push({ role: "tool", text: out, tool: { name: "shell", args: `! ${cmd}`, callId, ok: r.code === 0 } });
         tui.pushSystem(`${icon} ${cmd} · ${meta.join(" · ")}`);
