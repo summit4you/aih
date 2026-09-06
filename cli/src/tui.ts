@@ -643,6 +643,12 @@ constructor(opts: TuiOptions) {
       ? `${CSI}?1000h${CSI}?1006h${CSI}?2004h`
       : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
     process.stdout.write(modes);
+    if (legacyWin) {
+      this.pushSystem(
+        "conhost detected — for full mouse/paste/alt-screen, use Windows Terminal (Microsoft Store). " +
+        "Keyboard: Enter/o = expand/collapse · right-click = paste"
+      );
+    }
     this.#timer = setInterval(this.#tick, 120);
     this.#paint();
   }
