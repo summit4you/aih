@@ -25,6 +25,8 @@ export interface SubagentOptions {
   maxSteps?: number;
   /** working dir for spilling over-length answers (default ".") */
   cwd?: string;
+  /** CL-R#4 — abort signal: parent cancel → subagent cancels outstanding work. */
+  signal?: AbortSignal;
 }
 
 export interface SubagentResult {
@@ -35,6 +37,8 @@ export interface SubagentResult {
   truncated?: boolean;
   /** FB#5 — where the FULL answer was spilled (present when `truncated`). */
   fullOutputPath?: string;
+  /** CL-R#4 — true when the subagent was cancelled by a parent abort signal. */
+  cancelled?: boolean;
 }
 
 /**
@@ -76,6 +80,10 @@ export function answerCapLimit(): number {
  * assistant answer.
  */
 export async function runSubagent(o: SubagentOptions, prompt: string): Promise<SubagentResult> {
+  // CL-R#4 — abort check before starting
+  if (o.signal?.aborted) {
+    return { answer: "", steps: 0, stopReason: "cancelled", cancelled: true };
+  }
   const parent = o.toolsProvider();
   if (!parent) throw new Error("subagent has no parent tool registry");
   // KL-R#3 — subagent permission inheritance (see makeSubagentGate): parent's
@@ -237,6 +245,14 @@ export async function bestOfN(
       : prompt;
   const cap = Math.max(1, Number(process.env.AIH_TOOL_CONCURRENCY ?? "") || 4);
   const limit = Math.min(n, cap);
+  // CL-R#4 — abort check before starting any candidates
+  if (opts.signal?.aborted) {
+    return {
+      description, n, concurrency: limit,
+      candidates: Array.from({ length: n }, (_, i) => ({ index: i, ok: false, answer: "", steps: 0, stopReason: "cancelled" })),
+      best: -1, judgeReason: "aborted before start", answer: "",
+    };
+  }
   const candidates: Candidate[] = await mapOrdered(
     Array.from({ length: n }, (_, i) => async () => {
       try {
