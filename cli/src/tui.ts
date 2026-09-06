@@ -646,7 +646,15 @@ constructor(opts: TuiOptions) {
     if (legacyWin) {
       this.pushSystem(
         "conhost detected — for full mouse/paste/alt-screen, use Windows Terminal (Microsoft Store). " +
-        "Keyboard: Enter/o = expand/collapse · right-click = paste"
+        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse · right-click = paste"
+      );
+    } else if (process.platform === "win32") {
+      // Windows Terminal: mouse tracking enabled, but wheel is intercepted
+      // by the terminal for its own scrollback. Tell the user how to fix.
+      this.pushSystem(
+        "Windows Terminal: mouse click works, but wheel scrolls the terminal's scrollback. " +
+        "To forward wheel to aih: settings.json → \"mouseTracking\": \"always\". " +
+        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
       );
     }
     this.#timer = setInterval(this.#tick, 120);
