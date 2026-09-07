@@ -1,6 +1,10 @@
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh.md">简体中文</a>
+</p>
+
 <h1 align="center">AIH — App Intelligence Harness</h1>
 
-<p align="center"><strong>让任意普通应用（Web / 桌面 / 移动 / 后端服务）通过标准化接入获得 AI 能力的通用框架。</strong></p>
+<p align="center"><strong>A general framework that gives any ordinary app (Web / Desktop / Mobile / backend service) AI capabilities through a standardized adapter.</strong></p>
 
 <p align="center">
   <a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a> · <a href="https://github.com/anomalyco/opencode">opencode</a> · MIT
@@ -8,10 +12,10 @@
 
 ---
 
-AIH（App Intelligence Harness）把"应用接入智能体"这件事标准化：实现一个轻量的
-`AppAdapter`（读 Context / 写 Action / 收 Event），你的业务应用就获得了
-allow/ask/deny 三级权限、append-only 会话审计、可插拔技能层与三种接入形态
-（MCP 外挂 / CLI / 内嵌 SDK）——不需要改动任何业务代码。
+AIH (App Intelligence Harness) standardizes "connecting an app to an agent": implement a lightweight
+`AppAdapter` (read Context / write Action / receive Event), and your business app gains
+three-tier allow/ask/deny permissions, append-only session audit, a pluggable skill layer and
+three integration forms (MCP plugin / CLI / embedded SDK) — **without changing any business code**.
 
 ---
 
@@ -29,574 +33,600 @@ curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install
 irm https://raw.githubusercontent.com/summit4you/aih/main/scripts/install.ps1 | iex
 ```
 
-**Options**: `--version <ver>` (指定版本)、`--dir <path>` (自定义目录)、`--no-modify-path`
+**Options**: `--version <ver>` (pin a version), `--dir <path>` (custom install dir), `--no-modify-path`
 
-**From source** (开发者):
+**Offline installers** (fully self-contained, no network needed): download `aih-<version>-offline.sh`
+(macOS/Linux) or `aih-<version>-offline.ps1` (Windows) from the
+[releases page](https://github.com/summit4you/aih/releases), then run
+`sh aih-*-offline.sh` / `powershell -ep Bypass -File aih-*-offline.ps1`.
+
+**From source** (developers):
 
 ```sh
 git clone https://github.com/summit4you/aih && cd aih
-npm run bootstrap   # 安装依赖
-npm run doctor      # 就绪检查
-npm run check       # 构建 + 契约一致性校验
-npm test            # 冒烟测试（core / mcp / cli）
-npm run eval        # 完整交接门禁（doctor + bootstrap + check + test）
+npm run bootstrap   # install dependencies
+npm run doctor      # readiness check
+npm run check       # build + contract consistency check
+npm test            # smoke tests (core / mcp / cli)
+npm run eval        # full handoff gate (doctor + bootstrap + check + test)
 ```
 
 ```sh
-# 直接运行 aih 进入交互终端（opencode 风格 TUI，需 TTY）
+# Run aih directly to enter the interactive terminal (opencode-style TUI, needs TTY)
 aih
 
-# 一次性问答（--mock 离线演示，无需 API key）
+# One-shot Q&A (--mock offline demo, no API key needed)
 npm run cli -- run "add a todo buy milk" --mock
 
-# 真实模型（任意 OpenAI 兼容接口，支持 SSE 流式输出）
+# Real model (any OpenAI-compatible endpoint, SSE streaming)
 AIH_BASE_URL=https://api.deepseek.com/v1 \
 AIH_MODEL=deepseek-chat \
-AIH_API_KEY=sk-... npm run cli -- run "今天有哪些待办？"
+AIH_API_KEY=sk-... npm run cli -- run "what todos do I have today?"
 ```
 
 ---
 
 ## Core Features
 
-AIH 的四层内核把"接入"拆成职责分明的层级，与 deepseek-harness / opencode 的
-设计融合点如下：
+AIH's four-layer kernel splits "integration" into clearly separated responsibilities, fusing
+design ideas from deepseek-harness / opencode:
 
-| 来源 | 借鉴 | 落点 |
+| Source | Borrowed | Landing |
 |---|---|---|
-| [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | append-only Session Log（"模型可见即可回放"）、守卫式工具管线、Agent Loop、可替换能力接缝（Seam） | `core/`（L1 内核） |
-| [Harness-for-codex](https://github.com/ganimjeong/Harness-for-codex) | AGENTS.md 式指令契约、标准命令（bootstrap/check/test/eval/doctor）、任务简报与决策日志 | `APP.md`、`harness.yml`、`scripts/`、`tasks/`、`docs/`（L2 规程） |
-| open agent skills 生态 | SKILL.md 渐进披露、技能自进化 | `skills/`（L3 技能层） |
+| [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | append-only Session Log ("what the model sees can be replayed"), guarded tool pipeline, Agent Loop, replaceable capability seams | `core/` (L1 kernel) |
+| [Harness-for-codex](https://github.com/ganimjeong/Harness-for-codex) | AGENTS.md-style instruction contract, standard commands (bootstrap/check/test/eval/doctor), task briefs & decision logs | `APP.md`, `harness.yml`, `scripts/`, `tasks/`, `docs/` (L2 protocol) |
+| open agent skills ecosystem | SKILL.md progressive disclosure, self-evolving skills | `skills/` (L3 skill layer) |
 
-### L0 接入层（AppAdapter）
+### L0 Adapter Layer (AppAdapter)
 
-实现一个 `AppAdapter` 即可接入任意应用：`descriptor` + `context(query)` +
-`actions`（动作参数用 zod 定义）。三个原语：
+Implement one `AppAdapter` to integrate any app: `descriptor` + `context(query)` +
+`actions` (action params defined with zod). Three primitives:
 
-| 原语 | 含义 |
+| Primitive | Meaning |
 |---|---|
-| **Context** | 读操作，`allow` 级，直接执行 |
-| **Action** | 写操作，带 `allow/ask/deny` 权限 |
-| **Event** | 变更事件流，可选 |
+| **Context** | Read, `allow` tier, executes directly |
+| **Action** | Write, carries `allow/ask/deny` permission |
+| **Event** | Change-event stream, optional |
 
-### 三种接入形态
+### Three Integration Forms
 
-| 形态 | 场景 | 入口 |
+| Form | Scenario | Entry |
 |---|---|---|
-| **MCP 外挂**（零侵入，推荐起步） | 挂进 opencode / codex / claude code 等任何 MCP 客户端 | `mcp-server/dist/index.js` |
-| **CLI 接入** | 交互终端、一次性问答、脚本管道 | `aih` / `aih run` / `aih chat` |
-| **内嵌 Copilot**（SDK） | 直接复用 L1 内核，把工具注册进 `AgentLoop` | `@aih/core` |
+| **MCP plugin** (zero-intrusion, recommended start) | Plug into any MCP client: opencode / codex / claude code | `mcp-server/dist/index.js` |
+| **CLI integration** | Interactive terminal, one-shot Q&A, script pipelines | `aih` / `aih run` / `aih chat` |
+| **Embedded Copilot** (SDK) | Reuse the L1 kernel directly, register tools into `AgentLoop` | `@aih/core` |
 
-### serve / attach（远程模式）
+### serve / attach (remote mode)
 
-`aih serve` 把 harness（MCP + loop）跑成无头 HTTP/SSE 服务，解决 SSH 卡顿、
-让 UI 与后端分离：
+`aih serve` runs the harness (MCP + loop) as a headless HTTP/SSE service, solving SSH
+latency and separating UI from backend:
 
 ```sh
-aih serve --port 8787 --session work   # 无头跑 harness（MCP + loop）
-aih attach http://127.0.0.1:8787       # 从另一台机器 attach 一个 REPL
+aih serve --port 8787 --session work   # headless harness (MCP + loop)
+aih attach http://127.0.0.1:8787       # attach a REPL from another machine
 ```
 
-- `GET /health`：就绪检查（工具数 / 会话名 / 版本）
-- `GET /events`：SSE 事件流（含流式 `app/event` 增量帧）
-- `POST /message`：提交一轮，返回结构化结果
-- `GET /tools`：列出当前工具集
-- `aih attach` 是 SSE 客户端：回放既有事件 + 实时续接，可选 `--min-events` /
-  `--timeout`；`attachInteractive` 提供 REPL。实现：`cli/src/serve.ts`。
+- `GET /health`: readiness (tool count / session name / version)
+- `GET /events`: SSE event stream (incl. streaming `app/event` delta frames)
+- `POST /message`: submit a turn, returns a structured result
+- `GET /tools`: list the current toolset
+- `aih attach` is an SSE client: replays existing events + live tail, optional `--min-events` /
+  `--timeout`; `attachInteractive` provides a REPL. Implementation: `cli/src/serve.ts`.
 
-### Multiple Agents（build / plan）
+### Multiple Agents (build / plan)
 
-对齐 opencode 的 build/plan 分工：
+Aligned with opencode's build/plan split:
 
-- **build**：默认，全量工具权限用于开发
-- **plan**：只读分析模式，全部 `kind=write` 工具从注册表隐藏
-  （含 write_file/run_cmd），meta 行显示 `plan · …`（黄色）
+- **build**: default, full tool permissions for development
+- **plan**: read-only analysis mode, all `kind=write` tools are hidden from the registry
+  (incl. write_file/run_cmd), meta line shows `plan · …` (yellow)
 
-Tab（无补全时）或 `/mode <build|plan>` 切换。
+Switch with Tab (when no completion) or `/mode <build|plan>`.
 
 ### Goal / Stop Condition
 
-`/goal <条件>` 后每轮结束由一次独立 LLM 调用裁判条件是否真满足——满足即停
-（`✅ goal met`），不满足自动注入续跑指令再战，最多 `AIH_GOAL_ROUNDS`（默认 3）
-个额外轮次；`/goal clear` 取消。防"乐观停止"，是批量操作/巡检类任务的关键可靠性开关。
+After `/goal <condition>`, an independent LLM call judges whether the condition is truly met
+at the end of each round — met stops (`✅ goal met`), not-met auto-injects a continuation
+prompt and tries again, up to `AIH_GOAL_ROUNDS` (default 3) extra rounds; `/goal clear`
+cancels. Prevents "optimistic stopping"; a key reliability switch for batch/inspection tasks.
 
-裁判 prompt 内嵌**完成诚实规则**（借鉴 LongHorizon-Harness 的 Final-State Guard 与
-Task Contract，arXiv 2608.01964）：agent 自述"已完成"不算证据，必须从对话中的真实
-状态载体（工具读回的文件内容、命令退出码、测试输出）判定；支持扩展裁决
-`{"met": bool, "reason": str, "unmet": [...]}`——未满足的验收标准会注入续跑指令，
-要求逐项对照持久化状态重新验证。系统提示同样附带该守卫；`/goal` 设置时会回显
-结构化契约模板（Objective / Acceptance criteria / Constraints / Current state /
-Next move）。
+The judge prompt embeds **completion honesty rules** (borrowing LongHorizon-Harness's
+Final-State Guard and Task Contract, arXiv 2608.01964): the agent's own claim of "done" is
+not evidence — it must be judged from real state carriers in the conversation (file contents
+read back by tools, command exit codes, test output); supports extended verdicts
+`{"met": bool, "reason": str, "unmet": [...]}` — unmet acceptance criteria are injected
+back as continuation instructions requiring item-by-item re-verification against persisted
+state. The system prompt carries the same guard; `/goal` echoes a structured contract
+template (Objective / Acceptance criteria / Constraints / Current state / Next move).
 
-**契约式写法示例**——把模糊目标写成"可验证的目标状态"，三要素：
-什么算完成（状态载体）、怎么验证（可执行检查）、什么不能动（约束）：
+**Contract-style example** — turning a vague goal into a "verifiable target state", three
+elements: what counts as done (state carrier), how to verify (executable check), what must
+not change (constraint):
 
 ```
-/goal 目标：修复 cli/src/gate.ts 中 deny 规则不生效的问题
-验收标准：
-1. npm test 全绿（读回退出码）
-2. node -e "new Gate().request('write_file')" 返回 denied
-约束：不要改动 core/src/ 下任何文件；保持现有导出签名不变
+/goal Fix the bug where deny rules in cli/src/gate.ts don't take effect
+Acceptance criteria:
+1. npm test all green (read back exit code)
+2. node -e "new Gate().request('write_file')" returns denied
+Constraints: don't touch any file under core/src/; keep existing export signatures
 ```
 
-一行简写也可以：`/goal README.md 中出现 "v0.2.0 发布说明" 一节；cat README.md 可见；
-其他章节不变`。验证方式尽量写成能出真实证据的命令（`npm test`、`grep … file`），
-而不是"看起来对"。不设置 `/goal` 时行为与之前一致，仅系统提示多约 550 tokens 的
-守卫规则；Goal 裁判零开销（未设置时直接跳过）。
+One-liners also work: `/goal README.md contains a section "v0.2.0 release notes"; visible
+via cat README.md; other sections unchanged`. Write verification as commands that produce
+real evidence (`npm test`, `grep … file`) rather than "looks right". Without `/goal`, behavior
+is unchanged — the system prompt just carries ~550 tokens of guard rules; the goal judge
+costs nothing when unset.
 
-CLI 侧同样可用：`aih run --goal "<条件>" "<任务>"` 在非交互场景做有界自动续跑，
-裁判事件以结构化 `goal/judge` 类型写入会话日志（append-only JSONL，可审计回放）。
+CLI side works too: `aih run --goal "<condition>" "<task>"` does bounded auto-continuation
+non-interactively; judge events are written to the session log as structured `goal/judge`
+entries (append-only JSONL, auditable replay).
 
-#### MEA 独立判定层（写动作 Guardian + 完成 Auditor）
+#### MEA Independent Judgment Layer (write-action Guardian + completion Auditor)
 
-roadmap 最高优先级项（LH#1 LongHorizon Auditor + CX-R#1 codex Guardian 合并实施），
-为 AIH 补齐此前未实施的"独立判定角色"——主 agent 之外的第二双眼睛：
+The roadmap's highest-priority item (LH#1 LongHorizon Auditor + CX-R#1 codex Guardian
+merged) — filling AIH's previously unimplemented "independent judge" role, a second pair of
+eyes outside the main agent:
 
-- **写动作 Guardian（默认开启，接管 ask 流程）**：需批准（ask）的写操作在弹人工确认前，
-  先由独立无工具 LLM 按声明式 policy（`AIH_GUARDIAN_POLICY`，缺省内置 policy）评估
-  `risk × authorization → allow/deny/ask`。低风险 allow 自动放行不打扰、deny 拒绝并注入
-  "不得规避达成同一结果"、连续 deny≥3 触发 circuit-breaker 注入停止指令。**fail-closed**：
-  超时/解析失败/LLM 错误 → deny（`AIH_GUARDIAN_FAIL_CLOSED=1`），否则安全降级为人工确认。
-  无 API key/无可配 LLM 时自动降级回原人工 gate（零行为变化）——这是本地确定性的默认兜底。
-  用 `--no-guardian` 或 `AIH_GUARDIAN=0` 关闭。
-  **体验松绑三件套（2026-09-05）**：① 内置 policy 改为「workspace 常规写 = 低风险 → allow 倾向」，
-  只保留真正红线域（凭据/密钥、数据外泄、破坏性批量删除、策略规避）作为 deny 依据，从源头减少误 deny；
-  ② `AIH_GUARDIAN_TRUST=1` 信任模式——Guardian 的 allow 在**任意**风险级都直接放行（medium 不再回落人工），
-  deny 仍拦截；③ deny 时键盘弹 `[g] grant <scope>`——按一次即写入会话 allow 规则，同 scope 永久短路
-  Guardian 不再审（按 `[n]` 拒绝则仅本次拒绝）。
-- **完成产物 Auditor（/goal 独立验证）**：goal 裁判判 met 后，再由独立 Auditor LLM 依据
-  **verified-state ledger**（从会话日志采集真实工具输出，而非 agent 自述）审计真实产物，
-  产出 AuditReport；只有 `complete + contract_aligned + integrity≥0.9` 才算 trusted state，
-  发现缺失/阻塞则降级为 not-met 并注入续跑。交互 `/goal` 与 `aih run --goal` 两条路径均接入。
+- **Write-action Guardian (enabled by default, takes over the ask flow)**: before a human
+  confirmation prompt for a write op, an independent tool-less LLM evaluates
+  `risk × authorization → allow/deny/ask` against a declarative policy
+  (`AIH_GUARDIAN_POLICY`, built-in policy default). Low-risk allow passes without bothering
+  you; deny rejects and injects "do not circumvent to achieve the same outcome"; consecutive
+  denials ≥3 trigger a circuit-breaker stop directive. **fail-closed**: timeout / parse
+  failure / LLM error → deny (`AIH_GUARDIAN_FAIL_CLOSED=1`), otherwise degrades safely to
+  human confirmation. No API key / no configurable LLM → auto-degrades to the original human
+  gate (zero behavior change) — the local deterministic default. Disable with `--no-guardian`
+  or `AIH_GUARDIAN=0`.
+  **UX-relief trio (2026-09-05)**: (1) built-in policy treats "routine workspace writes =
+  low-risk → allow-leaning", keeping only real red lines (credentials/secrets, data
+  exfiltration, destructive bulk deletes, policy circumvention) as deny grounds, cutting
+  false denials at the source; (2) `AIH_GUARDIAN_TRUST=1` trust mode — Guardian's allow
+  passes at **any** risk level (medium no longer falls back to human), deny still blocks;
+  (3) on deny the keyboard prompt shows `[g] grant <scope>` — one keystroke writes a session
+  allow rule, permanently short-circuiting the Guardian for that scope (press `[n]` to reject
+  for this call only).
+- **Completion Auditor (/goal independent verification)**: after the goal judge rules met,
+  an independent Auditor LLM audits the real artifact against a **verified-state ledger**
+  (collected from real tool output in the session log, not agent self-narration) and produces
+  an AuditReport; only `complete + contract_aligned + integrity≥0.9` counts as a trusted
+  state — missing/blocked degrades to not-met with a resume injection. Both interactive
+  `/goal` and `aih run --goal` paths are wired in.
+### Deterministic Workflow (`.aih/workflows/*.mjs`)
 
-### 确定性 Workflow（`.aih/workflows/*.mjs`）
-
-把固定流程写成代码而非 prompt——借鉴 MiMo-Code 的 `.mimocode/workflows` 与
-opencode 的确定性管线。工作流是导出 `phases` 数组的 ESM 模块：
+Write fixed flows as code instead of prompts — borrowing MiMo-Code's `.mimocode/workflows`
+and opencode's deterministic pipeline. A workflow is an ESM module exporting a `phases` array:
 
 ```js
 // .aih/workflows/example.mjs
 export default {
   name: "example",
   phases: [
-    { name: "check", prompt: "运行 npm test 并总结结果", expect: "passed" }, // 单次 agent 调用
-    { name: "fanout", prompts: ["审查 core/", "审查 cli/"] },               // 并行扇出
+    { name: "check", prompt: "Run npm test and summarize the result", expect: "passed" }, // single agent call
+    { name: "fanout", prompts: ["review core/", "review cli/"] },               // parallel fan-out
   ],
 };
 ```
 
-每个 phase 按序执行；`expect` 是输出子串门禁（不满足即 fail-fast），`retries`
-限制额外重试次数。跑完输出 JSON 报告：
+Phases run in order; `expect` is an output-substring gate (fail-fast if unmet), `retries`
+bounds extra retries. Running produces a JSON report:
 
 ```sh
-aih workflow list                      # 列出 .aih/workflows/ 下所有工作流
-aih workflow run example               # 非交互跑完出报告
-aih workflow run example --format json # JSON 报告（CI 友好）
+aih workflow list                      # list workflows under .aih/workflows/
+aih workflow run example               # non-interactive run → report
+aih workflow run example --format json # JSON report (CI-friendly)
 ```
 
-首发场景：`aih init` 生成的应用 APP.md 验收项一键回归。
+First use case: one-shot regression of the acceptance items in the APP.md generated by `aih init`.
 
-### 写后自动格式化
+### Post-write Auto-formatting
 
-`write_file` / `edit` / `apply_patch` 成功后自动检测项目 formatter 并执行
-（借鉴 opencode formatters）：从写入文件向上层目录探测配置文件与 lockfile，
-优先级 prettier > biome > eslint `--fix`；带超时（`AIH_FORMAT_TIMEOUT_MS`，
-默认 15s）。格式化失败**绝不阻断写入**——只在工具结果附 `formatNote` 提示，
-成功则并入 `formatted: true` 标志。
+After `write_file` / `edit` / `apply_patch` succeed, AIH auto-detects the project formatter
+and runs it (borrowing opencode formatters): probing upward from the written file for config
+files and lockfiles, priority prettier > biome > eslint `--fix`; with a timeout
+(`AIH_FORMAT_TIMEOUT_MS`, default 15s). Format failure **never blocks the write** — it only
+attaches a `formatNote` hint to the tool result; success is folded into the `formatted: true`
+flag.
 
-### 并行只读工具调用
+### Parallel Read-only Tool Calls
 
-单步内**连续的只读工具调用并发执行**（codex `parallel.rs` 同源设计）：读类
-批量并发、上限 `AIH_TOOL_CONCURRENCY`（默认 4）；写类保持串行——顺序语义与
-doom-loop 判定不受影响。完成顺序不影响落盘：`tool/result` 事件始终按**原始
-调用顺序**写入会话日志，回放审计所见即模型所依。
+**Consecutive read-only tool calls within one step run concurrently** (same-origin design as
+codex `parallel.rs`): read-class batch concurrency, capped at `AIH_TOOL_CONCURRENCY`
+(default 4); write-class stays serial — ordering semantics and doom-loop detection are
+unaffected. Completion order doesn't affect persistence: `tool/result` events are always
+written to the session log in **original call order**, so replay/audit sees exactly what the
+model saw.
 
-### shell 上下文感知（IT#1）
+### Shell Context Awareness (IT#1)
 
-agent 可以**主动取用**本会话最近的 shell 上下文，免去用户手动粘贴报错/输出
-（借鉴 Intelligent Terminal "agent has context on your shell output, no
-copy-pasting needed"）。纯 seam `cli/src/shell-context.ts`（无 I/O、无 LLM、
-可单测）在 session log 的 `run_cmd` `tool/call`+`tool/result` 之上抽取最近 N 条
-命令（命令 · 退出码 · cwd · 输出尾部；`keep_output` 时附全量输出文件路径），
-只读 `run_cmd` 的 `stdout` 字段、不泄漏其他工具输出；用 `result.code` 判成败
-（非零退出仍是 `ok:true`，故读 `code` 而非 `ok`）。三种用法：
+The agent can **proactively pull** this session's recent shell context, saving the user from
+manually pasting errors/output (borrowing Intelligent Terminal's "agent has context on your
+shell output, no copy-pasting needed"). A pure seam `cli/src/shell-context.ts` (no I/O, no
+LLM, unit-testable) extracts the recent N commands (command · exit code · cwd · output tail;
+full-output file path when `keep_output`) on top of the session log's `run_cmd`
+`tool/call`+`tool/result` events; reads only `run_cmd`'s `stdout` field, never leaks other
+tool output; uses `result.code` for success (non-zero exit is still `ok:true`, hence reading
+`code` not `ok`). Three usages:
 
-- **`shell_context` 工具**（read/allow）：agent 按需取用，`max_commands`（默认 3，
-  上限 10）/`max_output_chars`（默认 4000）可调；无 shell 历史 → `{ found:false }`
-  明确空态。
-- **TUI `/shell`**：展示最近 shell 上下文；`/shell --send` 把上下文块注入下一 turn。
-- **`AIH_SHELL_CONTEXT=auto`**：每个正常消息 turn 起始自动附带（空态 → no-op，
-  不注入噪声）。
+- **`shell_context` tool** (read/allow): agent pulls on demand, tunable `max_commands`
+  (default 3, cap 10) / `max_output_chars` (default 4000); no shell history → `{ found:false }`
+  explicit empty state.
+- **TUI `/shell`**: shows recent shell context; `/shell --send` injects the context block into
+  the next turn.
+- **`AIH_SHELL_CONTEXT=auto`**: auto-attached at the start of every normal message turn
+  (empty state → no-op, no noise injected).
 
-### 确定性 shell 失败检测 + 一键修复（IT#2）
+### Deterministic Shell Failure Detection + One-click Fix (IT#2)
 
-`run_cmd` 失败（非零退出码 / 超时）时，AIH **确定性**（非 LLM）检测并点亮状态栏
-错误指示，一键把失败上下文送 agent 求修复（借鉴 Intelligent Terminal "auto-detect
-command failures, send to agent for fix suggestions"）。纯 seam
-`cli/src/error-detect.ts`（无 I/O、无 LLM、可单测）复用 IT#1 `extractShellContext`：
+When `run_cmd` fails (non-zero exit / timeout), AIH **deterministically** (not LLM) detects
+it and lights the status-bar error indicator; one keystroke sends the failure context to the
+agent for a fix (borrowing Intelligent Terminal's "auto-detect command failures, send to
+agent for fix suggestions"). Pure seam `cli/src/error-detect.ts` (no I/O, no LLM,
+unit-testable) reuses IT#1 `extractShellContext`:
 
-- **失败判定**：非零退出码或超时（`isFailed`）。**退出码 0 永不误报为失败**——
-  分类只是**标注**种类（固定正则集 `crash/network/js/test/fs/build/unknown`），
-  不决定成败，故绿色命令不会被误判、失败命令无已知模式时仍报 `unknown`。
-- **状态栏指示**：红色 `⚠ N failed`（`tui.ts` `shellErrorBadge?()`，全绿 → 隐藏）。
-  在 `tool/result`/`turn/end` 时重算并缓存，启动时按 session 回填（resume 也点亮）。
-- **TUI `/fix`**：检测失败 → 展示摘要 → 组装修复请求块（命令 + 退出码 + 分类 +
-  输出尾部 + full-output 路径）走 `evalTurn` 送 agent 求修复。`/fix --show`/`--dry`
-  只展示不发送；`busy` 时拒绝。
-- **`AIH_ERROR_DETECT=0`**：关闭自动指示（显式 `/fix` 始终可用）。
+- **Failure detection**: non-zero exit or timeout (`isFailed`). **Exit 0 is never a false
+  positive** — classification only **annotates** the kind (fixed regex set
+  `crash/network/js/test/fs/build/unknown`), doesn't decide success, so green commands are
+  never misjudged and unknown-pattern failures still report `unknown`.
+- **Status-bar indication**: red `⚠ N failed` (`tui.ts` `shellErrorBadge?()`, hidden when all
+  green). Recomputed+cached at `tool/result`/`turn/end`, back-filled on startup (resume lights
+  up too).
+- **TUI `/fix`**: detect failure → show summary → assemble a fix-request block (command +
+  exit code + classification + output tail + full-output path) through `evalTurn` to the
+  agent. `/fix --show`/`--dry` preview only; rejected when `busy`.
+- **`AIH_ERROR_DETECT=0`**: disable auto-indication (explicit `/fix` always available).
 
-### `?` 前缀快捷任务 + 上下文注入（IT#3）
+### `?`-prefix Quick Task + Context Injection (IT#3)
 
-TUI 输入行以 **`?`** 开头即启动一个 agent 任务，**自动注入当前上下文**（借鉴
-Intelligent Terminal "type `?` + prompt, injects active pane context"）。纯 seam
-`cli/src/question.ts`（无 I/O、无 LLM、可单测）：
+A TUI input line starting with **`?`** launches an agent task with **current context
+auto-injected** (borrowing Intelligent Terminal's "type `?` + prompt, injects active pane
+context"). Pure seam `cli/src/question.ts` (no I/O, no LLM, unit-testable):
 
-- **`classifyQuestionPrefix`**：`?` + 空格 + 文本 / `?` + CJK（无空格）→ 任务；
-  裸 `?`、`?foo`（`?` 紧贴 ascii）、句尾 `?`、无 `?` → **不**误判（literal）。
-- **`buildQuestionContext`**：复用 IT#1 shell-context 组装上下文块（最近 shell 输出 +
-  cwd + 活动 session）；空 log → 仅 cwd，不注入噪声。
-- **`composeQuestionPrompt`**：上下文块 + `Task: <prompt>` 合成单条 prompt 送 agent。
+- **`classifyQuestionPrefix`**: `?` + space + text / `?` + CJK (no space) → task; bare `?`,
+  `?foo` (`?` immediately followed by ascii), trailing `?`, no `?` → **not** misclassified
+  (literal).
+- **`buildQuestionContext`**: reuses IT#1 shell-context to assemble the context block (recent
+  shell output + cwd + active session); empty log → cwd only, no noise.
+- **`composeQuestionPrompt`**: context block + `Task: <prompt>` into one prompt for the agent.
 
-### `!` 前缀直接执行 shell 命令（opencode / mimo-code parity）
+### `!`-prefix Direct Shell Execution (opencode / mimo-code parity)
 
-TUI 输入行以 **`!`** 开头即作为**直接 shell 命令**就地执行（opencode/mimo-code 的
-"Start a message with `!` to run shell commands directly (e.g. `!ls -la`)"），
-**绝不发给 LLM**——`!ls` 就是在终端跑 `ls` 并回显输出：
+A TUI input line starting with **`!`** runs as a **direct shell command** in place (opencode/
+mimo-code's "Start a message with `!` to run shell commands directly (e.g. `!ls -la`)"),
+**never sent to the LLM** — `!ls` runs `ls` in the terminal and echoes output:
 
-- **统一执行器**：与 `run_cmd` 工具共用 `runShellCommand`（`cli/src/dev-tools.ts`）——
-  同一条 sandbox + env 过滤 + 超时 + 中间折叠管线，工具与输入前缀永不漂移。
-- **busy 也执行**：turn 运行中输入 `!cmd` 依旧直接执行（opencode/codex 行为），
-  不会被 steer 成给正在运行的 turn 的注入消息。
-- **进入会话历史**：以 `run_cmd` 的 `tool/call` + `tool/result` 事件落盘，因此被复用
-  现有 IT#1（`/shell`）与 IT#2（`/fix`）的 shell 上下文机制——无需另开旁路。
-- **裸 `!`** 显示用法；`!` 仅作为**行首**字符特殊（行中 `!` 仍是普通文本）。
+- **Unified executor**: shares `runShellCommand` with the `run_cmd` tool
+  (`cli/src/dev-tools.ts`) — the same sandbox + env filter + timeout + middle-truncation
+  pipeline, so tool and input-prefix never drift.
+- **Runs even while busy**: `!cmd` during a running turn still executes directly (opencode/
+  codex behavior), never steered into an injection message for the running turn.
+- **Entered into session history**: persisted as `run_cmd` `tool/call` + `tool/result` events,
+  so the existing IT#1 (`/shell`) and IT#2 (`/fix`) shell-context mechanisms pick it up — no
+  separate side channel.
+- **Bare `!`** shows usage; `!` is special only as the **first character** of a line
+  (mid-line `!` is ordinary text).
 
-参考实现对照（三仓实读）：opencode/mimo-code 用输入框 **keybind**（光标在位置 0 时按
-`!` 进入 shell mode，Enter 提交经 `session.shell()` 端点执行）；codex 用 `!` 前缀直接
-执行并把输出标为 **"You ran"** 进对话。AIH 取中点——行首 `!` 提交时原生执行，交互直觉
-与 codex 一致，执行器与 opencode 的 sandbox/env/timeout 对齐。
+Reference implementations (all three repos read): opencode/mimo-code use an input-box
+**keybind** (cursor at position 0, press `!` to enter shell mode, Enter submits via the
+`session.shell()` endpoint); codex uses the `!` prefix directly and marks output as
+**"You ran"** in the conversation. AIH takes the middle — line-leading `!` executes natively
+on submit, interaction intuition matches codex, executor aligns with opencode's
+sandbox/env/timeout.
 
-### 多 agent 会话管理面板（IT#4）
+### Multi-agent Session Panel (IT#4)
 
-TUI **`/sessions`** 常驻会话管理面：列出活跃 agent 会话 + 状态 + token 用量与成本
-（借鉴 Intelligent Terminal "track active agent sessions and their status"）。纯 seam
-`cli/src/sessions.ts`（无 I/O、无 LLM、可单测）：
+TUI **`/sessions`** is a resident session-management surface: lists active agent sessions +
+status + token usage and cost (borrowing Intelligent Terminal's "track active agent sessions
+and their status"). Pure seam `cli/src/sessions.ts` (no I/O, no LLM, unit-testable):
 
-- **dashboard**：active（job-backed，newest-first）+ saved（非 job，idle）双区，
-  聚合 `totalTokens` + `totalCost`（有价目表时）。
-- **`/sessions kill <id>`**：取消运行中的后台 job。
-- **`/sessions view <name>`**：单 session 的 token/cost 摘要。
-- 状态映射 running / done / failed / cancelled；空态 → `(no sessions yet)`。
+- **dashboard**: active (job-backed, newest-first) + saved (non-job, idle) zones, aggregating
+  `totalTokens` + `totalCost` (when a price table exists).
+- **`/sessions kill <id>`**: cancel a running background job.
+- **`/sessions view <name>`**: token/cost summary for one session.
+- Status mapping running / done / failed / cancelled; empty → `(no sessions yet)`.
 
-### 命令批准 run-or-copy（IT#5）
+### Command Approval run-or-copy (IT#5)
 
-agent 建议一条 **write 类** `run_cmd` 命令时，批准提示不再是笼统的
-`[y]es/[n]o/[a]lways`，而是显式 **`[R]un / [C]opy / [N]o`**（借鉴 Intelligent
-Terminal "gives you the option to run or copy it rather than running it
-automatically"）——**默认不自动执行**：
+When the agent proposes a **write-class** `run_cmd` command, approval is no longer a vague
+`[y]es/[n]o/[a]lways` but an explicit **`[R]un / [C]opy / [N]o`** (borrowing Intelligent
+Terminal's "gives you the option to run or copy it rather than running it automatically") —
+**never auto-runs**:
 
-- **`R`（run）**：批准执行该命令。
-- **`C`（copy）**：把命令**复制到剪贴板**（`pbcopy`/`wl-copy`/`xclip`/`xsel`/`clip`
-  探测，`cli/src/clipboard.ts`），**不执行**；无剪贴板时降级为**打印命令**供手动粘贴。
-- **`N`（no）**：拒绝。
-- **读类命令**仍走 CC#54 auto-allow 白名单（`ls`/`cat`/`grep`… 自动放行，不弹
-  run-or-copy）；非 `run_cmd` 的 write ask 保持通用 `[y]/[n]/[a]`。
-- 兼容性：未实现 `askRunOrCopy` 的 TUI（如测试 stub）自动回退 `askConfirm`，
-  CC#54 契约不破（`gate.ts` 路由时探测）。
+- **`R` (run)**: approve and execute.
+- **`C` (copy)**: copy the command to the clipboard (`pbcopy`/`wl-copy`/`xclip`/`xsel`/`clip`
+  probe, `cli/src/clipboard.ts`), **without executing**; no clipboard → degrades to
+  **printing the command** for manual paste.
+- **`N` (no)**: reject.
+- **Read-class commands** still go through the CC#54 auto-allow whitelist
+  (`ls`/`cat`/`grep`… auto-pass, no run-or-copy prompt); non-`run_cmd` write asks keep the
+  generic `[y]/[n]/[a]`.
+- Compatibility: TUIs without `askRunOrCopy` (e.g. test stubs) auto-fall back to
+  `askConfirm`; CC#54 contract intact (`gate.ts` probes at routing).
 
-### 变更可视化（diff 渲染）
+### Change Visualization (diff rendering)
 
-编辑类工具（`write_file` / `edit` / `apply_patch`）执行后在 TUI 内渲染前后对比
-diff：绿 `+` 新增 / 红 `-` 删除，LCS 行级对齐，超 80 行自动截断并提示
-`… N more line(s)`。实现位于 `cli/src/diff.ts`（也随 MCP 工具结果返回 `_diff`
-字段，可被任意客户端渲染）。
+After edit-class tools (`write_file` / `edit` / `apply_patch`) execute, the TUI renders a
+before/after diff: green `+` additions / red `-` deletions, LCS line-level alignment,
+auto-truncation past 80 lines with `… N more line(s)`. Implemented in `cli/src/diff.ts`
+(also returned as the `_diff` field of MCP tool results, renderable by any client).
 
-宽终端（≥100 列）为 side-by-side 双列：左删（红底，旧文件行号）/ 右加（绿底，
-新文件行号），行号槽按实际最大行号自适应；窄终端（<100 列）自动回退 unified
-单列（行号内联）；明/暗双主题色板。TUI 构造项 `width` 可锁定列宽（测试/嵌入）。
+Wide terminals (≥100 cols) render side-by-side dual columns: left-delete (red bg, old line
+numbers) / right-add (green bg, new line numbers), line-number slots auto-sized to the actual
+max; narrow terminals (<100 cols) auto-fall back to unified single column (inline numbers);
+light/dark dual theme palettes. TUI constructor option `width` can lock the column width
+(testing/embedding).
 
-### 检查点与回滚（checkpoint / restore）
+### Checkpoint & Rollback (checkpoint / restore)
 
-结构化"可回滚快照点"（roadmap F#28，升级 P0#1 剩余增量）：
+Structured "rollback-able snapshot points" (roadmap F#28, upgraded P0#1 remainder):
 
-- `checkpoint` 事件是**追加式标记**（`SessionLog.checkpoint(note?, contextTokens?)`），
-  不重写任何历史；`restoreTo(seq)` 派生"到该标记为止"的前缀，`adopt()` 原地切换指针
-- CLI：`aih session checkpoint [name] [note...]` 记录标记；
-  `aih session restore <name> [seq]` 把前缀分叉为 `<name>-restore-<seq>` 新会话——
-  **原会话文件不动**，append-only 全量历史仍可审计
-- TUI：`/checkpoint [note]` 与 `/restore [seq]`；回滚前自动把完整历史快照到
-  `*-pre-restore-<时间戳>.jsonl`，被丢弃的后缀随时可查
-- **worktree 摘要**：checkpoint 事件附带当时的 git 工作区快照（`WorktreeSummary`：
-  分支、HEAD 短 sha、变更文件清单封顶 50 条 + 总数）——恢复点同时告诉你"代码当时
-  什么样"；git 缺失/非仓库/超时（5s）时静默省略，绝不阻断 checkpoint；CLI 与 TUI
-  记录时打印摘要，restore 时回显该快照
-- 冒烟测试覆盖：标记追加、前缀派生、指针切换后 seq 续接、`deriveMessages` 跳过标记、
-  拒绝覆盖、坏 seq / 无标记报错；worktree 快照（非仓库 undefined、分支/sha/脏文件、
-  封顶计数、事件携带结构化摘要）
+- `checkpoint` events are **append-only markers** (`SessionLog.checkpoint(note?, contextTokens?)`),
+  never rewriting history; `restoreTo(seq)` derives the prefix "up to this marker",
+  `adopt()` switches the pointer in place
+- CLI: `aih session checkpoint [name] [note...]` records a marker;
+  `aih session restore <name> [seq]` forks the prefix into a new `<name>-restore-<seq>`
+  session — **the original session file is untouched**, full append-only history stays auditable
+- TUI: `/checkpoint [note]` and `/restore [seq]`; before rollback the full history is
+  auto-snapshotted to `*-pre-restore-<timestamp>.jsonl`, the discarded suffix is queryable anytime
+- **worktree summary**: the checkpoint event carries a git workspace snapshot
+  (`WorktreeSummary`: branch, HEAD short sha, changed-file list capped at 50 + total) — a
+  restore point also tells you "what the code looked like then"; silently omitted when git is
+  missing / not a repo / timeout (5s), never blocking checkpoint; CLI & TUI print the summary
+  when recording and echo it on restore
+- Smoke coverage: marker append, prefix derivation, seq continuation after pointer switch,
+  `deriveMessages` skipping markers, overwrite rejection, bad seq / no-marker errors; worktree
+  snapshot (non-repo undefined, branch/sha/dirty files, capped count, structured summary on
+  the event)
 
-### 分支蒸馏（distill-branch，P#37）
+### Branch Distillation (distill-branch, P#37)
 
-放弃一个分支时，"被扔掉的路上学到了什么"不必跟着丢：
+When abandoning a branch, "what was learned on the discarded path" doesn't have to die with
+it:
 
-- `aih session distill-branch <废弃会话> <目标会话> [--from seq]` 用**一次无工具
-  LLM 调用**把废弃分支的转写（工具正文截断、输入封顶 24k 字符）蒸馏为 3–6 条可迁移
-  经验，作为 `branch_summary` 事件**追加**到目标会话——原文件不动，append-only 可审计
-- `deriveMessages` 把 branch_summary 折叠进首条 system 消息（与 compaction 投影共存），
-  存活分支保留死路的知识而无需承担其 token 成本；蒸馏提示词只取"为什么失败/发现的约束/
-  关键路径与命令"，不含密钥
-- 冒烟测试覆盖：投影折叠（含与 compaction 并存）、CLI 蒸馏落盘与缺失目标拒绝
+- `aih session distill-branch <discarded> <target> [--from seq]` uses **one tool-less LLM
+  call** to distill the discarded branch's transcript (tool bodies truncated, input capped at
+  24k chars) into 3–6 transferable lessons, appended as a `branch_summary` event to the
+  target session — original file untouched, append-only auditable
+- `deriveMessages` folds branch_summary into the first system message (coexisting with the
+  compaction projection), so the surviving branch keeps the dead path's knowledge without
+  bearing its token cost; the distillation prompt takes only "why it failed / constraints
+  discovered / key paths and commands", never secrets
+- Smoke coverage: projection folding (incl. coexisting with compaction), CLI distillation
+  persistence, missing-target rejection
 
-### Eval 实验框架（P#46）
+### Eval Experiment Framework (P#46)
 
-"A/B 两个模型跑同一批任务各 N 次，产出可比的结果内核"——现代智能体项目的可信度门槛：
+"A/B two models running the same batch of tasks N times each, producing a comparable result
+kernel" — the credibility bar for modern agent projects:
 
 ```sh
-# 编程接口（cli/src/eval.ts）：tasks × models × repetitions → cell 矩阵
+# Programming interface (cli/src/eval.ts): tasks × models × repetitions → cell matrix
 runExperiment(tasks, models, reps, subject, { outDir, budget })
 ```
 
-- **SubjectAdapter seam**：eval 只拥有实验语义，执行复用各 subject 自身运行时——
-  内置 CLI（`cliSubjectAdapter`）、任意外部命令（`externalSubjectAdapter`，
-  `{prompt}`/`{workdir}` 模板展开，可对比其他 agent CLI）、HTTP 端点
-  （`httpSubjectAdapter`，打 `aih serve POST /message`）
-- **预算控制**：墙钟（`budgetMs`）与成本上限（`maxCostUsd`，按 F#30 价目表从各
-  attempt 会话日志的 turn/end usage 定价）；预算耗尽后未启动的 cell 进
-  `skippedCells`——诚实记账，绝不伪造结果；并发上限默认 `AIH_TOOL_CONCURRENCY`
-- **结果内核**：`{ status, durationMs, outputTail, failureReason, usage, costUsd }`；
-  attempt 不可变，多 attempt 取最早有效者（反 Goodhart）
-- **CLI 面（FA#6 失败单题重跑）**：`aih experiment`（`aih eval` 已是仓库 QA 门禁，故实验
-  框架单列命令）——
+- **SubjectAdapter seam**: eval only owns experiment semantics; execution reuses each
+  subject's own runtime — built-in CLI (`cliSubjectAdapter`), any external command
+  (`externalSubjectAdapter`, `{prompt}`/`{workdir}` template expansion, can compare other
+  agent CLIs), HTTP endpoint (`httpSubjectAdapter`, hitting `aih serve POST /message`)
+- **Budget control**: wall-clock (`budgetMs`) and cost cap (`maxCostUsd`, priced from each
+  attempt's session-log turn/end usage via the F#30 price table); cells not started after
+  budget exhaustion go into `skippedCells` — honest bookkeeping, never fabricated results;
+  concurrency cap defaults to `AIH_TOOL_CONCURRENCY`
+- **Result kernel**: `{ status, durationMs, outputTail, failureReason, usage, costUsd }`;
+  attempts immutable, multi-attempt takes the earliest valid one (anti-Goodhart)
+- **CLI surface (FA#6 failed-item rerun)**: `aih experiment` (eval is the repo QA gate, so the
+  experiment framework gets its own command) —
   ```sh
   aih experiment run <spec.json> [--exp-id id] [--mock] [--reps N] [--concurrency N]
-  aih experiment retry <spec.json> --exp-id id   # == run --retry-failed：只重跑非 passed cell
-  aih experiment status <exp-id> [--json]         # passed/failed/error 分布
+  aih experiment retry <spec.json> --exp-id id   # == run --retry-failed: only rerun non-passed cells
+  aih experiment status <exp-id> [--json]         # passed/failed/error distribution
   ```
-  spec：`{ "tasks": [{id, prompt, expect[]}], "models": [{model, provider?, baseUrl?}],
-  "repetitions": N }`。每 cell 的 `status` 持久化到 `.aih/eval/<exp-id>.results.json`；
-  `retry` 只重跑上次 `failed`/`error`/未跑的 cell 并合并回同一结果集（省 token/时间），
-  全绿时直接短路。
-- 冒烟测试覆盖：cell 展开、mock 全流程 4 cell、紧预算跳过记账、usage 聚合、成本上限
-  停机、外部 echo subject 判定、**FA#6 持久化 + 失败单题重跑（只跑失败 cell、passed 保留）
-  + status 分布检视**
+  spec: `{ "tasks": [{id, prompt, expect[]}], "models": [{model, provider?, baseUrl?}],
+  "repetitions": N }`. Each cell's `status` persists to `.aih/eval/<exp-id>.results.json`;
+  `retry` only reruns last `failed`/`error`/unrun cells and merges back into the same result
+  set (saves tokens/time), short-circuits when all green.
+- Smoke coverage: cell expansion, mock full flow 4 cells, tight-budget skip accounting, usage
+  aggregation, cost-cap shutdown, external echo subject judgment, **FA#6 persistence +
+  failed-item rerun (only failed cells, passed preserved) + status distribution inspection**
 
-### 质量评测集 + 回归基线（FB#4，BuffBench 式）
+### Quality Eval Suite + Regression Baseline (FB#4, BuffBench-style)
 
-把「agent 在真实任务上的表现」变成可重复评测集——固定任务 + 期望产物 + 自动判分，防止改 A
-坏 B：
+Turn "agent performance on real tasks" into a repeatable eval suite — fixed tasks + expected
+artifacts + auto-scoring, preventing "fix A, break B":
 
 ```sh
 npm run eval:quality      # aih quality --mock && aih coverage --profile release
-aih quality [--mock] [--json]   # 跑 evals/quality.tasks.json + 对基线做回归对比
+aih quality [--mock] [--json]   # run evals/quality.tasks.json + regression vs baseline
 ```
 
-- **任务套件**（`evals/quality.tasks.json`）：5 条固定质量任务（工具调用 / 读后总结 / 多工具
-  组合 / 搜索汇报 / 指令遵循），各带 `expect` 期望产物，按子串自动判分（复用 P#46 runner）
-- **回归基线**（`evals/quality.baseline.json`）：cellId / `task__*__rN` 通配符模式，列出
-  **必须通过**的 cell；`compareToBaseline`（纯函数）把新跑通过集与此 diff——基线期望但新跑
-  未通过 → **REGRESSION**（改 A 坏 B）
-- **回归门语义**：live run（真模型）有回归 → 退出 1（gate）；`--mock`/CI run 确定性、信息性、
-  退出 0（mock subject 无法证明真实质量，只验证套件+基线机制不漂移）
+- **Task suite** (`evals/quality.tasks.json`): 5 fixed quality tasks (tool calls / read-then-
+  summarize / multi-tool composition / search reporting / instruction following), each with
+  `expect` expected artifacts
+- **auto-scoring**: deterministic scoring of each task's output against the expected
+  artifacts — no LLM judging, no subjective grading, reproducible across runs
+- **baseline regression**: scores compared against a committed baseline
+  (`evals/baseline.json`); a drop below the threshold fails the gate (`aih coverage` outside
+  the release pipeline too), so quality improvements are locked in as a regression test
+- Smoke coverage: task suite loads, mock run scores, baseline comparison, threshold logic
 
-### 成本与吞吐（cost / TPS）
+### Cost & Throughput (cost / TPS)
 
-会话级成本与吞吐统计（roadmap F#30，对齐 MiMo context sidebar）：
+- **Live TUI**: the context panel shows `cost $x.xx · N tok/s`; `/usage` shows per-loop
+  (per-tool-call) token breakdown + session totals; `aih stats` aggregates across sessions
+- **Price table**: builtin `DEFAULT_PRICES` (known model ids), `aih.json` `prices` overrides;
+  `resolvePrice` normalizes substring matching (supports dated ids); TPS = session average
+  throughput (total tokens / wall-clock span)
+- Smoke coverage: price parsing, cost computation, TPS boundaries, formatting
 
-- **价目表**：`cli/src/cost.ts` 内置常见模型 $/1M 价格（OpenAI / Anthropic / Google /
-  DeepSeek / Qwen / Meta）；`aih.json` 的 `prices` 键可覆盖（`{ "gpt-4o": { "input": 2.5, "output": 10 } }`），
-  匹配为归一化子串——dated id（`gpt-4o-2024-11-20`）命中 `gpt-4o` 行
-- **计费真值（防错账）**：**keyless 网关与本地 llama.cpp/Ollama 端点一律 $0**——
-  没有按 token 计费的凭据就不可能产生账单，models.dev 快照里同名模型的商业价
-  不适用；快照仅按**裸名精确匹配**（不再子串匹配 7400+ 条 provider 域条目，
-  此前 `glm-5.3-flash` 会误配 `above/glm-5.3-flash` 商业价、`.gguf` 误配商业价，
-  keyless 会话显示 ~$17 假账单）；同名模型跨 provider 价格不一致时**拒绝猜测**
-  返回"—"（`/prices` 提示加 `prices` 覆盖），provider id 可锁定 `<provider>/<model>` 行
-- **缓存分层计价（cache-aware billing）**：`ModelPrice` 支持 `cacheRead`/`cacheWrite`
-  （opencode Zen「缓存读取/写入」、Anthropic cache_read/cache_creation 对应）；
-  成本公式 = (prompt − cached)×input + cached×cacheRead + cacheWriteTokens×cacheWrite +
-  completion×output——agentic 会话大部分 prompt 走缓存（glm-5.3-flash cache read
-  $0.03 vs input $0.15），按全价计曾把面板虚高 ~3-5 倍。无 cacheRead 的表按全价
-  （保守旧行为）。opencode-go 全表 26 行已按官方价目表校准（含 glm-5.3-flash
-  0.15/0.50/cacheRead 0.03，修掉过期 0.075/0.25 行）；快照生成器 `extractPrices`
-  保留 `cache_read`/`cache_write`（此前丢弃）
-- **三处展示**：TUI Context 面板加 `cost $x.xx · N tok/s` 行；`/usage` 输出累计成本 + 吞吐；
-  `aih stats`（非交互）输出成本 + 吞吐
-- **TPS** 为会话平均吞吐（总 token / 时间跨度），数据可推导、可单测；
-  **逐请求流式 TPS 已交付**——`streamingTps()` 用完成 token / 真实生成毫秒
-  （`turn/end.genMs`，流式响应自请求至末个 delta 计时），三处展示为 `stps` /
-  `stream N tok/s`；mock / 非流式无 `genMs` 时为 0
-- 无价目表匹配时成本显示 `—` 并提示配置 `prices`；mock 模式无 usage 数据，成本/TPS 不显示
-- 冒烟测试覆盖：价格解析（精确/子串/大小写/用户覆盖/未命中）、成本计算、TPS 边界、格式化
+### Prefix Stability (prompt-cache prefix stability, CC-R#3)
 
-### 前缀稳定性（prompt-cache prefix stability，CC-R#3）
+- System prompt carries a prefix-stability discipline paragraph (stable content in the
+  prefix, volatile content via messages)
+- `toolsetFingerprint()` byte-level fingerprint of the toolset; chat TUI registry rebuilds
+  (plan↔build, extension registration) compare and emit a system-row warning + log the
+  breakage point on change
+- `/usage` prefix-stability attribution (cold starts unattributed, idle-TTL consumed by
+  `cacheTtlWaste` without double counting, remaining misses listed by prefix breakage)
 
-provider 的 prompt cache 按请求的**精确字节前缀**（系统提示 + 工具定义 + 消息前缀）命中；
-任何字节变化都会让整段缓存失效并按全价重读。AIH 的三层防护：
+### Scorecard (harness scorecard, PE#3)
 
-- **纪律进系统提示**：`PREFIX_STABILITY_RULES`（稳定内容进前缀且跨轮不变、易变内容走
-  消息、避免触发工具集/系统提示变更）随 guard 段注入；
-- **工具集指纹**：`toolsetFingerprint()`（SHA-256、对象键序归一、列表序敏感）；chat
-  TUI registry 重建（plan↔build 切换是最常见破坏源）时比对，变化→系统行一次性警告
-  （"provider prompt cache will miss on the next request"）+ 记录破坏点；
-- **/usage 归因**：`cachePrefixMissAttribution()` 把「上报了缓存但大半 uncached 的轮次」
-  归因——首个上报轮 = 冷启不归因；空闲 > TTL 的 miss 已由 TTL 浪费归因（不重复计）；
-  其余 miss 按前缀破坏列出（含破坏时间与说明），末行附 byte-stable 提示。
-  归因是可观测事实启发式（provider 只报 cached_tokens），不冒充账本。
-
-### 记分卡（harness scorecard，PE#3）
-
-「不要数 token，要数**无需人工干预且产出可接受证据的完成任务数**」（Production Agent
-Engineering 6 层 Playbook 的核心指标）。`aih scorecard [--format json]` 从现有
-append-only 会话日志 + `.aih/memory.md` 纯函数算出 6 项健康指标——**无新存储、零重依赖**：
-
-- **completion rate** = goal-met / turn（验证完成率，↑）
-- **rework rate** = 失败 tool 调用 / turn（返工率，↓）
-- **escalation rate** = escalate 事件 / turn（人工介入率，↓，PE#4 原语）
-- **recovery time** = 失败 tool → 下一次成功调用的最大间隔（恢复时长，↓）
-- **cost per verified** = 总成本 / 验证数（每验证结果成本，↓，复用 F#30 价目表）
-- **guide growth** = memory 中 dated 规则数 / 会话跨度（规则增速，理想→下降）
-
-载体：`cli/src/scorecard.ts`（纯函数 `computeScorecard` / `formatScorecard` /
-`countDatedEntries`）+ `cli/src/index.ts` `scorecard` 子命令；数据源 = 现有会话日志
-（`turn/start`、`goal/judge`、`tool/result`、`escalate`、`turn/end.usage`）+ 项目记忆。
-无价目表 / mock 模式下成本项为 `—` / 0，其余指标照常。冒烟覆盖：6 指标数值、
-recovery 跨度、guide 增速（含短跨度不外推）、空会话全 0 不报错、bullet-dated 记忆行计数。
-
-### 安全缝（safety seam，PE#1 / PE#2 / PE#4）
-
-「让 harness 强制，而不是让模型自律」——Production Agent Engineering 的护栏层。
-三件套在**每步工具执行后**由内核统一裁决，模型不可见、不可绕过：
-
-- **PE#2 预算硬约束 + 熔断（budget）**：`BudgetTracker` 累积**成本 / 写次数 / 墙钟时间**，
-  并守住 **scope 拒绝清单**（`denyPaths` 命中的写立即硬违规）。
-  - **硬边界**（`maxCostUsd` / `maxWrites` / `timeoutMs` / `denyPaths`）任一越界 →
-    抛 `BudgetExceeded` → 内核发 `escalate` 事件、`turn/end stopReason="escalated"`，**停止本轮**。
-  - **软熔断（tripwire）**：单任务成本 ≥ 2× 会话均值 → 经 `onTripwire` 钩子**提示一次**（每任务
-    锁存一次），**不阻断**——把「异常贵」变成可见信号而非静默烧钱。
-- **PE#1 计算式传感器（sensors）**：写后验证。声明 `{name, command, onTools?, pathPrefix?, timeoutMs?}`，
-  在指定写工具成功后跑一条命令（`cwd`=项目根，`buildChildEnv` 保证子进程**拿不到密钥**）。
-  退出 0=绿；非 0=红→**有界重试**（`sensorRetries`，默认 1）→仍红则**升级**。
-  `onTools` 限定触发工具、`pathPrefix` 限定写入路径，避免无关写触发昂贵检查。
-- **PE#4 升级原语（escalate）**：harness 遇到「自己解决不了」的边界（传感器持续红、预算越界、
-  反复失败）时，发一条**模型不可见**的 `escalate` 事件（`reason` + `options[2-4]` + `safestDefault`），
-  把决策交还给人：
-  - **交互（TUI）**：渲染选项 + 最安全默认，等待人工选择；
-  - **非交互（`run`）**：打印选项与 safest default 后**以退出码 3 停止**（`ESCALATE_EXIT_CODE`），
-    让 CI / 脚本能区分「正常结束」与「需要人介入」。
-
-配置（`aih.json` `safety` 块，或 env 覆盖，后者胜）：
-
-```jsonc
-{
-  "safety": {
-    "budget": { "maxCostUsd": 1, "maxWrites": 5, "timeoutMs": 60000, "denyPaths": ["secrets/"] },
-    "sensors": [
-      { "name": "typecheck", "command": "npm run typecheck", "onTools": ["write_file", "edit"] }
-    ],
-    "sensorRetries": 1
-  }
-}
+```sh
+aih scorecard [--format json]   # six playbook metrics
 ```
 
-env 等价：`AIH_BUDGET`（JSON 或 `maxCostUsd=1|maxWrites=5|timeoutMs=60000|denyPaths=a|b`）、
-`AIH_SENSORS`（SensorConfig JSON 数组或单对象）、`AIH_SENSOR_RETRIES`（默认 1）、
-`AIH_SENSOR_TIMEOUT_MS`（默认 60000）。**未配置时整条缝 no-op**（零开销、零行为改变）。
+Reports six metrics — completion rate, rework rate, escalation rate, recovery time, cost per
+verified result, guide growth — computed purely over the existing append-only session log +
+`.aih/memory.md` (no new storage, zero new dependencies). Pure implementation
+(`cli/src/scorecard.ts`, same discipline as cost.ts).
 
-载体：状态机在 `core/src/budget.ts`（`BudgetTracker` / `SensorLoop` / `parseBudget` / `isDenied`，
-纯函数可单测），裁决在 `core/src/agent-loop.ts`（`escalate()` + 每步后 sensor/budget 检查），
-CLI 接线在 `cli/src/safety.ts`（config→core 对象 + 传感器执行器 + `onEscalate` 行为）。
-冒烟覆盖：预算 cost/writes/timeout/scope/tripwire/parse、传感器绿/红/重试/升级/pathPrefix、
-AgentLoop 集成（传感器红→escalate、预算硬→escalate、tripwire→继续）。
-**恢复测试**：`test/recovery.sh`（escalate 落盘可回放 + 非交互退出码 3 + 崩溃后续跑不重复派发）。
+### Safety Seam (PE#1 / PE#2 / PE#4)
 
-### 距离尺（`aih measure`，PR#2）
+The harness enforces safety, **not the model**. Three pieces, all pure-function seams (zero
+new dependencies), adjudicated by the kernel after every tool batch:
 
-scorecard 回答「现在有多好」（单点），`aih measure` 回答「变了多少、怎么变的」——
-Proteus「measurement instrument, not just a score」的距离尺。纯函数（`cli/src/measure.ts`，
-同 cost.ts/scorecard.ts 纪律，无 LLM 可单测），**只读声明的 surface + 归一化 trace，从不读
-agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化结果：
+- **PE#2 budget hard constraint + tripwire** — `BudgetTracker` (`core/src/budget.ts`)
+  accumulates cost / write-count / wall-clock and guards a `denyPaths` scope list. A hard
+  bound (`maxCostUsd` / `maxWrites` / `timeoutMs` / `denyPaths`) → `escalate` +
+  `stopReason="escalated"`, stopping the turn. A soft **tripwire** (task cost ≥ 2× session
+  mean) → `onTripwire` hint once (latched per task), non-blocking. Configure via `aih.json`
+  `safety.budget` or `AIH_BUDGET`
+  (`maxCostUsd=1|maxWrites=5|timeoutMs=60000|denyPaths=a|b`).
+- **PE#1 computational sensors** — `SensorLoop` (`core/src/budget.ts`) + `cli/src/safety.ts`
+  executor. After a write tool succeeds, run a declared `{name, command, onTools?,
+  pathPrefix?, timeoutMs?}` check (children get `buildChildEnv`, so they inherit **no
+  secrets**). Exit 0 = green; red → bounded retry (`AIH_SENSOR_RETRIES`, default 1) →
+  escalate. Configure via `safety.sensors` / `AIH_SENSORS`.
+- **PE#4 escalate primitive** — `AgentLoop.escalate()` emits a **model-invisible**
+  `escalate` event (`reason` + `options[2-4]` + `safestDefault`; `deriveMessages` skips it).
+  Non-interactive `run` prints the options + safest default then **exits code 3**
+  (`ESCALATE_EXIT_CODE`); the TUI renders the options for a human to choose.
+- **Recovery test** — `test/recovery.sh` drives the real CLI + mock LLM over a real persisted
+  session: escalate event persisted & replayable, exit code 3, and a mid-turn crash
+  (dispatch, no result) → resume reads the checkpoint, parks the tool (indeterminate, outcome
+  UNKNOWN) and does **not** re-dispatch it. 10/10, stable.
+### Distance Measure (`aih measure`, PR#2)
 
-- **`aih measure distance <a.json> <b.json>`** —— 每 surface 的结构距离：`added`/`dropped`/
-  `revised` + `pathLength`；`--revised surface=entry,entry` 声明「同在但已变」的条目。
-  **缺快照→明确 degraded（exit 1）而非虚构大距离**。
-- **`aih measure stream <traces.json> [--perms N] [--seed N]`** —— 行为距离：工具流频率 L1 +
-  转移 bigram Jaccard，配 **seeded 置换检验**（between/within 比 R + p；同 seed 完全可复现；
-  arm<2 时 degraded 不硬算）。
-- **`aih measure crystallize <evolved.json> <neutral.json>`** —— 进化态挂中性条件读回是否等于
-  自身端点（disposition 稳定判定）；drift → **exit 1 有信号**、`DRIFTED` 标记。
+scorecard answers "how good is it now" (a point); `aih measure` answers "how much
+changed, and how" — a Proteus-style "measurement instrument, not just a score"
+ruler. Pure functions (`cli/src/measure.ts`, same discipline as cost.ts/
+scorecard.ts, no LLM, unit-testable), **read only declared surfaces + normalized
+traces — never reads agent self-narration, never instruments the harness**. Three
+subcommands, `--json` for structured output:
 
-输入 schema：`{ "surfaces": [ { "surface": "skills", "entries": ["a","b"] } ] }` 与
-`{ "traces": [ { "label": "arm", "events": [...] } ] }`。冒烟覆盖结构距离精确 diff、置换检验
-可复现、缺快照降级、CLI 端到端 —— 见 `cli/src/smoke.ts` PR#2 块。
+- **`aih measure distance <a.json> <b.json>`** — structural distance per surface:
+  `added`/`dropped`/`revised` + `pathLength`; `--revised surface=entry,entry`
+  declares "present in both but changed" entries. **Missing snapshot → explicit
+  degraded (exit 1), never a fabricated large distance**.
+- **`aih measure stream <traces.json> [--perms N] [--seed N]`** — behavioral
+  distance: tool-stream frequency L1 + transition bigram Jaccard, with a **seeded
+  permutation test** (between/within ratio R + p; same seed fully reproducible;
+  arm<2 → degraded, no forced computation).
+- **`aih measure crystallize <evolved.json> <neutral.json>`** — does the evolved
+  state read back equal to itself when mounted on neutral conditions (disposition
+  stability)? drift → **exit 1 with signal**, `DRIFTED` marker.
 
-### Persistent Memory（持久记忆）
+Input schema: `{ "surfaces": [ { "surface": "skills", "entries": ["a","b"] } ] }`
+and `{ "traces": [ { "label": "arm", "events": [...] } ] }`. Smoke coverage for
+structural-distance exact diff, reproducible permutation test, missing-snapshot
+degradation, CLI end-to-end — see the PR#2 block in `cli/src/smoke.ts`.
 
-`.aih/memory.md` 是 agent 自己维护的持久知识（与 APP.md"人写契约"分离）：
+### Persistent Memory
 
-- `remember` 工具写入：`action=append` 追加带日期条目 / `action=set` 整体重写；
-  `scope` 可选 `project`（`.aih/memory.md`）/ `user`（XDG 用户目录 `memory.md`）
-- 每轮自动注入 system prompt（项目 + 用户两级合并，预算 `AIH_MEMORY_BUDGET`，
-  默认 4000 字符，超出截断；截断时尾部附可操作提示语，agent 知道被切了、
-  知道去找全量）
-- **`memory_recall` 只读工具（KL-R#2，词元重叠检索）**：注入块被预算截断后，
-  agent 可以用自由文本 query 召回最相关的记忆条目（`{"query": "...", "top_k": 8}`）。
-  打分 = 查询词元命中计数（非向量/非 FTS/零依赖）：NFKC 归一、camelCase 拆词、
-  小写、CJK bigram（中文条目可检索）、英文功能词静态停用；泛化词动态抑制
-  （在 >80% 条目出现且语料 ≥3 条的词元不计分，防止 "memory"/"session" 刷分，
-  阈值未取 kilo 原版 0.5——小语料下领域词 60% 出现率极正常）；排序 = 分数 →
-  新鲜度（date 降序）→ 字典序；`restates` 词元重叠 ≥85% 去重近重复条目；
-  project + user 两级都查，返回带 `score`/`matched`/`scope`
-- TUI `/memory` 查看当前记忆；`/tidy [project|user]` 确定性去重
-  （保留最新日期副本，`/tidy apply` 写入）
+`.aih/memory.md` is persistent knowledge maintained by the agent itself (separate
+from APP.md, the "human-written contract"):
 
-### Dream / Distill（会话即资产）
+- `remember` tool writes: `action=append` appends dated entries / `action=set`
+  rewrites wholesale; `scope` optional `project` (`.aih/memory.md`) / `user`
+  (XDG user dir `memory.md`)
+- Auto-injected into the system prompt each turn (project + user merged, budget
+  `AIH_MEMORY_BUDGET`, default 4000 chars, truncated when over; on truncation an
+  actionable hint is appended — the agent knows it was cut and knows to go fetch
+  the full text)
+- **`memory_recall` read-only tool (KL-R#2, token-overlap retrieval)**: after the
+  injected block is truncated by budget, the agent can recall the most relevant
+  memory entries with a free-text query (`{"query": "...", "top_k": 8}`).
+  Scoring = query token hit count (not vector / not FTS / zero deps): NFKC
+  normalization, camelCase splitting, lowercasing, CJK bigrams (Chinese entries
+  searchable), static stop words for English function words; generic words
+  dynamically suppressed (tokens appearing in >80% of entries with corpus ≥3
+  entries don't score, preventing "memory"/"session" from inflating — threshold
+  not kilo's original 0.5, since 60% domain-word occurrence is normal in small
+  corpora); ordering = score → freshness (date desc) → lexicographic; `restates`
+  dedups near-duplicates at ≥85% token overlap; queries both project + user
+  levels, returns `score`/`matched`/`scope`
+- TUI `/memory` views current memory; `/tidy [project|user]` deterministic dedup
+  (keeps newest-dated copy, `/tidy apply` writes)
 
-把历史会话当作可复利资产（roadmap P2#7，`cli/src/dream.ts` 纯函数模块 + TUI 命令）：
+### Dream / Distill (sessions as assets)
 
-- **`/dream`**：扫描最近 5 个会话（每会话最多 40 轮，封顶），抽取"值得记住"的素材——
-  用户纠正/偏好（中英关键词启发式）、checkpoint 备注、goal/judge 理由、重复流程；
-  一次无工具 LLM 调用把素材蒸馏为 ≤5 条 memory 候选。**只建议、不自动写**——
-  用户审阅后用 `remember` 工具落盘（保持"记忆写入需人确认"的边界）
-- **`/distill`**：确定性提取重复流程——同一工具 + 同一归一化参数签名出现 ≥3 次
-  （`run_cmd` 命令 / `webfetch` URL 去尾斜杠 / 文件类 path）即为 skill/workflow 候选，
-  附建议（如 `npm test` ×N → "wrap as a workflow phase"）
-- 边界：`/dream` 无素材时直接报告"nothing notable"不调 LLM；LLM 失败回退打印原始素材；
-  扫描全程有界（5 会话 × 40 轮），大日志不爆
-- 冒烟测试覆盖：flow 阈值/排序/URL 归一化、dream 素材四类抽取、格式化渲染、空会话 no-op
+Treat historical sessions as compoundable assets (roadmap P2#7,
+`cli/src/dream.ts` pure-function module + TUI commands):
 
-### Intelligent Context Management（智能上下文管理）
+- **`/dream`**: scans the last 5 sessions (≤40 turns each, capped), extracts
+  "worth remembering" material — user corrections/preferences (zh/en keyword
+  heuristics), checkpoint notes, goal/judge reasons, repeated flows; one
+  tool-less LLM call distills the material into ≤5 memory candidates.
+  **Suggest-only, never auto-writes** — the user reviews, then `remember` persists
+  (keeping the "memory writes need human confirmation" boundary)
+- **`/distill`**: deterministically extracts repeated flows — same tool + same
+  normalized-argument signature appearing ≥3 times (`run_cmd` commands /
+  `webfetch` URLs minus trailing slash / file-class paths) is a skill/workflow
+  candidate, with a suggestion (e.g. `npm test` ×N → "wrap as a workflow phase")
+- Boundaries: `/dream` reports "nothing notable" without calling the LLM when
+  there's no material; LLM failure falls back to printing raw material; scanning
+  is fully bounded (5 sessions × 40 turns), big logs don't blow up
+- Smoke coverage: flow threshold/sorting/URL normalization, four dream material
+  classes, formatted rendering, empty-session no-op
 
-用量提示按最近一次请求的 prompt tokens（真实窗口占用）计算：≥80% 黄色、≥95% 红色。
-超限处置对齐 opencode / MiMo-Code 的压缩设计（`session/compaction.ts`）：
+### Intelligent Context Management
 
-- **保留近期尾部原文**：按 `clamp(usable×0.25, 500, 15000)` tokens 保留最近对话**不摘要**，
-  切分点落在 user 消息（轮次）边界上，保证 tool 调用/结果不被拆散；只有更旧的头部才进摘要
-- **user-query 不变量**（对齐 opencode/MiMo-Code replay）：压缩后模型可见会话**必须含 user 消息**
-  ——尾部预算装不下时把本 turn 的 user 原文 replay 成新尾部；历史里没有任何 user 时用合成
-  "Continue…" 兜底。否则 Qwen3 一类严格 chat 模板直接 400（`No user query found in messages`）
-- **滚动摘要**：每次新摘要折叠进上一次摘要（`<prior-summary>`），用结构化模板
-  （目标/约束/决策/当前状态/下一步）产出，工具输出序列化时截断到 2000 字符
-- **主动**：每步后 `promptTokens ≥ AIH_COMPACT_AT`(0.8) `× 上下文窗口`(默认 128k)
-  → 摘要旧头部，写入 `compaction` 事件（`summary` + `recent` + `trigger`）；之后用"摘要 + 近期尾部"替代全量前史
-- **被动**：provider 返回上下文超限错误时自动压缩并重试该步
-- **手动**：输入框 `/compact [focus]` 随时压缩（focus 可定向摘要，如"保留所有文件路径"）；
-  无旧头部时仍压缩整段对话（刷新滚动摘要）；回显压缩前后 token 数与降幅，
-  会话 JSONL 保持 append-only（摘要只是视图，历史可审计）
-- **文件改动清单（M-R#1 file manifest）**：压缩时 `buildFileManifest` 从会话的
-  read/patch 工具事件重建**被触碰文件清单**（每个文件记 `edited`/`written`/
-  `read: full`/`read: lines x-y`，同路径按最后触碰去重），作为摘要附加输入注入——
-  压缩后 agent 直接知道"哪些文件被改/被读、读到哪几行"，减少重读/重改；
-  清单全量落 `compaction` 事件的 `fileManifest` 字段（可审计），渲染层
-  `renderFileManifest` 封顶 `MAX_FILE_MANIFEST_ENTRIES`(120) 条展示，溢出附 `… N more`
+Usage hints are computed from the last request's prompt tokens (real window
+occupancy): ≥80% yellow, ≥95% red. Over-limit handling aligns with opencode /
+MiMo-Code compaction design (`session/compaction.ts`):
 
-**窗口按模型设置 + 自动检测**（优先级：`--context-window` > `AIH_CONTEXT_WINDOW` >
-**实时探测**（llama.cpp `/slots`，取各 slot `n_ctx` 最小值=单请求有效窗口）> `aih.json` 的
-**模型级** `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`
-> 默认 128k）。llama.cpp 服务端把总窗口按并行槽数（`parallel`）分好后，就在 `/slots` 里
-以每 slot 的 `n_ctx` 上报，因此"2 并行 256k"自动解析为 128k，无需手算；非 llama.cpp 端点
-或探测失败时静默回落到配置值：
+- **Keep recent tail verbatim**: `clamp(usable×0.25, 500, 15000)` tokens of the
+  most recent conversation are kept **unsummarized**, with split points on user
+  message (turn) boundaries so tool calls/results are never torn; only the older
+  head goes into the summary
+- **user-query invariant** (aligned with opencode/MiMo-Code replay): after
+  compaction the model-visible session **must contain a user message** — if the
+  tail budget can't fit it, this turn's user text is replayed as the new tail;
+  with no user message in history, a synthetic "Continue…" fallback. Otherwise
+  strict chat templates like Qwen3 400 directly (`No user query found in messages`)
+- **Rolling summary**: each new summary folds into the previous one
+  (`<prior-summary>`), produced with a structured template (goal/constraints/
+  decisions/current state/next move); tool outputs truncated to 2000 chars when
+  serialized
+- **Proactive**: after each step `promptTokens ≥ AIH_COMPACT_AT`(0.8) `× context
+  window`(default 128k) → summarize old head, write a `compaction` event
+  (`summary` + `recent` + `trigger`); thereafter "summary + recent tail"
+  replaces the full prior history
+- **Passive**: provider returns context-over-limit error → auto-compact and retry
+  that step
+- **Manual**: `/compact [focus]` compacts anytime (focus can target the summary,
+  e.g. "keep all file paths"); compacts the whole conversation when there's no
+  old head (refreshes the rolling summary); echoes token count before/after and
+  the reduction; session JSONL stays append-only (summary is just a view,
+  history stays auditable)
+- **File-change manifest (M-R#1)**: on compaction, `buildFileManifest` rebuilds
+  the **touched-file list** from the session's read/patch tool events (each file
+  recorded as `edited`/`written`/`read: full`/`read: lines x-y`, deduped by last
+  touch per path), injected as extra summary input — after compaction the agent
+  directly knows "which files were changed/read, which lines", reducing
+  re-reads/re-edits; the manifest lands fully in the `compaction` event's
+  `fileManifest` field (auditable), rendered capped at `MAX_FILE_MANIFEST_ENTRIES`
+  (120) with `… N more` for overflow
+
+**Window per-model + auto-detection** (precedence: `--context-window` >
+`AIH_CONTEXT_WINDOW` > **live probe** (llama.cpp `/slots`, taking the min `n_ctx`
+across slots = effective single-request window) > aih.json **model-level**
+`models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`
+> default 128k). When the llama.cpp server splits the total window across parallel
+slots, `/slots` reports each slot's `n_ctx`, so "2-parallel 256k" resolves to
+128k automatically, no manual math; non-llama.cpp endpoints or probe failure
+silently fall back to configured values:
 
 ```jsonc
-// aih.json — 配置值作为探测失败时的回退（可选）
+// aih.json — configured values as fallback when the probe fails (optional)
 { "defaultProvider": "qwen",
   "providers": {
     "qwen":     { "model": "qwen3-27b",  "contextWindow": 131072 },
@@ -604,16 +634,17 @@ agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化
   } }
 ```
 
-**按模型声明窗口（F#34）**：一个 provider 挂多个模型时，provider 级 `contextWindow`
-对所有模型一刀切。`models[]` 支持对象形式 `{ "model": "<id>", "contextWindow": <n> }`，
-只对该模型生效（字符串与对象可混用），TUI 面板 / `/model` 切换 / `aih config` 全部跟随：
+**Per-model declared windows (F#34)**: with multiple models on one provider, a
+provider-level `contextWindow` applies uniformly. `models[]` supports object form
+`{ "model": "<id>", "contextWindow": <n> }`, applying only to that model (strings
+and objects mixable); TUI panel / `/model` switching / `aih config` all follow:
 
 ```jsonc
 { "providers": {
     "opencode": {
       "baseUrl": "https://opencode.ai/zen/v1",
       "model": "big-pickle",
-      "contextWindow": 200000,                       // 主模型（provider 级）
+      "contextWindow": 200000,                       // primary model (provider-level)
       "models": [
         { "model": "x-preview-f-free", "contextWindow": 1000000 },  // 1M
         { "model": "hy3-free",         "contextWindow": 190000 }    // 190k
@@ -622,280 +653,338 @@ agent 自述、不给 harness 插桩**。三个子命令，`--json` 出结构化
 ```
 
 ```sh
-AIH_CONTEXT_WINDOW=65536 AIH_COMPACT_AT=0.7 npm run cli -- chat   # 临时覆盖：小窗口模型/更早触发
+AIH_CONTEXT_WINDOW=65536 AIH_COMPACT_AT=0.7 npm run cli -- chat   # temporary override: small window / earlier trigger
 ```
 
-### Session Persistence & Audit（会话持久化与审计）
+### Session Persistence & Audit
 
-`chat` 与 `run` 默认把会话持久化到 `.aih/sessions/default.jsonl`（退出即落盘，
-含 Ctrl-C/exit 中断场景），再次进入自动续上；续跑时自动**回放历史**
-（`replayHistory`：用户/助手消息、工具调用与结果、压缩事件按原序渲染，上下文完整还原）；
-`--ephemeral` 可关闭持久化。
+`chat` and `run` persist sessions to `.aih/sessions/default.jsonl` by default
+(saved on exit, including Ctrl-C/exit interruption), auto-resuming next entry;
+resume auto-**replays history** (`replayHistory`: user/assistant messages, tool
+calls & results, compaction events rendered in order, full context restored);
+`--ephemeral` disables persistence.
 
 ```sh
-npm run cli -- chat                                # 默认持久化到 default，下次自动恢复
-npm run cli -- run "添加待办A" --session work     # 指定会话名 → .aih/sessions/work.jsonl
-npm run cli -- run "再添加B" -c                   # 续跑最近会话（上下文完整保留）
-npm run cli -- session list                       # 列出
-npm run cli -- session show work                  # 人类可读回放
-npm run cli -- session export work  > work.json   # 导出为 JSON
-npm run cli -- session fork default branch-a --from 7   # 从事件序 7 分叉出新会话
-npm run cli -- session checkpoint work "before risky refactor"   # 记录检查点（F#28）
-npm run cli -- session restore work   # 回滚：前缀分叉为 work-restore-<seq>（原文件不动）
-npm run cli -- session distill-branch branch-a default --from 7  # 废弃分支蒸馏为 branch_summary 注入目标会话
-# TUI 内：/checkpoint [note] 与 /restore [seq]（回滚前自动快照完整历史）
-npm run cli -- session rm work                    # 删除
-npm run cli -- stats                              # 所有会话 token 用量汇总
-npm run cli -- scorecard [--format json]          # harness 健康记分卡（6 指标，PE#3）
-npm run cli -- measure distance <a.json> <b.json> # 结构距离（added/dropped/revised+len，PR#2）
-npm run cli -- measure stream <traces.json>       # 行为距离 + 置换检验 R（seeded，PR#2）
-npm run cli -- measure crystallize <e> <n>        # 进化态中性读回 vs 端点（drift→exit 1）
+npm run cli -- chat                                # default persists to default, auto-recovers next time
+npm run cli -- run "add todo A" --session work     # named session → .aih/sessions/work.jsonl
+npm run cli -- run "add B too" -c                  # resume most recent session (full context kept)
+npm run cli -- session list                       # list
+npm run cli -- session show work                  # human-readable replay
+npm run cli -- session export work  > work.json   # export as JSON
+npm run cli -- session fork default branch-a --from 7   # fork new session from event seq 7
+npm run cli -- session checkpoint work "before risky refactor"   # record checkpoint (F#28)
+npm run cli -- session restore work   # rollback: prefix forks to work-restore-<seq> (original file untouched)
+npm run cli -- session distill-branch branch-a default --from 7  # distill abandoned branch into branch_summary injected into target session
+# Inside TUI: /checkpoint [note] and /restore [seq] (full history auto-snapshotted before rollback)
+npm run cli -- session rm work                    # delete
+npm run cli -- stats                              # all-session token usage summary
+npm run cli -- scorecard [--format json]          # harness health scorecard (6 metrics, PE#3)
+npm run cli -- measure distance <a.json> <b.json> # structural distance (added/dropped/revised+len, PR#2)
+npm run cli -- measure stream <traces.json>       # behavioral distance + permutation-test R (seeded, PR#2)
+npm run cli -- measure crystallize <e> <n>        # evolved-state neutral read-back vs endpoint (drift→exit 1)
 ```
 
-会话文件为 append-only JSONL（每行一个 SessionEvent），可直接审计或程序化回放。
-每次工具调用另追加到 `.aih/tool-audit.jsonl`（ts/tool/args[4KB]/ok/error），
-含 `task` 子代理内部调用；`--no-audit` 关闭。"模型可见即已记录"不变量。
+Session files are append-only JSONL (one SessionEvent per line), directly
+auditable or programmatically replayable. Every tool call is additionally
+appended to `.aih/tool-audit.jsonl` (ts/tool/args[4KB]/ok/error), including
+`task` subagent internal calls; `--no-audit` disables. The "model-visible =
+already recorded" invariant.
 
-### Subagent System（子代理）
+### Subagent System
 
-`task` 工具派发子代理：独立上下文、≤8 步、不可再嵌套，返回最终答案。
-`task` 本身免审，但其子代理调用的每个工具仍走各自权限门。
+The `task` tool dispatches subagents: independent context, ≤8 steps, no further
+nesting, returns the final answer. `task` itself is approval-free, but every tool
+its subagents call still goes through its own permission gate.
 
-### Max Mode（并行子代理 + best-of-N 裁判）
+### Max Mode (parallel subagents + best-of-N judge)
 
-`best_of_n` 工具对同一 prompt 并行派发 N 个独立子代理（N 默认 3、封顶 8；
-并发受 `AIH_TOOL_CONCURRENCY` 限制，结果按原序收集），再用一次**无工具**的
-LLM 裁判调用从候选答案里选出最佳（`{"best": <index>, "reason": "..."}`，
-越界/解析失败回退到第一个成功候选）。全部失败则整体报错；仅一个成功则直接
-采用（跳过裁判）。实现：`cli/src/maxmode.ts`（`runSubagent` / `mapOrdered` /
-`parseJudgeVerdict` / `bestOfN`），零新依赖，复用 core `AgentLoop` +
-`ToolRegistry`。冒烟覆盖：裁判解析/越界回退、`mapOrdered` 顺序与并发上限、
-N=3 全流程、n 钳制、全失败路径、子代理防递归（剔除 task/question/best_of_n）。
+The `best_of_n` tool dispatches N independent subagents in parallel on the same
+prompt (N default 3, cap 8; concurrency bounded by `AIH_TOOL_CONCURRENCY`,
+results collected in order), then one **tool-less** LLM judge call picks the best
+(`{"best": <index>, "reason": "..."}`; out-of-range/parse failure falls back to
+the first successful candidate). All-fail → overall error; exactly one success →
+adopt directly (skip the judge). Implementation: `cli/src/maxmode.ts`
+(`runSubagent` / `mapOrdered` / `parseJudgeVerdict` / `bestOfN`), zero new deps,
+reuses core `AgentLoop` + `ToolRegistry`. Smoke coverage: judge parsing/
+out-of-range fallback, `mapOrdered` ordering + concurrency cap, N=3 full flow,
+n clamping, all-fail path, subagent anti-recursion (task/question/best_of_n
+excluded).
 
-两个可选增强（借鉴 CodebuffAI/freebuff，roadmap FB#1 / FB#2）：
+Two optional enhancements (borrowed from CodebuffAI/freebuff, roadmap FB#1 /
+FB#2):
 
-- **多策略模式（FB#1）**：传 `prompts`（一组短策略提示）后，候选 i 在**共享
-  任务上下文**之上叠加自己的策略方向（`prompts[i % len]`）——比 N 个同 prompt
-  采样探索面更广。结果带 `strategies` 字段，裁判给每个候选标注
-  `[strategy: …]`，可权衡"方法对不对"而非只看"答案对不对"。省略 `prompts`
-  → 单 prompt 行为不变。
-- **双裁判面板（FB#2）**：设 `AIH_SECOND_JUDGE_MODEL` 后启用第二裁判——两裁判
-  **并行**（`Promise.allSettled`），保留主裁判的选择（两个意见的中位）；**分歧**
-  或**任一裁判失败**都标记 `judgeDegraded` 并在 stderr 警告（绝不静默丢弃一个
-  裁判——丢弃 = 面板退化成单意见）；双裁判都失败 → 硬错误。缺省 → 单裁判
-  行为不变。面板是通用 `judgePanel<V>()`，`/goal` 裁判可共用同一套纪律
-  （roadmap FB#6）。
+- **Multi-strategy mode (FB#1)**: pass `prompts` (a short strategy-prompt array)
+  and candidate i layers its own strategy direction on the **shared task context**
+  (`prompts[i % len]`) — wider exploration than N samples of the same prompt.
+  Results carry a `strategies` field and the judge annotates each candidate
+  `[strategy: …]`, letting you weigh "was the approach right" rather than only
+  "was the answer right". Omitting `prompts` → single-prompt behavior unchanged.
+- **Dual-judge panel (FB#2)**: set `AIH_SECOND_JUDGE_MODEL` to enable a second
+  judge — both run **in parallel** (`Promise.allSettled`), keeping the primary's
+  choice (the median of two opinions); **disagreement** or **any judge failure**
+  marks `judgeDegraded` and warns on stderr (never silently drops a judge —
+  dropping would degrade the panel to a single opinion); both judges fail → hard
+  error. Default → single-judge behavior unchanged. The panel is a generic
+  `judgePanel<V>()`; the `/goal` judge can share the same discipline (roadmap FB#6).
 
-### Agent Teams（roster + 任务板 + mailbox）
+### Agent Teams (roster + task board + mailbox)
 
-在子代理原语之上的协作层（roadmap D#15）：`.aih/team/` 下的纯文件团队工作区，
-`aih team` 管理名册、任务板与每 agent 的 mailbox：
+A collaboration layer above the subagent primitive (roadmap D#15): a pure-file
+team workspace under `.aih/team/`; `aih team` manages the roster, task board and
+per-agent mailboxes:
 
 ```sh
 aih team add-agent scout --role research --prompt "You are a careful researcher."
 aih team add-task "write the report" --detail "draft v1"
 aih team claim <task> --as scout
-aih team dispatch <task> --as scout   # 跑一个同步 agent turn，结果镜像回任务板
+aih team dispatch <task> --as scout   # run one synchronous agent turn, result mirrored back to the board
 aih team done <task> --note "shipped"
 aih team mail builder "report ready" --sender scout
 aih team inbox builder [--unread]
-aih team list                         # 名册 + 任务板 + inbox 计数
+aih team list                         # roster + task board + inbox counts
 ```
 
-任务 id 支持唯一前缀解析；`dispatch` 复用 D#13 的 `spawnJob`（作业板
-`.aih/jobs.json` 记录运行态），完成后把 done/failed + 预览写回任务板；
-需要后台并行时用 TUI `/bg`（长驻进程持有子进程句柄）。
+Task ids support unique-prefix resolution; `dispatch` reuses D#13's `spawnJob`
+(job board `.aih/jobs.json` records running state) and writes done/failed +
+preview back to the board after completion; use TUI `/bg` for background
+parallelism (long-running processes hold the child-process handle).
 
-### Builtin Skills（内置技能）
+### Builtin Skills
 
-技能是可复用的指令包（YAML frontmatter + 正文），让 agent "接入即懂行"：
+Skills are reusable instruction packs (YAML frontmatter + body) that make the
+agent "domain-savvy on arrival":
 
 ```sh
-npm run cli -- skills list                        # 列出：project > user > builtin 三级
-npm run cli -- skills find tour                   # 按关键词检索（名称命中加权）
-npm run cli -- skills install app-tour            # 把内置技能落盘到 .aih/skills/
-npm run cli -- skills show app-tour               # 查看正文
+npm run cli -- skills list                        # list: project > user > builtin three tiers
+npm run cli -- skills find tour                   # keyword search (name-hit weighted)
+npm run cli -- skills install app-tour            # materialize builtin skill into .aih/skills/
+npm run cli -- skills show app-tour               # view the body
 ```
 
-内置：
+Builtin:
 
 | Skill | Description |
 |---|---|
-| `app-tour` | 探索已接入应用的工具并产出能力巡览 |
-| `batch-ops` | 批量数据操作的 plan-execute-verify 模式 |
-| `session-report` | 把当前会话历史整理成结构化报告 |
+| `app-tour` | Explore the connected app's tools and produce a capability tour |
+| `batch-ops` | plan-execute-verify pattern for bulk data operations |
+| `session-report` | turn the current session history into a structured report |
 
-同名时项目覆盖用户覆盖内置；会话与 `run` 中技能清单注入 system prompt，模型按需
-调用 `load_skill` 加载全文；TUI `/skills` 列出、`/<技能名>` 直接注入。
+Same name → project overrides user overrides builtin; in sessions and `run`, the
+skill roster is injected into the system prompt and the model calls `load_skill`
+on demand to load full text; TUI `/skills` lists, `/<skill-name>` injects
+directly.
 
-**技能相关性自动加载**（roadmap P1#4，`cli/src/bm25.ts`）：每轮开始前用 BM25
-对已装技能做相关性排序（CJK 按字符 bigram 分词），命中技能以"建议加载"提示
-注入本轮上下文，模型可直接 `load_skill`；`aih skills suggest <query>` 可离线
-查看同一排序。另：`SKILL.md` front matter 支持 `secretPatterns`（见"安全与调试"）。
+**Skill-relevance auto-loading** (roadmap P1#4, `cli/src/bm25.ts`): before each
+turn, BM25 ranks installed skills by relevance (CJK tokenized by character
+bigrams); hit skills inject a "suggested load" hint into this turn's context, and
+the model can `load_skill` directly; `aih skills suggest <query>` shows the same
+ranking offline. Also: `SKILL.md` front matter supports `secretPatterns` (see
+"Security & debugging").
 
-### 后台任务（`/bg`）与沙箱 seam
+### Background Tasks (`/bg`) & the Sandbox Seam
 
-- **后台任务**（roadmap D#13）：TUI `/bg <prompt>` 把一次 agent turn 派生成
-  后台子进程（`aih run --session bg-<id>`），TUI 保持响应；状态行实时显示
-  running/done/failed 计数，完成时把最终答案作为 system 消息回显；
-  `/bg list` / `/bg cancel <id>` 管理；作业板落 `.aih/jobs.json`，重启 TUI 仍在。
-  `distill` / `tidy` 等纯 CLI 子命令也可作为后台作业派发。
-- **沙箱 seam**（roadmap D#12）：`run_cmd` 的执行后端可替换——
-  `local`（默认）/ `bwrap` / `remote`（`cli/src/sandbox.ts` 的 `SandboxBackend`
-  接口，`AIH_SANDBOX` 或工具参数 `sandbox` 选择）；先定接口，默认本地。
+- **Background tasks** (roadmap D#13): TUI `/bg <prompt>` spawns one agent turn
+  as a background subprocess (`aih run --session bg-<id>`), keeping the TUI
+  responsive; the status bar shows running/done/failed counts live, and the final
+  answer is echoed back as a system message on completion; `/bg list` /
+  `/bg cancel <id>` manage; the job board lands in `.aih/jobs.json`, surviving
+  TUI restarts. Pure-CLI subcommands like `distill` / `tidy` can also be
+  dispatched as background jobs.
+- **Sandbox seam** (roadmap D#12): `run_cmd`'s execution backend is replaceable
+  — `local` (default) / `bwrap` / `remote` (the `SandboxBackend` interface in
+  `cli/src/sandbox.ts`, chosen via `AIH_SANDBOX` or the tool's `sandbox`
+  parameter); interface first, default local.
 
-### 权限模型（allow / ask / deny）
+### Permission Model (allow / ask / deny)
 
-| 档位 | 默认对象 | 行为 |
+| Tier | Default object | Behavior |
 |---|---|---|
-| `allow` | 读操作 | 直接执行 |
-| `ask` | 写操作 | 经 `ApprovalGate` 人工/策略确认 |
-| `deny` | 业务红线 | 注册表直接拒绝 |
+| `allow` | read operations | execute directly |
+| `ask` | write operations | human/policy confirmation via `ApprovalGate` |
+| `deny` | business red lines | registry rejects directly |
 
-策略实现 `ApprovalGate` 即可接入自有审批系统（`PolicyGate` 提供规则引擎雏形）。
-TUI 内联确认：`⚠ approval requested: <tool> <args>` → `[y] once · [n] no ·
-[a] always <scope>`；`scope` 由目标路径自动推导为父目录，选 `a` 按 last-match-wins
-持久化到 aih.json（项目 > 全局）。
+Implement the `ApprovalGate` policy to plug in your own approval system
+(`PolicyGate` provides a rule-engine prototype). TUI inline confirmation:
+`⚠ approval requested: <tool> <args>` → `[y] once · [n] no · [a] always <scope>`;
+`scope` is auto-derived from the target path's parent dir; `a` persists to
+aih.json with last-match-wins (project > global).
 
-**只读 bash 护栏 + guarded 写工具（KL-R#4，纵深防御非沙箱）**：
-- **只读自动放行**：`autoAllowReadonly` 下，`run_cmd` 走 `isReadonlyCommand`
-  前缀白名单（`ls`/`git status`/`grep`…）判定只读，命中即免确认直接执行；
-  非只读命令回落人工确认。
-- **防御性黑名单**（`hasDefensiveVeto`，在只读判定**之前**否决）：即便命令以只读
-  前缀开头，只要含 `;`/`&&`/`||`/`|`/`>`/`<`/`&`/反引号/`$(`/`${`/`sudo`/`env`/
-  `eval`/`exec`/`source`/`--pre`/`-exec`/`-delete`/`--pager`/`sh -c`/`bash -c`/
-  `rm`/`mv`/`cp`/`chmod`/`curl`/`wget`/`nc` 等注入/执行/危险子串，一律**否决只读
-  判定**（回落人工确认）——阻断 `ls; rm -rf`、`grep … | sh`、`rg --pre '…'`、
-  `man -P '…'` 一类借只读外壳执行任意命令的注入路径。
-- **guarded 写工具地板**（`GUARDED_WRITE_TOOLS`）：`run_cmd`/`write_file`/`edit`/
-  `apply_patch`/`append_text`/`patch`/`permissions`/`toggle_todo`/`remove_todo`/
-  `add_todo` 这类**作者标记需人工**的写工具，其 `allow` 规则在 `RulesetGate` 里被
-  **降为 `ask`**（`deny` 仍优先）——配置规则（含 allow-everything 或机器写出的配置）
-  **永远无法自动放行**它们，人工确认是不可被配置绕过的人类地板。只读调用不受影响。
+**Read-only bash guardrail + guarded write tools (KL-R#4, defense-in-depth not a
+sandbox)**:
+- **Read-only auto-allow**: under `autoAllowReadonly`, `run_cmd` classifies via
+  `isReadonlyCommand` prefix whitelist (`ls`/`git status`/`grep`…) — whitelist hit
+  executes without confirmation; non-readonly commands fall back to human
+  confirmation.
+- **Defensive blacklist** (`hasDefensiveVeto`, vetoes **before** the readonly
+  check): even a command starting with a readonly prefix is vetoed for readonly
+  classification (falls back to human confirmation) if it contains
+  `;`/`&&`/`||`/`|`/`>`/`<`/`&`/backtick/`$(`/`${`/`sudo`/`env`/`eval`/`exec`/
+  `source`/`--pre`/`-exec`/`-delete`/`--pager`/`sh -c`/`bash -c`/`rm`/`mv`/`cp`/
+  `chmod`/`curl`/`wget`/`nc` etc. injection/execution/dangerous substrings —
+  blocking `ls; rm -rf`, `grep … | sh`, `rg --pre '…'`, `man -P '…'`-style
+  arbitrary-command injection through a readonly shell.
+- **Guarded write-tool floor** (`GUARDED_WRITE_TOOLS`): for author-marked
+  human-guarded write tools (`run_cmd`/`write_file`/`edit`/`apply_patch`/
+  `append_text`/`patch`/`permissions`/`toggle_todo`/`remove_todo`/`add_todo`),
+  their `allow` rules are **lowered to `ask`** in `RulesetGate` (`deny` still
+  wins) — configuration (including allow-everything or machine-written config)
+  **can never auto-allow them**; human confirmation is a floor that config cannot
+  bypass. Readonly calls unaffected.
 
-### 信任模型（OC#4 — 本地单算子，非多租户安全边界）
+### Trust Model (OC#4 — local single operator, not a multi-tenant security boundary)
 
-AIH 的威胁模型是**本地单算子**：
+AIH's threat model is **local single operator**:
 
-- **信任边界 = 宿主 OS 用户**。能操作该 agent 的人就能让 agent 做任何 agent 能做的事。
-  session 的所有权/可见性是**可用性特性，不是安全边界**——不要把它当隔离手段。
-- **prompt-injection-only 链不算安全 bug**：仅靠「模型被诱导」而**没有**越过下列任一硬边界的
-  路径不在威胁模型内。硬边界 = `allow/ask/deny` 权限门（`ApprovalGate`）、凭据脱敏与
-  owner 隔离（`redactCredential` / 降级而非 fallback）、sandbox seam（默认 local，可切
-  bwrap/remote）、工具注册表的 `deny` 红线。越过其中任一才算安全事件。
-- **需要真隔离时**：用独立 agent / 独立宿主（独立 OS 用户或容器）建立新信任边界，而不是
-  指望 prompt 或 session 隔离。
-- **对手模型**：默认对手是「同宿主用户」与「不可信的外部内容（网页/工具输出）」；外部内容
-  只能影响模型意图，不能直接触达 deny 红线或凭据——除非它诱导模型主动调用一个被 allow/ask
-  放行的工具，而那属于用户对权限配置的决策。
+- **Trust boundary = the host OS user**. Anyone who can operate the agent can
+  make it do anything the agent can do. Session ownership/visibility is a
+  **usability feature, not a security boundary** — don't treat it as isolation.
+- **Prompt-injection-only chains are not security bugs**: a path relying solely
+  on "the model being induced" that does **not** cross any hard boundary below is
+  outside the threat model. Hard boundaries = `allow/ask/deny` permission gates
+  (`ApprovalGate`), credential redaction + owner isolation
+  (`redactCredential` / degrade-not-fallback), the sandbox seam (default local,
+  switchable bwrap/remote), the tool registry's `deny` red lines. Crossing any of
+  these is a security event.
+- **When you need real isolation**: build a new trust boundary with an
+  independent agent / independent host (separate OS user or container) — don't
+  rely on prompt or session isolation.
+- **Adversary model**: the default adversaries are "same-host users" and
+  "untrusted external content (web pages/tool output)"; external content can only
+  influence model intent, it cannot directly touch deny red lines or credentials
+  — unless it induces the model to proactively call an allow/ask-granted tool,
+  which is the user's decision about permission configuration.
 
-### TUI（交互终端）
+### TUI (interactive terminal)
 
-opencode / MiMo-Code 风格全屏 TUI：
+opencode / MiMo-Code style full-screen TUI:
 
-- **轻 Markdown 渲染**：标题→粗体、代码块→暗色+**语法高亮**（关键字/字符串/数字/
-  注释分色）、引用→暗色、列表→`•`/序号、行内代码→青色、行内链接双色下划线、
-  表格 `|`→`·`；工具调用图标行内（`$` bash / `→` read / `✱` search / `%` web /
-  `←` write / `#` todo / `⚙` 其他）；同类工具自动分组折叠（`$ bash ×3 · enter to
-  expand`）；`run_cmd` 等结果前三行预览（`… N more · enter to expand`）
-- **权限确认（文件夹级记忆）**：忙碌中提交自动排队（`queued: …`）
-- **多行输入框**：按显示宽度折行（CJK 宽字符感知、光标精确定位）、框内滚动；
-  `/` 触发 Tab 幽灵补全；忙碌时旋转指示器 + 已用秒数
-- **底部**：重边线（滚动时 `↑N`）+ 提示行（cwd · 快捷键 · 右侧上下文用量
-  `used/limit (pct%)`）+ 状态行（`⊙ N MCP` 徽章 · 应用 · 版本 · 会话名）
-- **交互**：鼠标滚轮 / PgUp/PgDn 滚动；上下键翻输入历史；空输入框 `Enter` 或
-  `o` 展开/折叠选中工具块（**legacy Windows conhost 无鼠标事件，这是唯一展开路径**，
-  常规终端鼠标点击也可用）；`exit`（或 `/quit`，`ctrl-c` 清空输入再按退出）还原终端；
-  忙碌中 `ctrl-c` 取消当前轮不退出
-- **Windows 显示**：`install.ps1` 安装的 `aih.cmd` 启动器自动 `chcp 65001`（UTF-8），
-  legacy conhost 的框线/块字符不乱码；上下文进度条用 ASCII `#`/`-`（GBK 下块字符
-  按双宽渲染错位），侧栏其余用文本行（`Nk / Mk · X%`）
-- 斜杠命令：`/mode` `/goal` `/tools` `/model <id>`（热切换）`/usage` `/compact [focus]` `/clear`
-  `/inject <text>` `/events` `/skills` `/vivid` `/bg <prompt>` `/find <text>` `/shell [--send]` `/fix [--show]` `/ <技能名>`
-- **`/find <text>`**：跨所有工具输出逐行检索（含 32KB 内带上限的展开内容），
-  命中工具自动展开并滚动到首个命中，列出最近 12 条命中（`tool · line · 片段`）；
-  超出内带上限的全量输出用 `run_cmd keep_output=true` 落盘 `.aih/outputs/*.log`
-- **`/shell [--send]`**（IT#1 shell 上下文感知）：展示本会话最近的 `run_cmd` 上下文
-  （命令 · 退出码 · cwd · 输出尾部，`keep_output` 时附全量输出文件路径）；
-  `--send` 把该上下文块注入下一 turn。agent 侧另有 `shell_context` 工具可主动取用
-  （`max_commands`/`max_output_chars` 可调），或设 `AIH_SHELL_CONTEXT=auto` 在每个
-  正常消息 turn 起始自动附带——免去手动粘贴 shell 报错/输出
-- **`/fix [--show]`**（IT#2 确定性 error-detection）：检测本会话失败的 `run_cmd`
-  （非零退出码 / 超时），展示摘要（命令 · 退出码 · 分类），组装修复请求块送 agent
-  求修复；`--show`/`--dry` 只展示不发送。状态栏在失败后亮红色 `⚠ N failed`
-  （全绿隐藏；`AIH_ERROR_DETECT=0` 关闭自动指示）
-- **`/vivid` 简洁渲染**：切换 plain 模式——去掉边框/底色/侧栏/状态提示等 chrome，
-  只留正文（适合低带宽/远程/日志回放）；再按一次还原完整主题
-- 会话标题：首轮后自动 LLM 生成 2–6 词标题（`<name>.jsonl.meta.json`），状态栏与
-  `session list` 显示
+- **Light Markdown rendering**: headings→bold, code blocks→dark + **syntax
+  highlighting** (keywords/strings/numbers/comments color-coded), quotes→dark,
+  lists→`•`/numbers, inline code→cyan, inline links two-tone underlined,
+  tables `|`→`·`; tool-call icons inline (`$` bash / `→` read / `✱` search /
+  `%` web / `←` write / `#` todo / `⚙` other); same-class tools auto-group
+  collapsed (`$ bash ×3 · enter to expand`); `run_cmd` etc. first-three-line
+  preview (`… N more · enter to expand`)
+- **Permission confirmation (folder-level memory)**: submissions while busy
+  auto-queue (`queued: …`)
+- **Multiline input box**: wraps by display width (CJK wide-char aware, cursor
+  precisely positioned), in-box scrolling; `/` triggers Tab ghost completion;
+  spinner + elapsed seconds while busy
+- **Bottom**: heavy border (scroll indicator `↑N`) + hint line (cwd · shortcuts ·
+  right-side context usage `used/limit (pct%)`) + status line (`⊙ N MCP` badge ·
+  app · version · session name)
+- **Interaction**: mouse wheel / PgUp/PgDn scroll; up/down arrows walk input
+  history; `Enter` on an empty box or `o` expands/collapses the selected tool
+  block (**legacy Windows conhost has no mouse events — this is the only expand
+  path**; regular terminals also support mouse click); `exit` (or `/quit`,
+  `ctrl-c` clears input then exits) restores the terminal; `ctrl-c` while busy
+  cancels the current turn without exiting
+- **Windows display**: `aih.cmd` launcher from `install.ps1` auto-runs
+  `chcp 65001` (UTF-8), so legacy conhost box-drawing/block chars don't garble;
+  the context progress bar uses ASCII `#`/`-` (block chars render double-width
+  wrong under GBK), the rest of the sidebar uses text lines (`Nk / Mk · X%`)
+- Slash commands: `/mode` `/goal` `/tools` `/model <id>` (hot switch) `/usage`
+  `/compact [focus]` `/clear` `/inject <text>` `/events` `/skills` `/vivid`
+  `/bg <prompt>` `/find <text>` `/shell [--send]` `/fix [--show]`
+  `/<skill-name>`
+- **`/find <text>`**: line-by-line search across all tool outputs (incl. expanded
+  content within the 32KB inline cap); hit tools auto-expand and scroll to the
+  first hit, listing the 12 most recent hits (`tool · line · snippet`); full
+  outputs beyond the cap are captured with `run_cmd keep_output=true` to
+  `.aih/outputs/*.log`
+- **`/shell [--send]`** (IT#1 shell context awareness): shows this session's
+  recent `run_cmd` context (command · exit code · cwd · output tail, full-output
+  file path when `keep_output`); `--send` injects the context block into the next
+  turn. Agent-side `shell_context` tool can also pull it on demand
+  (`max_commands`/`max_output_chars` adjustable), or set `AIH_SHELL_CONTEXT=auto`
+  to attach it at the start of every normal message turn — no more manual
+  pasting of shell errors/output
+- **`/fix [--show]`** (IT#2 deterministic error-detection): detects this
+  session's failed `run_cmd`s (non-zero exit / timeout), shows a summary
+  (command · exit code · classification), assembles a fix-request block sent to
+  the agent; `--show`/`--dry` show only, don't send. The status bar lights red
+  `⚠ N failed` after a failure (hidden when all green; `AIH_ERROR_DETECT=0`
+  disables auto-indication)
+- **`/vivid` minimal rendering**: toggle plain mode — strips chrome (borders/
+  background/sidebar/status hints), leaves only the body (good for low-bandwidth/
+  remote/log replay); toggle again to restore the full theme
+- Session titles: after the first turn, an LLM auto-generates a 2–6 word title
+  (`<name>.jsonl.meta.json`), shown in the status bar and `session list`
 
-### 通用/编程能力（本地工具集，对齐 opencode 内置工具）
+### General/Programming Capabilities (local toolset, aligned with opencode built-ins)
 
-AIH 的 agent 内核是通用的，工具来自外接应用；交互终端默认再挂一套本地工具
-（与任意 MCP 应用工具并存，同名时应用工具优先）：
+AIH's agent kernel is generic — tools come from the connected app; the
+interactive terminal additionally mounts a local toolset by default (coexisting
+with any MCP app tools; same-name → app tool wins):
 
-| 工具 | 说明 | 权限 |
+| Tool | Description | Permission |
 |---|---|---|
-| `list_dir` / `read_file` | 列目录 / 读文件（双预算 3000 行/50KB + 逐行 512 字符；full/head/tail/middle 四态截断，middle 保 head+tail + `… N lines elided …` 标记，巨型行只留字节窗口不物化全串；行偏移） | allow |
-| `write_file` / `run_cmd` | 写文件 / 执行命令（默认 120s 超时、可传 timeout_ms 至 600s；后台子进程不阻塞返回） | ask |
-| `edit` | 精确字符串替换编辑（歧义时报错，`replace_all` 全量） | ask |
-| `glob` | `**/*.ts` 模式找文件（无 `/` 的模式任意深度匹配） | allow |
-| `grep` | 正则内容搜索 + `include` 文件名过滤 | allow |
-| `todo` | 任务清单（`.aih/todos.json`，至多一个 in_progress） | allow |
-| `remember` | 项目记忆：追加/重写 `.aih/memory.md`，跨会话持久化知识 | allow |
-| `memory_recall` | 检索项目+用户记忆：自由文本 query → 词元重叠打分返回最相关条目（零依赖，注入块被预算截断时的兜底召回） | allow |
-| `question` | 模型向用户提问并等待回答（TUI 内联问答行） | allow |
-| `webfetch` | 抓取 URL → 纯文本（HTML 转 text，64KB 截断）。浏览器级 UA + Accept 头、网络失败有界重试 1 次、Cloudflare 403 challenge 自动换诚实 UA 重试、`timeout` 参数（秒，默认 30、上限 120）、下载前 content-length 预检、失败信息可操作（提示替代端点/websearch） | allow |
-| `websearch` | DuckDuckGo 搜索（标题/URL/摘要，免 key） | allow |
-| `task` | 派发子代理（独立上下文、≤8 步、不可再嵌套） | allow* |
-| `apply_patch` | 多文件补丁（Add/Update/Delete/Move，opencode 格式） | ask |
+| `list_dir` / `read_file` | list dir / read file (dual budget 3000 lines/50KB + 512 chars/line; full/head/tail/middle four-state truncation, middle keeps head+tail + `… N lines elided …` marker, giant lines keep only a byte window without materializing the whole string; line offset) | allow |
+| `write_file` / `run_cmd` | write file / run command (default 120s timeout, `timeout_ms` up to 600s; background child processes don't block the return) | ask |
+| `edit` | exact string-replacement edit (errors on ambiguity, `replace_all` for all) | ask |
+| `glob` | `**/*.ts` patterns find files (`/`-less patterns match at any depth) | allow |
+| `grep` | regex content search + `include` filename filter | allow |
+| `todo` | task list (`.aih/todos.json`, at most one in_progress) | allow |
+| `remember` | project memory: append/rewrite `.aih/memory.md`, cross-session persistent knowledge | allow |
+| `memory_recall` | retrieve project+user memory: free-text query → token-overlap scoring returns the most relevant entries (zero deps; fallback recall when the injected block is budget-truncated) | allow |
+| `question` | the model asks the user a question and waits (TUI inline Q&A line) | allow |
+| `webfetch` | fetch URL → plain text (HTML→text, 64KB cap). Browser-grade UA + Accept headers, one bounded network retry, Cloudflare 403 challenge auto-retries with an honest UA, `timeout` param (seconds, default 30, cap 120), content-length precheck before download, actionable failure messages (suggests alternate endpoint/websearch) | allow |
+| `websearch` | DuckDuckGo search (titles/URLs/snippets, key-free) | allow |
+| `task` | dispatch subagent (independent context, ≤8 steps, no further nesting) | allow* |
+| `apply_patch` | multi-file patch (Add/Update/Delete/Move, opencode format) | ask |
 
-plan 模式下所有 `ask` 写工具自动隐藏。未对齐 opencode 的仅 `lsp`（语言服务器基建）
-与实验性 `execute`(code-mode)——前者属 MCP 外挂范畴，后者由 run_cmd + roadmap 沙箱
-seam 覆盖。除工具集外，opencode 的 `rules`（AGENTS.md/CLAUDE.md/instructions）、
-`policies`（provider.use）、`keybinds`（tui.json）三块能力也已对齐——见 Configuration 节。
+In plan mode all `ask` write tools auto-hide. The only opencode capabilities not
+aligned are `lsp` (language-server infra) and experimental `execute` (code-mode)
+— the former belongs in the MCP plugin domain, the latter is covered by run_cmd +
+the roadmap sandbox seam. Beyond the toolset, opencode's `rules`
+(AGENTS.md/CLAUDE.md/instructions), `policies` (provider.use) and `keybinds`
+(tui.json) are all aligned — see the Configuration section.
 
-### 安全与调试
+### Security & Debugging
 
-- **Shell 环境策略**（借鉴 Codex CLI 的 `shell_environment_policy`）：`run_cmd`
-  拉起的子进程**不再继承宿主完整环境**——名字带 `KEY / TOKEN / SECRET / PASSWORD /
-  CREDENTIAL` 等敏感词的变量、以及 `AIH_*API*` 凭据一律剔除，`PATH / HOME / TERM`
-  等良性变量保留。这样 agent 执行的命令拿不到你的 API key / 数据库密码，避免
-  密钥随子进程泄漏或被 `env` 打印。实现见 `cli/src/env-policy.ts`（`buildChildEnv`）。
-- **`--debug-prompt`**：每次 LLM 调用前，把**模型实际看到的完整 messages**
-  （system prompt + 历史 + 本轮输入）打印到 stderr，用于排查 prompt 组装、
-  技能注入、记忆块、goal 守卫是否按预期进入上下文。对应 Codex 的
-  `codex debug prompt-input`；内核侧由 `AgentLoop.onPromptInput` 钩子提供
-  （`core/src/agent-loop.ts`）。
-- **技能名册上下文预算**：系统提示里的 `## Skills` 名册受上下文预算约束
-  （窗口已知时取 2%，未知时上限 8000 字符）。超限时先截短各技能描述、
-  仍超则省略尾部技能并附提示，避免技能越多越挤占正文上下文。
-- **工具结果脱敏 + 计时钩子**（roadmap D#11）：默认开启的内置钩子在工具结果
-  进入 LLM / 会话日志 / 审计前，把常见凭据形状（`sk-…` / `ghp_…` / `AKIA…` /
-  `xox…` / `api_key=…` 等）替换为 `[REDACTED]` 并附 `redacted: N` 计数与
-  `duration_ms` 计时；`--no-redact` 关闭脱敏。技能可在 `SKILL.md` front matter
-  用 `secretPatterns`（分号分隔的正则源）声明额外秘密形状，非法正则自动跳过，
-  内置表始终生效。实现见 `cli/src/hooks.ts`。
-
----
-
+- **Shell environment policy** (borrowed from Codex CLI's
+  `shell_environment_policy`): `run_cmd` child processes **no longer inherit the
+  host's full environment** — variables whose names contain sensitive words like
+  `KEY / TOKEN / SECRET / PASSWORD / CREDENTIAL`, plus `AIH_*API*` credentials,
+  are stripped; benign variables (`PATH / HOME / TERM`) kept. Commands the agent
+  runs can't get your API key / database password, preventing secret leakage via
+  child processes or `env` printing. Implementation: `cli/src/env-policy.ts`
+  (`buildChildEnv`).
+- **`--debug-prompt`**: before every LLM call, prints the **full messages the
+  model actually sees** (system prompt + history + this turn's input) to stderr,
+  for debugging prompt assembly, skill injection, memory blocks, goal guards.
+  Corresponds to Codex's `codex debug prompt-input`; kernel-side provided by the
+  `AgentLoop.onPromptInput` hook (`core/src/agent-loop.ts`).
+- **Skill-roster context budget**: the `## Skills` roster in the system prompt is
+  budget-constrained (2% of the window when known, 8000-char cap when unknown).
+  Over-limit → truncate each skill's description first, drop trailing skills with
+  a hint if still over — more skills don't crowd out body context.
+- **Tool-result redaction + timing hooks** (roadmap D#11): a default-on built-in
+  hook replaces common credential shapes (`sk-…` / `ghp_…` / `AKIA…` / `xox…` /
+  `api_key=…` etc.) with `[REDACTED]` plus a `redacted: N` count and `duration_ms`
+  timing before tool results enter the LLM / session log / audit; `--no-redact`
+  disables. Skills can declare extra secret shapes with `secretPatterns`
+  (semicolon-separated regex sources) in `SKILL.md` front matter; invalid regexes
+  are skipped automatically; the built-in table always applies. Implementation:
+  `cli/src/hooks.ts`.
 ## Architecture
 
 ```
-L3 技能层   skills/aih-app-integration   按需加载的领域知识，可由 skill-creator 自进化
-L2 规程层   APP.md · harness.yml · scripts · tasks · docs/decisions.md
-L1 内核层   core/  SessionLog · ToolRegistry(守卫管线) · AgentLoop(turn/step) · Seams(LLM/权限)
-L0 接入层   mcp-server/  AppAdapter: Context(读) / Action(写,带权限) / Event(流)
-横切面      权限三档 allow/ask/deny · 审计日志 · eval 交接门禁
+L3 skill layer   skills/aih-app-integration   on-demand domain knowledge, self-evolving via skill-creator
+L2 procedure     APP.md · harness.yml · scripts · tasks · docs/decisions.md
+L1 kernel        core/   SessionLog · ToolRegistry(guarded pipeline) · AgentLoop(turn/step) · Seams(LLM/permissions)
+L0 integration   mcp-server/   AppAdapter: Context(read) / Action(write, with permissions) / Event(stream)
+cross-cutting    allow/ask/deny permissions · audit log · eval handoff gate
 ```
 
 ## Configuration
 
-优先级：**flag > 环境变量 > 项目 `aih.json`/`.aih/config.json` > 全局用户配置**。
+Precedence: **flag > environment variable > project `aih.json`/`.aih/config.json` > global user config**.
 
-全局用户配置按 **XDG 数据目录规范**解析（`cli/src/paths.ts`）：
-`AIH_HOME` > `$XDG_DATA_HOME/aih` > `~/.local/share/aih`；旧版 `~/.aih` 在 XDG
-目录不存在时**仍可读**（平滑迁移，已存在的旧配置不丢）。
+Global user config follows the **XDG data-directory spec** (`cli/src/paths.ts`):
+`AIH_HOME` > `$XDG_DATA_HOME/aih` > `~/.local/share/aih`; the legacy `~/.aih`
+directory is **still readable** when XDG does not exist (smooth migration, existing
+config is never lost).
 
 ```json
 {
@@ -912,28 +1001,31 @@ L0 接入层   mcp-server/  AppAdapter: Context(读) / Action(写,带权限) / E
 }
 ```
 
-`aih config` 打印生效配置及各字段来源；`aih models` 列出所有 provider。
+`aih config` prints the effective config and the source of each field; `aih models`
+lists every provider.
 
-**编辑器补全（`$schema` 注入）**：在 `aih.json` / `config.json` 顶部加
-`"$schema": "https://aih.dev/schema/aih.schema.json"` 即获得字段自动补全与校验；
-`aih config --schema` 直接打印该 JSON Schema（本地文件 `cli/schema/aih.schema.json`）。
+**Editor completion (`$schema` injection)**: adding
+`"$schema": "https://aih.dev/schema/aih.schema.json"` at the top of `aih.json` /
+`config.json` gives field autocompletion and validation; `aih config --schema`
+prints the JSON Schema directly (local file `cli/schema/aih.schema.json`).
 
-**一个 provider 挂多个模型**：`model` 是主模型，`models[]` 列出同一端点下额外
-可切换的模型（共享该 provider 的 `baseUrl` / `headers` / `apiKeyEnv`）。每个模型
-在 `aih models` 与 TUI 的 `ctrl-p` 模型选择器里各占一行，用
-`/model <provider>/<model>` 或直接点选即可热切换——适合把免费档 / 多档模型
-都挂在一个端点下随时切。
+**One provider, multiple models**: `model` is the primary model, `models[]` lists
+extra switchable models under the same endpoint (sharing that provider's `baseUrl` /
+`headers` / `apiKeyEnv`). Each model gets its own row in `aih models` and the TUI's
+`ctrl-p` model picker — hot-switch with `/model <provider>/<model>` or by selecting
+directly. Great for hanging free-tier / multi-tier models off one endpoint.
 
-### 规则（`AGENTS.md` / `CLAUDE.md` / `instructions` — opencode `rules` parity）
+### Rules (`AGENTS.md` / `CLAUDE.md` / `instructions` — opencode `rules` parity)
 
-AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**（对齐 opencode 的
-`rules` 机制，此前只读 APP.md 应用契约）。加载顺序（同类中第一个命中优先）：
+AIH reads and injects project/global rule files as **mandatory instructions**
+(aligning with opencode's `rules` mechanism; previously only the APP.md app contract
+was read). Load order (first hit wins within each class):
 
-1. **项目规则** — 从 `cwd` 向上逐层找 `AGENTS.md`（无则回退 `CLAUDE.md`）；
-2. **全局规则** — `~/.claude/CLAUDE.md`（Claude Code 兼容，`AIH_DISABLE_CLAUDE_CODE=1`
-   关闭，`AIH_DISABLE_CLAUDE_CODE_PROMPT=1` 只关此文件）；
-3. **配置 `instructions`** — 任意已信任配置层的 `instructions` 数组（路径 / glob /
-   远程 URL）。
+1. **Project rules** — walk up from `cwd` looking for `AGENTS.md` (fallback `CLAUDE.md`);
+2. **Global rules** — `~/.claude/CLAUDE.md` (Claude Code compatible;
+   `AIH_DISABLE_CLAUDE_CODE=1` disables, `AIH_DISABLE_CLAUDE_CODE_PROMPT=1` disables only this file);
+3. **Config `instructions`** — the `instructions` array of any trusted config layer
+   (paths / globs / remote URLs).
 
 ```json
 {
@@ -941,16 +1033,18 @@ AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**�
 }
 ```
 
-规则内容被合并进系统提示的 `# Project rules` 段（每条 6000 字符预算），标记为
-`mandatory`，且会覆盖默认行为。Claude Code 兼容可在 `AIH_DISABLE_CLAUDE_CODE`
-家族环境变量下按需关闭。
+Rule content is merged into the `# Project rules` section of the system prompt
+(6000-char budget each), marked `mandatory`, and overrides default behavior. Claude
+Code compatibility can be turned off via the `AIH_DISABLE_CLAUDE_CODE` env family.
 
-### 策略（`policies` — opencode `policies` parity）
+### Policies (`policies` — opencode `policies` parity)
 
-`policies` 控制**哪些已配置的 LLM provider 可用**，与 `permissions`（管工具）
-正交——被 deny 的 provider 即使配了凭据也不可选、不可用。资源支持 `*` / `?`
-通配；**最后一个匹配的语句生效**（因此宽规则放前、特例放后）；全局策略优先于
-项目策略（仓库无法重新启用你在全局 deny 的 provider）；无匹配默认放行。
+`policies` controls **which configured LLM providers are usable**, orthogonal to
+`permissions` (which governs tools) — a denied provider is not selectable or
+usable even with credentials configured. Resources support `*` / `?` wildcards;
+**the last matching statement wins** (so put broad rules first, special cases
+after); global policies take precedence over project policies (a repo cannot
+re-enable a provider you denied globally); no match → allow by default.
 
 ```json
 {
@@ -961,13 +1055,14 @@ AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**�
 }
 ```
 
-以上配置只允许 `opencode` provider，其余全部不可用。
+The config above allows only the `opencode` provider; everything else is unusable.
 
-### 快捷键（`tui.json` — opencode `keybinds` parity）
+### Keybinds (`tui.json` — opencode `keybinds` parity)
 
-核心操作键位可通过 `tui.json`（cwd 项目级 + `~/.aih/tui.json` 全局）重绑，全局
-覆盖项目。支持 `ctrl+<letter>`、`tab`、单个可打印字符、`none`（禁用）。与内置
-保留键（Enter/Ctrl+C 等）冲突的映射会被丢弃并告警。
+Core operation keybindings can be rebound via `tui.json` (cwd project-level +
+`~/.aih/tui.json` global; global overrides project). Supports `ctrl+<letter>`,
+`tab`, single printable characters, `none` (disable). Mappings that conflict with
+built-in reserved keys (Enter/Ctrl+C etc.) are dropped with a warning.
 
 ```json
 {
@@ -979,23 +1074,26 @@ AIH 现在会读取并注入项目/全局规则文件作为**强制性指令**�
 }
 ```
 
-默认：`palette=ctrl+p`、`help=?`；`toggleMode` 默认不设独立键（Tab 已经驱动
-补全与 build/plan 切换）。`Alt+…`/功能键属转义序列，超出单字节重绑范围。
+Defaults: `palette=ctrl+p`, `help=?`; `toggleMode` has no dedicated key by default
+(Tab already drives both completion and build/plan switching). `Alt+…`/function
+keys are escape sequences, outside single-byte rebinding scope.
 
-### 凭据所有者隔离（OC#7 — OpenClaw「secrets have owners」）
+### Credential-owner isolation (OC#7 — OpenClaw "secrets have owners")
 
-一条凭据失败时**只降级它的归属者（owner）**，绝不静默 fallback 到另一条凭据。
-AIH 的 owner 即一个已配置的 LLM provider（`empero` / `llamacpp` / `zhipu` /
-`opencode` …）。语义：
+When one credential fails, **only its owner degrades** — never silently fall back
+to another credential. An AIH owner is a configured LLM provider (`empero` /
+`llamacpp` / `zhipu` / `opencode` …). Semantics:
 
-- **可隔离降级** — provider 出现凭据类失败（401/403 认证、或配额耗尽）时，该
-  owner 被标记为不可用，在**用户级** `owner.json` 记录**脱敏**原因；原错误仍
-  照常抛出（不会自动换到别的凭据）。之后的一次**成功调用会自动清除**该降级。
-- **硬失败阻止启动** — 缺少必需 API key、未知 provider、被 policy deny 的
-  provider，都在解析时直接 throw（fail-closed），不降级糊弄。
-- **报告** — `aih models` 会在降级 provider 行标 `⚠ degraded`，并在末尾打印
-  `degraded owners` 报告（含脱敏原因）；`aih stats` 同样打印该报告。
-  `aih models --clear-degraded` 重置脱敏登记。
+- **Isolated degradation** — on credential-class failure (401/403 auth, or quota
+  exhaustion), that owner is marked unavailable, with a **redacted** reason recorded
+  in the user-level `owner.json`; the original error still propagates (no automatic
+  switch to another credential). The next **successful call clears** the degradation.
+- **Hard failure blocks startup** — missing required API key, unknown provider,
+  or a policy-denied provider all throw at parse time (fail-closed), no degraded
+  pretending.
+- **Reporting** — `aih models` marks degraded providers with `⚠ degraded` and prints
+  a `degraded owners` report (with redacted reasons) at the end; `aih stats` prints
+  the same report. `aih models --clear-degraded` resets the degraded registry.
 
 ```text
 $ aih models
@@ -1008,21 +1106,23 @@ degraded owners:
   (clear with: aih models --clear-degraded)
 ```
 
-选择另一个（未降级）owner 仍是**显式用户决策**——不是自动 fallback；`/model`、
-`--provider` 切到其它可用 provider 依然正常。实现见 `cli/src/owner-state.ts` +
-`core/src/seams/llm-openai.ts`（`onCredentialFailure` / `onOwnerSuccess` 钩子）。
+Choosing another (non-degraded) owner is still an **explicit user decision** — not
+automatic fallback; `/model`, `--provider` switching to another usable provider
+works normally. Implementation: `cli/src/owner-state.ts` +
+`core/src/seams/llm-openai.ts` (`onCredentialFailure` / `onOwnerSuccess` hooks).
 
-### 多 MCP 服务器（`mcpServers`）
+### Multiple MCP servers (`mcpServers`)
 
-除 `-s/--server` 指定单个 MCP server 外，配置里可以声明**多个** MCP 服务器，
-AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 重命名区隔：
+Besides `-s/--server` for a single MCP server, the config can declare **multiple**
+MCP servers — AIH connects to all in parallel and aggregates their tools;
+same-named tools are renamed `<server>_<tool>` to disambiguate:
 
 ```json
 {
   "mcpServers": {
     "todos": {
       "command": "node",
-      "args": ["/绝对路径/aih/mcp-server/dist/index.js"],
+      "args": ["/abs/path/aih/mcp-server/dist/index.js"],
       "enabled": true
     },
     "search": {
@@ -1034,244 +1134,333 @@ AIH 会并行连接并聚合全部工具；相同工具名按 `<server>_<tool>` 
 }
 ```
 
-- `command` 必填，`args` 可选，`enabled: false` 可临时停用某个服务器。
-- 连接优先级：`-s/--server`（单一）> `mcpServers`（多）> 内置 todo-app。
-- 来自多个服务器的同名工具会带上服务器前缀（如两个服务器都导出 `ping`，
-  则出现 `todos_ping` 与 `search_ping`），工具的注释里标注来源
-  （`(from <server>)`）；单一服务器下的工具名保持原样。
-- `aih tools` 聚合列出所有已连服务器的工具；`aih config` 打印 `servers` 数组
-  与 `serverSource`（`flag` / `mcpServers` / `bundled`）标明当前来源。
+- `command` required, `args` optional, `enabled: false` temporarily disables a server.
+- Connection precedence: `-s/--server` (single) > `mcpServers` (multiple) > built-in todo-app.
+- Same-named tools from different servers get a server prefix (e.g. two servers both
+  exporting `ping` → `todos_ping` and `search_ping`), and the tool comment marks the
+  source (`(from <server>)`); tools under a single server keep their names.
+- `aih tools` lists aggregated tools of all connected servers; `aih config` prints
+  the `servers` array and `serverSource` (`flag` / `mcpServers` / `bundled`).
 
-### 环境变量
+### Environment variables
 
-| 变量 | 作用 |
+| Variable | Purpose |
 |---|---|
-| `AIH_MODEL` / `AIH_BASE_URL` / `AIH_API_KEY` | 模型、端点、密钥（任意 OpenAI 兼容接口） |
-| `AIH_HOME` | 全局用户配置/数据目录（最高优先级，覆盖 XDG 默认） |
-| `XDG_DATA_HOME` | XDG 数据基目录（全局配置落到 `$XDG_DATA_HOME/aih`） |
-| `AIH_RETRIES` (1) | LLM 429/5xx 自动重试次数（鉴权错误不重试） |
-| `AIH_FIRST_TOKEN_TIMEOUT_MS` (180000) | 流式响应首 token 超时（0 关闭）；超时后带部分内容的断流触发**断流续传**（保留 partial 文本 + 有界续跑一次），无内容的计入重试预算 |
-| `AIH_STALL_TIMEOUT_MS` (60000) | 流式响应帧间 stall 超时（0 关闭）；语义同上 |
-| `AIH_QUOTA_AUTO_RESUME` (1) | 配额耗尽（429/402 + quota/limit/credits 或 Retry-After ≥ 60s）时交互会话自动等待重置后**重发被拒调用**（有界 2 次，TUI 显示等待行）；`0` 关闭。非交互 `run` 恒快速失败。**spend limit/billing 类终态配额不等待**，立即失败（CC-R#2） |
-| `NO_COLOR` | 关闭彩色输出 |
-| `AIH_CONTEXT_WINDOW` (默认 131072) / `AIH_COMPACT_AT` (0.8) | 上下文窗口与压缩阈值（窗口优先级：`--context-window` > env > llama.cpp `/slots` 实时探测 > aih.json `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`） |
-| `AIH_GOAL_ROUNDS` (3) | `/goal` 与 `run --goal` 的额外续跑轮数上限 |
-| `AIH_MEMORY_BUDGET` (4000) | 每轮注入 memory.md 的字符预算 |
-| `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd 默认超时 |
-| `AIH_TOOL_CONCURRENCY` (4) | 单步内连续只读工具调用的并发上限（写类恒串行） |
-| `AIH_FORMAT_TIMEOUT_MS` (15000) | 写后自动格式化超时（失败不阻断写入） |
-| `AIH_FETCH_TIMEOUT_MS` (30000) | webfetch 默认超时（工具 `timeout` 参数优先；硬上限 120000） |
-| `AIH_MOCK_AUX_TEXT` | mock 模式下无工具辅助调用（goal 裁判 / 分支蒸馏）的回复文本（测试钩子） |
-| `AIH_SECOND_JUDGE_MODEL` | `best_of_n` 第二裁判的 model id（FB#2 双裁判面板；复用主模型的 provider/base-url/api-key，缺省 → 单裁判） |
-| `AIH_BUDGET` | PE#2 预算硬约束：JSON 或 `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b`（越界→escalate 退出码 3） |
-| `AIH_SENSORS` | PE#1 计算式传感器：SensorConfig JSON 数组或单对象（写后验证命令，红→有界重试→升级） |
-| `AIH_SENSOR_RETRIES` (1) | PE#1 传感器红→升级前的重试次数 |
-| `AIH_SENSOR_TIMEOUT_MS` (60000) | PE#1 单条传感器命令超时 |
-| `AIH_GUARDIAN` (1) | MEA 写动作 Guardian：需批准写操作先由独立无工具 LLM 按声明式 policy 评估（`0` 与 `--no-guardian` 关闭，回落纯人工确认） |
-| `AIH_GUARDIAN_FAIL_CLOSED` | Guardian 审核超时/解析失败/LLM 错误时 fail-closed → deny（未设则安全降级为人工确认） |
-| `AIH_GUARDIAN_POLICY` | Guardian 声明式 policy.md 文本（缺省用内置 policy，含「workspace 常规写=低风险→allow 倾向」） |
-| `AIH_GUARDIAN_TRUST` (0) | 信任模式：Guardian 的 allow 在**任意**风险级直接放行（medium 不再回落人工）；deny 仍拦截 |
+| `AIH_MODEL` / `AIH_BASE_URL` / `AIH_API_KEY` | model, endpoint, key (any OpenAI-compatible API) |
+| `AIH_HOME` | global user config/data directory (highest priority, overrides XDG default) |
+| `XDG_DATA_HOME` | XDG data base dir (global config lands in `$XDG_DATA_HOME/aih`) |
+| `AIH_RETRIES` (1) | automatic retry count for LLM 429/5xx (auth errors not retried) |
+| `AIH_FIRST_TOKEN_TIMEOUT_MS` (180000) | streaming first-token timeout (0 disables); timeout with partial content triggers **stall-resume** (keeps partial text + one bounded re-run), no content counts into retry budget |
+| `AIH_STALL_TIMEOUT_MS` (60000) | streaming inter-frame stall timeout (0 disables); same semantics |
+| `AIH_QUOTA_AUTO_RESUME` (1) | on quota exhaustion (429/402 + quota/limit/credits or Retry-After ≥ 60s) interactive sessions auto-wait for reset then **re-send the rejected call** (bounded 2×, TUI shows a waiting line); `0` disables. Non-interactive `run` always fails fast. **Spend-limit/billing terminal quotas are not waited on** — fail immediately (CC-R#2) |
+| `NO_COLOR` | disable colored output |
+| `AIH_CONTEXT_WINDOW` (default 131072) / `AIH_COMPACT_AT` (0.8) | context window & compaction threshold (window precedence: `--context-window` > env > llama.cpp `/slots` live probe > aih.json `models[<id>].contextWindow` > `providers.<name>.contextWindow` / `contextWindow`) |
+| `AIH_GOAL_ROUNDS` (3) | max extra resume rounds for `/goal` and `run --goal` |
+| `AIH_MEMORY_BUDGET` (4000) | per-turn memory.md injection char budget |
+| `AIH_CMD_TIMEOUT_MS` (120000) | run_cmd default timeout |
+| `AIH_TOOL_CONCURRENCY` (4) | concurrency cap for consecutive read-only tool calls in one step (writes stay serial) |
+| `AIH_FORMAT_TIMEOUT_MS` (15000) | post-write auto-format timeout (failure never blocks the write) |
+| `AIH_FETCH_TIMEOUT_MS` (30000) | webfetch default timeout (tool `timeout` param wins; hard cap 120000) |
+| `AIH_MOCK_AUX_TEXT` | mock-mode reply text for tool-less auxiliary calls (goal judge / branch distillation; test hook) |
+| `AIH_SECOND_JUDGE_MODEL` | model id for the `best_of_n` second judge (FB#2 dual-judge panel; reuses the primary provider's base-url/api-key; default → single judge) |
+| `AIH_BUDGET` | PE#2 hard budget constraint: JSON or `maxCostUsd=1\|maxWrites=5\|timeoutMs=60000\|denyPaths=a\|b` (overrun → escalate, exit code 3) |
+| `AIH_SENSORS` | PE#1 computational sensors: SensorConfig JSON array or single object (post-write verification commands, red → bounded retry → escalate) |
+| `AIH_SENSOR_RETRIES` (1) | PE#1 retries before a red sensor escalates |
+| `AIH_SENSOR_TIMEOUT_MS` (60000) | PE#1 per-sensor command timeout |
+| `AIH_GUARDIAN` (1) | MEA write-action Guardian: ask-level writes are first assessed by an independent tool-less LLM against a declarative policy (`0` and `--no-guardian` disable, falling back to pure human confirmation) |
+| `AIH_GUARDIAN_FAIL_CLOSED` | Guardian review timeout/parse failure/LLM error → fail-closed deny (unset → safe degradation to human confirmation) |
+| `AIH_GUARDIAN_POLICY` | declarative policy.md text for the Guardian (default built-in policy, incl. "routine workspace writes = low-risk → allow-leaning") |
+| `AIH_GUARDIAN_TRUST` (0) | trust mode: Guardian's allow passes at **any** risk level (medium no longer falls back to human); deny still blocks |
 
-### 会话标题（隐藏系统 agent）
+### Session titles (hidden system agent)
 
-首轮结束后自动用一次轻量 LLM 调用生成 2–6 词标题：写入 `<name>.jsonl.meta.json`，
-TUI 状态栏 `S:` 位与 `session list` 标题列实时显示；已有标题则直接复用。
+After the first turn ends, one lightweight LLM call generates a 2–6 word title:
+written to `<name>.jsonl.meta.json`, shown in the TUI status bar `S:` slot and the
+`session list` title column; an existing title is reused.
 
-### 脚手架与独立服务
-
-```sh
-npm run cli -- init my-app            # 生成 APP.md/AGENTS.md/CLAUDE.md/harness.yml/scripts/mcp-server 全套骨架
-npm run cli -- mcp                    # 以独立进程运行内置 todo-app MCP server
-```
-
-### Token 用量统计
-
-每次 LLM 响应的 usage 被累加进 `turn/end` 事件并随会话持久化：
+### Scaffolding & standalone services
 
 ```sh
-npm run cli -- run "..."          # 文本模式页脚: [turn xxx, 2 step(s), end_turn, tokens 512/89/601]
-npm run cli -- run "..." -f json  # JSON 模式: turn/end 事件含 usage 字段
+npm run cli -- init my-app            # generate full scaffold: APP.md/AGENTS.md/CLAUDE.md/harness.yml/scripts/mcp-server
+npm run cli -- mcp                    # run the built-in todo-app MCP server as a standalone process
 ```
 
-### 性能基准
+### Token usage stats
+
+Each LLM response's usage is accumulated into the `turn/end` event and persisted
+with the session:
 
 ```sh
-AIH_API_KEY=sk-... npm run bench   # 对比 opencode（需本地安装且 cwd 有 opencode.json）
+npm run cli -- run "..."          # text-mode footer: [turn xxx, 2 step(s), end_turn, tokens 512/89/601]
+npm run cli -- run "..." -f json  # JSON mode: turn/end event carries the usage field
 ```
 
-实测（deepseek-v4-flash @ OpenCode Go，各 3 轮均值）：单轮对话 AIH ~2.4s vs
-opencode ~7.4s；工具任务 ~5.9s vs ~11.2s；正确率双方均 14/14。详见 `.aih/bench.tsv`。
+### Performance benchmark
+
+```sh
+AIH_API_KEY=sk-... npm run bench   # compare with opencode (needs local install + opencode.json in cwd)
+```
+
+Measured (deepseek-v4-flash @ OpenCode Go, mean of 3 rounds each): single-turn
+conversation AIH ~2.4s vs opencode ~7.4s; tool task ~5.9s vs ~11.2s; correctness
+14/14 for both. Details in `.aih/bench.tsv`.
 
 ---
 
 ## Development
 
 ```sh
-npm run build       # tsc -b 构建三个 workspace
-npm test            # 冒烟测试：node core/dist/smoke.js && mcp-server && cli
-npm run eval        # 完整交接门禁（doctor + bootstrap + check + test）
+npm run build       # tsc -b builds the three workspaces
+npm test            # smoke tests: node core/dist/smoke.js && mcp-server && cli
+npm run eval        # full handoff gate (doctor + bootstrap + check + test)
 ```
 
-## 把智能体接到你的应用
+## Connect AIH to Your App
 
-### 方式一：MCP 外挂（零侵入，推荐起步）
+### Option 1: MCP (zero-invasion, recommended start)
 
-构建后把 `mcp-server/dist/index.js` 注册为 MCP server。以 opencode 为例，
-参见 `examples/opencode.json`：
+After building, register `mcp-server/dist/index.js` as an MCP server. With opencode
+for example, see `examples/opencode.json`:
 
 ```json
 {
   "mcp": {
-    "aih": { "type": "local", "command": ["node", "/绝对路径/aih/mcp-server/dist/index.js"] }
+    "aih": { "type": "local", "command": ["node", "/abs/path/aih/mcp-server/dist/index.js"] }
   }
 }
 ```
 
-之后任何 opencode 会话即可调用 `app_describe` / `app_context` / `add_todo` 等
-工具操作应用。codex、claude code 等支持 MCP 的智能体同理。
+Any opencode session can then call `app_describe` / `app_context` / `add_todo` etc.
+to operate the app. codex, claude code and other MCP-capable agents work the same way.
 
-### 方式二：CLI 接入（参考 opencode 的 run/chat 风格）
+### Option 2: CLI (opencode-style run/chat)
 
-`run` 支持管道输入（与 opencode 一致）：`echo "补充说明" | aih run "处理这个"`。
-文本模式默认流式输出（逐 token 渲染，`--no-stream` 可关闭）；工具调用以
-`⚙ name {args}` 内联显示在 stderr，stdout 保持干净可重定向。
-写操作默认需确认：TTY 下 `[y/N]` 提示；非 TTY 必须显式 `--yes`。
-彩色输出自动关闭（非 TTY 或设置 `NO_COLOR`）。
+`run` supports piped input (like opencode): `echo "extra note" | aih run "handle this"`.
+Text mode streams by default (token-by-token rendering, `--no-stream` disables); tool
+calls are shown inline on stderr as `⚙ name {args}`, keeping stdout clean and
+redirectable. Write operations require confirmation by default: `[y/N]` prompt on TTY;
+non-TTY must pass explicit `--yes`. Color auto-disables (non-TTY or `NO_COLOR` set).
 
-### 方式三：内嵌 Copilot（SDK 模式）
+### Option 3: Embedded Copilot (SDK mode)
 
-直接复用 L1 内核：
+Reuse the L1 kernel directly:
 
 ```ts
 import { AgentLoop, SessionLog, ToolRegistry, AutoApprove } from "@aih/core";
 
 const tools = new ToolRegistry(new AutoApprove());
-tools.register(myAppTool);          // 你的应用动作
+tools.register(myAppTool);          // your app's actions
 const loop = new AgentLoop({ llm: myLLMAdapter, tools, systemPrompt: "..." });
-await loop.send("帮我把上周的订单导出");
+await loop.send("export last week's orders");
 ```
 
-`llm` 只需实现 `LLMAdapter` 接口（OpenAI 兼容 / DeepSeek / 本地模型均可）。
+`llm` only needs to implement the `LLMAdapter` interface (OpenAI-compatible /
+DeepSeek / local models all work).
 
-## 接入你自己的应用
+## Integrate Your Own App
 
-1. 在 `mcp-server/src/app-adapter.ts` 旁新建你的 Adapter（实现 `AppAdapter`：
-   `descriptor` + `context(query)` + `actions`，动作参数用 zod 定义）。
-2. 在 `mcp-server/src/index.ts` 中替换 `TodoAppAdapter`。
-3. 同步更新 `APP.md` 第 4 节（原语清单）。
-4. 扩展 `mcp-server/src/smoke.ts` 覆盖新适配器的一读一写。
-5. 运行 `npm run eval` 通过交接门禁。
+1. Create your Adapter next to `mcp-server/src/app-adapter.ts` (implement `AppAdapter`:
+   `descriptor` + `context(query)` + `actions`, action params defined with zod).
+2. Replace `TodoAppAdapter` in `mcp-server/src/index.ts`.
+3. Update `APP.md` section 4 (the primitive list) in sync.
+4. Extend `mcp-server/src/smoke.ts` to cover one read + one write of the new adapter.
+5. Run `npm run eval` to pass the handoff gate.
 
-详细规程见技能文件 `skills/aih-app-integration/SKILL.md`
-（可用 `npx skills add <本仓库>` 安装给任何智能体）。
+Full procedure in the skill file `skills/aih-app-integration/SKILL.md`
+(installable for any agent with `npx skills add <this repo>`).
 
-## 与 deepseek-harness / opencode / MiMo-Code / Harness-for-codex 的对比
+## Comparison: deepseek-harness / opencode / MiMo-Code / Harness-for-codex
 
-AIH 与四个主流开源项目定位不同、各有侧重。下表从使用者的角度对比功能与相关性：
+AIH positions differently from the four mainstream open-source projects, each with
+its own focus. The table below compares features and relevance from a user's perspective:
 
-| 维度 | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [opencode](https://github.com/anomalyco/opencode) | [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code) | [Harness-for-codex](https://github.com/ganimjeong/Harness-for-codex) | AIH（本仓库） |
+| Dimension | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [opencode](https://github.com/anomalyco/opencode) | [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code) | [Harness-for-codex](https://github.com/ganimjeong/Harness-for-codex) | AIH (this repo) |
 |---|---|---|---|---|---|
-| 定位 | Agent 运行时框架（"一切皆插件"） | 通用 AI coding agent（终端原生） | opencode 的企业级 fork（交互/安全性增强） | 项目级 AI 协作脚手架（模板仓） | 应用智能体 Harness（App Intelligence） |
-| 服务对象 | 开发者搭建自己的 agent 系统 | 开发者写代码 | 需要企业级护栏的 coding 团队 | 想给单个仓库配 AI 协作规约的团队 | 把**任意业务应用**（Web/桌面/后端）接入 AI |
-| 核心抽象 | 插件（plugin，基于 Cordis） | build/plan 双 agent + 内置工具集 + MCP | 在 opencode 之上加 agent 护栏/交互优化 | AGENTS.md + harness.yml + scripts/tasks/docs | L0 AppAdapter（Context/Action/Event）+ 四层内核（L1 内核/L2 规程/L3 技能）+ 内置通用工具集 |
-| 运行形态 | Web UI（`npx @deepseek-ai/dsh web`，默认 127.0.0.1:3080） | TUI / CLI / 桌面 App | TUI / CLI（fork 自 opencode） | 仓库模板（配合 codex/claude 使用） | TUI / CLI / SDK，另提供 MCP server 外挂应用 |
-| 与 MCP 的关系 | 插件生态（含 MCP 能力） | 作为 MCP client 消费外部工具 | 同 opencode（MCP client） | 无（面向 codex 的 AGENTS.md 规约） | 自身即 MCP server，可被 opencode / codex / claude code 等消费 |
-| 权限模型 | 插件级权限声明 | 按 agent（build/plan）分档 + 规则审批（含 doom_loop 行为级守卫） | 同 opencode（fork 继承），面向企业加固 | `verification.default/handoff` 门禁 | 工具级 allow/ask/deny 三档 + ApprovalGate 可插拔审批 |
-| 接入业务应用 | 写插件 | 写 MCP server / 工具 | 写 MCP server / 工具 | 写 AGENTS.md / harness.yml | 内置通用编码工具集（默认开：read/write/edit/glob/grep/run_cmd/apply_patch/搜索/子代理；`--no-dev` 关）+ 实现 AppAdapter 接入业务应用 |
-| 会话与审计 | Session Log（模型可见即可回放） | 会话持久化 + LSP 上下文 | 同 opencode + 企业审计 | 决策日志 docs/decisions.md | append-only JSONL SessionEvent + 工具审计 |
-| 协议 | MIT | MIT | MIT（opencode 的 fork） | MIT | MIT |
+| Positioning | Agent runtime framework ("everything is a plugin") | General AI coding agent (terminal-native) | opencode's enterprise fork (interaction/safety enhancements) | Project-level AI collaboration scaffold (template repo) | App-Intelligence Harness |
+| Serves | devs building their own agent systems | devs writing code | coding teams needing enterprise guardrails | teams wanting AI collaboration conventions for one repo | connecting **any business app** (Web/desktop/backend) to AI |
+| Core abstraction | plugin (Cordis-based) | build/plan dual agent + built-in tools + MCP | agent guardrails/interaction polish on opencode | AGENTS.md + harness.yml + scripts/tasks/docs | L0 AppAdapter (Context/Action/Event) + four-layer kernel (L1 kernel/L2 procedures/L3 skills) + built-in general toolset |
+| Run form | Web UI (`npx @deepseek-ai/dsh web`, default 127.0.0.1:3080) | TUI / CLI / desktop app | TUI / CLI (fork of opencode) | repo template (used with codex/claude) | TUI / CLI / SDK, plus MCP server for plugging into apps |
+| Relationship to MCP | plugin ecosystem (incl. MCP capability) | consumes external tools as MCP client | same as opencode (MCP client) | none (AGENTS.md conventions for codex) | is itself an MCP server, consumable by opencode / codex / claude code etc. |
+| Permission model | plugin-level permission declaration | per-agent (build/plan) tiers + rule approval (incl. doom_loop behavioral guard) | same as opencode (fork inheritance), enterprise-hardened | `verification.default/handoff` gates | tool-level allow/ask/deny + pluggable ApprovalGate |
+| Connecting business apps | write a plugin | write an MCP server / tools | write an MCP server / tools | write AGENTS.md / harness.yml | built-in general coding toolset (default on: read/write/edit/glob/grep/run_cmd/apply_patch/search/subagents; `--no-dev` off) + implement AppAdapter to connect business apps |
+| Sessions & audit | Session Log ("model-visible = replayable") | session persistence + LSP context | same as opencode + enterprise audit | decision log docs/decisions.md | append-only JSONL SessionEvent + tool audit |
+| License | MIT | MIT | MIT (opencode fork) | MIT | MIT |
 
-**功能矩阵**（2026-08-22 四仓交叉核对，✅ 完整 / ◐ 部分或规划 / — 无）：
+**Feature matrix** (four-repo cross-check 2026-08-22; ✅ complete / ◐ partial or
+planned / — none):
 
-| 能力 | dsh | opencode | MiMo | HfC | **AIH** |
+| Capability | dsh | opencode | MiMo | HfC | **AIH** |
 |---|---|---|---|---|---|
-| MCP 双向（server+client） | ◐ 插件内含 | ◐ client | ◐ client | — | ✅ **server+client** |
-| 任意应用零代码接入（AppAdapter） | — | — | — | — | ✅ **独有** |
-| append-only 会话回放/分叉 | ✅ | ✅ | ✅ | — | ✅ |
-| 权限规则集（pattern/路径作用域/last-match） | ◐ 沙箱视角 | ✅ | ✅ | — | ✅ |
-| doom_loop 死循环守卫 | ◐ 钩子拦截 | ✅ | ✅ | — | ✅ |
-| 上下文压缩（主动+被动+手动 /compact） | — | ✅ | ✅ | — | ✅ 三路+手动 |
-| 流式断流防护+诚实续传（stall 看门狗） | — | ◐ | ◐ | — | ✅ CC#49（首 token/帧间超时，partial 保留+有界续跑） |
-| 配额耗尽自动等待+重发被拒调用 | — | ◐ | ◐ | — | ✅ CC#51（quota/limit/credits 或 Retry-After≥60s，交互自动续、run 快速失败）+ CC-R#2（spend limit/billing 类**终态**配额不等待立即失败；goal 链遇不可恢复错误自动清除，`isUnrecoverableTurnError`：auth/终态配额/逃逸溢出/policy） |
-| 结构化 checkpoint 回滚 | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore`（F#28，append-only） |
-| 项目记忆（memory.md + 注入预算 + 词元检索召回） | — | — | ✅ | — | ✅（KL-R#2 `memory_recall`） |
-| Goal 裁判自动续跑 | ✅ goals | — | ✅ | — | ✅ |
-| 子代理 / 多 agent | ✅ teams | ✅ subagent | ✅ | — | ✅ 串行 `task` + **并行 `best_of_n`**（Max Mode，P2#9）+ **Agent Teams**（D#15） |
-| 并行工具调用（读类 ≤N 有界并发） | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29（写类恒串行） |
-| 技能层（SKILL.md 三级加载） | — | ✅ | ✅ | — | ✅ |
-| plan/build 双模式 | — | ✅ | ✅ | — | ✅ |
-| TUI：流式/markdown/侧栏面板/鼠标 | ◐ Web | ✅ | ✅ | — | ✅ |
-| 成本 / TPS 实时显示 | — | ◐ | ✅ | — | ✅ 面板 + /usage + stats（F#30，会话平均 TPS） |
-| 会话自进化（dream/distill 挖掘记忆+流程） | — | — | ◐ MEMORY | — | ✅ `/dream`+`/distill`（P2#7，只建议不自动写） |
-| 确定性 Workflow（阶段脚本） | — | — | ✅ | — | ✅ `.aih/workflows/*.mjs` |
-| 写后自动格式化（formatter 集成） | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
-| 会话标题/审计留痕/工具钩子 | ✅ | ✅ | ✅ | ✅ decisions | ✅ 审计 + **脱敏/计时 + 技能驱动 `secretPatterns`**（D#11） |
-| 工具输出搜索 / 全量落盘 | — | ◐ | ◐ | — | ✅ `/find` + `run_cmd keep_output`（T#22） |
-| shell 上下文感知（agent 主动取用 shell 输出/退出码） | — | — | — | — | ✅ `/shell` + `shell_context` 工具 + `AIH_SHELL_CONTEXT=auto`（IT#1） |
-| 确定性 shell 失败检测 + 一键修复（状态栏红标 + `/fix` 送 agent） | — | — | — | — | ✅ `error-detect.ts` + 状态栏 `⚠ N failed` + `/fix`（IT#2） |
-| 跨 agent 指令契约（AGENTS.md） | — | ◐ | ◐ | ✅ | ✅ |
-| curl\|bash 一键安装 | ✅ | ◐ | ✅ | — | ✅ |
-| CI 门禁 / 仓库卫生包（CHANGELOG、devcontainer） | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
-| serve/attach 多前端 | ✅ Web | ✅ | ✅ | — | ✅ **HTTP/SSE** `serve`+`attach`（P2#8） |
-| XDG 数据目录规范 | ✅ | ◐ | ◐ | — | ✅ `AIH_HOME`>XDG>默认 + `~/.aih` 兼容（P2#9） |
-| 配置 `$schema` 注入（编辑器补全） | — | ◐ | ◐ | — | ✅ `aih config --schema` + `aih.schema.json`（P2#9） |
-| 简洁/无 chrome 渲染模式 | — | ◐ | — | — | ✅ `/vivid` plain 模式（P2#9） |
-| 项目信任门（防克隆仓库投毒） | — | ◐ trust | ◐ | — | ✅ `--trust`/trust.json（P#40，fail-closed） |
-| 工具结果修剪 + archive_read 惰性取回 | — | ✅ prune | ◐ | — | ✅ `.aih/archives` + 占位符投影（MK#43） |
-| 崩溃恢复（T1 dispatch 事实 + park 不猜） | — | ✅ Runtime Resume | ◐ | — | ✅ tool/dispatch + scanRecovery + PARK 码（MK#44/45） |
-| 安全缝（预算硬约束 + 传感器 + escalate 原语） | — | ◐ | — | — | ✅ PE#1 传感器 + PE#2 预算/tripwire + PE#4 escalate（退出码 3，`test/recovery.sh`） |
-| 工作区身份 UUID / 覆盖校验压缩摘要 | — | ✅ | — | — | ✅ `.aih/workspace.json` + coverage digest（MK#47/#42） |
-| Extension API（代码级插件） | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on（P#39，信任门约束）+ 结果承载事件（before 否决 / after 改写 / turn:end）+ `init` 自扩展示例 |
-| Steering 中途改向 / Follow-up 排队 + Alt+Up 取回 | — | ✅ | ◐→✅ | ✅ Pi | ✅ busy 输入自动 steer；follow-up 自动续跑；Alt+Up 取回排队消息可改后重发（P#35） |
-| 缓存命中观测（CH%） | — | ◐ | ◐ | — | ✅ `/usage` 行 + 面板 CH%（P#41，需 provider 上报） |
-| 模型元数据快照同步（models.dev） | — | ✅ refresh | — | — | ✅ fail-closed 刷新脚本 + 27 模型快照（P#48） |
-| Session 树 / 分支导航 + 分支蒸馏 | — | ◐→✅ | ✅ Pi | — | ✅ parentId 链 + `/tree` 视图 + `distill-branch` branch_summary（P#37） |
-| Eval 实验框架（cells/预算/subject seam） | — | ◐ | — | ✅ Maka | ✅ runExperiment 有界并发 + 墙钟/成本预算 + CLI/外部命令/HTTP 三 subject（P#46） |
-| 深度代码评审（多维 fanout + verify 回环） | ✅ code-review | ✅ | — | — | ✅ AC#1：4 维并行审查 + finding 去重 + 独立 verify KEEP/DROP + JSONL 审计（`review-pipeline.ts`） |
-| 轻量 LSP 代码图谱（符号/签名/引用） | ✅ 内置 | ✅ | — | — | ✅ AC#2：list_symbols / read_symbol / find_references 三只读工具，按需 tsserver/标准 LSP 池化，零新依赖，优雅降级（`codeintel.ts`） |
+| MCP bidirectional (server+client) | ◐ inside plugin | ◐ client | ◐ client | — | ✅ **server+client** |
+| Zero-code app integration (AppAdapter) | — | — | — | — | ✅ **unique** |
+| append-only session replay/fork | ✅ | ✅ | ✅ | — | ✅ |
+| Permission rule set (pattern/path scope/last-match) | ◐ sandbox view | ✅ | ✅ | — | ✅ |
+| doom_loop dead-loop guard | ◐ hook interception | ✅ | ✅ | — | ✅ |
+| Context compaction (proactive+passive+manual /compact) | — | ✅ | ✅ | — | ✅ all three + manual |
+| Stream stall protection + honest resume (stall watchdog) | — | ◐ | ◐ | — | ✅ CC#49 (first-token/inter-frame timeout, partial kept + bounded resume) |
+| Quota-exhaustion auto-wait + resend rejected call | — | ◐ | ◐ | — | ✅ CC#51 (quota/limit/credits or Retry-After≥60s, interactive auto-resume, run fails fast) + CC-R#2 (spend-limit/billing **terminal** quotas fail immediately; goal chain auto-clears on unrecoverable errors, `isUnrecoverableTurnError`: auth/terminal quota/escape overflow/policy) |
+| Structured checkpoint rollback | — | ◐ snapshot | ◐ | — | ✅ `/checkpoint`+`/restore` (F#28, append-only) |
+| Project memory (memory.md + injection budget + token-overlap recall) | — | — | ✅ | — | ✅ (KL-R#2 `memory_recall`) |
+| Goal judge auto-resume | ✅ goals | — | ✅ | — | ✅ |
+| Subagents / multi-agent | ✅ teams | ✅ subagent | ✅ | — | ✅ serial `task` + **parallel `best_of_n`** (Max Mode, P2#9) + **Agent Teams** (D#15) |
+| Parallel tool calls (read-class bounded concurrency) | ✅ ≤10 | ◐ | ◐ | — | ✅ F#29 (writes always serial) |
+| Skill layer (SKILL.md three-tier loading) | — | ✅ | ✅ | — | ✅ |
+| plan/build dual mode | — | ✅ | ✅ | — | ✅ |
+| TUI: streaming/markdown/sidebar/mouse | ◐ Web | ✅ | ✅ | — | ✅ |
+| Cost / TPS live display | — | ◐ | ✅ | — | ✅ panel + /usage + stats (F#30, session-average TPS) |
+| Session self-evolution (dream/distill mining memory+flows) | — | — | ◐ MEMORY | — | ✅ `/dream`+`/distill` (P2#7, suggest-only, never auto-writes) |
+| Deterministic workflow (phase scripts) | — | — | ✅ | — | ✅ `.aih/workflows/*.mjs` |
+| Post-write auto-formatting (formatter integration) | — | ✅ | — | ◐ pre-commit | ✅ prettier>biome>eslint |
+| Session titles/audit trail/tool hooks | ✅ | ✅ | ✅ | ✅ decisions | ✅ audit + **redaction/timing + skill-driven `secretPatterns`** (D#11) |
+| Tool-output search / full capture-to-disk | — | ◐ | ◐ | — | ✅ `/find` + `run_cmd keep_output` (T#22) |
+| Shell context awareness (agent pulls shell output/exit codes) | — | — | — | — | ✅ `/shell` + `shell_context` tool + `AIH_SHELL_CONTEXT=auto` (IT#1) |
+| Deterministic shell failure detect + one-click fix (status-bar red badge + `/fix`) | — | — | — | — | ✅ `error-detect.ts` + status-bar `⚠ N failed` + `/fix` (IT#2) |
+| Cross-agent instruction contract (AGENTS.md) | — | ◐ | ◐ | ✅ | ✅ |
+| curl\|bash one-line install | ✅ | ◐ | ✅ | — | ✅ |
+| CI gate / repo hygiene (CHANGELOG, devcontainer) | ✅ | ◐ | ✅ | ✅ | ✅ ci.yml + CHANGELOG.md + .devcontainer |
+| serve/attach multi-frontend | ✅ Web | ✅ | ✅ | — | ✅ **HTTP/SSE** `serve`+`attach` (P2#8) |
+| XDG data-directory spec | ✅ | ◐ | ◐ | — | ✅ `AIH_HOME`>XDG>default + `~/.aih` compat (P2#9) |
+| Config `$schema` injection (editor completion) | — | ◐ | ◐ | — | ✅ `aih config --schema` + `aih.schema.json` (P2#9) |
+| Minimal/no-chrome render mode | — | ◐ | — | — | ✅ `/vivid` plain mode (P2#9) |
+| Project trust gate (anti cloned-repo poisoning) | — | ◐ trust | ◐ | — | ✅ `--trust`/trust.json (P#40, fail-closed) |
+| Tool-result pruning + archive_read lazy retrieval | — | ✅ prune | ◐ | — | ✅ `.aih/archives` + placeholder projection (MK#43) |
+| Crash recovery (T1 dispatch fact + park, no guessing) | — | ✅ Runtime Resume | ◐ | — | ✅ tool/dispatch + scanRecovery + PARK code (MK#44/45) |
+| Safety seam (budget hard bound + sensors + escalate primitive) | — | ◐ | — | — | ✅ PE#1 sensors + PE#2 budget/tripwire + PE#4 escalate (exit code 3, `test/recovery.sh`) |
+| Workspace identity UUID / coverage-verified compaction digest | — | ✅ | — | — | ✅ `.aih/workspace.json` + coverage digest (MK#47/#42) |
+| Extension API (code-level plugins) | — | ◐ | ✅ Pi | — | ✅ `.aih/extensions/*.mjs` registerTool/Command/on (P#39, trust-gated) + result-carrying events (before veto / after rewrite / turn:end) + `init` self-extension example |
+| Steering mid-turn / follow-up queue + Alt+Up retrieval | — | ✅ | ◐→✅ | ✅ Pi | ✅ busy input auto-steers; follow-up auto-resumes; Alt+Up retrieves queued message for edit-and-resend (P#35) |
+| Cache-hit observation (CH%) | — | ◐ | ◐ | — | ✅ `/usage` line + panel CH% (P#41, needs provider reporting) |
+| Model metadata snapshot sync (models.dev) | — | ✅ refresh | — | — | ✅ fail-closed refresh script + 27-model snapshot (P#48) |
+| Session tree / branch navigation + branch distillation | — | ◐→✅ | ✅ Pi | — | ✅ parentId chain + `/tree` view + `distill-branch` branch_summary (P#37) |
+| Eval experiment framework (cells/budget/subject seam) | — | ◐ | — | ✅ Maka | ✅ runExperiment bounded concurrency + wall-clock/cost budgets + CLI/external-command/HTTP three subjects (P#46) |
+| Deep code review (multi-dim fanout + verify loop) | ✅ code-review | ✅ | — | — | ✅ AC#1: 4-dim parallel review + finding dedup + independent verify KEEP/DROP + JSONL audit (`review-pipeline.ts`) |
+| Lightweight LSP code graph (symbols/signatures/references) | ✅ built-in | ✅ | — | — | ✅ AC#2: `list_symbols` / `read_symbol` / `find_references` three read-only tools, on-demand tsserver/standard-LSP pooling, zero new deps, graceful degradation (`codeintel.ts`) |
 
-**相关性 / 借鉴关系**（均已实读代码，吸收映射见 `docs/review-three-harnesses.md`、`docs/comparison-dsh.md`）：
+**Relevance / borrowings** (all code-read; the absorption map is in
+`docs/review-three-harnesses.md`, `docs/comparison-dsh.md`):
 
-- **deepseek-harness**（agent 运行时平台）→ 借 `Session Log` 回放不变量、`sessions.fork`、`pre/post-execute` 钩子（✅ D#11 脱敏/计时 + 技能驱动）、goals/续跑方向、并行只读工具（≤N 有界并发，✅ F#29）、后台 jobs（✅ D#13）、Agent Teams（✅ D#15）—— 余：沙箱 seam（✅ D#12 接口已留，默认本地）。
-- **opencode**（终端 coding agent）→ 借 `build/plan`、**内置通用工具集**（→ AIH `--dev`/general-tools）、pattern+路径权限、`doom_loop`、隐藏系统 agent（compaction/title 已落地）；TUI 交互（忙碌排队/markdown/Tab 补全/滚轮）已对齐；写后 formatter（prettier>biome>eslint，✅ F#27）；checkpoint 回滚（✅ F#28 `/checkpoint`+`/restore`）。
-- **MiMo-Code**（opencode fork，交互增强）→ 借 `/goal` 裁判续跑 ✅、MEMORY.md 记忆 ✅、侧栏 Context/Todo 面板 ✅、技能层 ✅、curl|bash 安装器 ✅、用量显示 ✅、确定性 workflow（`.aih/workflows/*.mjs` + `aih workflow run`，✅ F#33）。余：成本/TPS ✅ F#30；side-by-side diff ✅ F#31（双色单元格 + 行号列 + 窄屏回退）。
-- **LongHorizon-Harness**（AMAP-ML，长时程 Loop Engineering）→ 借 Final-State Guard（完成诚实规则）+ Task Contract 纪律 + 结构化 goal 契约/扩展裁决（`unmet` 回流续跑指令），以单模型守卫形式落地于系统提示与 `/goal` 裁判 ✅（`core/src/prompts.ts`）；MEA 三角色判定层（独立 Auditor + verified-state ledger）✅ 已交付（`cli/src/mea.ts`，与 codex Guardian 合并实施，见 README「MEA 独立判定层」节）。
-- **OpenClaw**（openclaw/openclaw，多渠道 AI 助手网关）→ 只借判断层/工程纪律：**核心每调用税 + 重复需求→seam 治理标尺**（OC#2，core 进严审 / 技能·扩展无税鼓励扩张 / ≥2 处独立 wire-in 提取 seam ✅，`docs/decisions.md` + APP.md §6）、修复教义（OC#1，root-cause-first / 生产 LOC 一等约束 / 禁止 consumer-only guard 掩盖根因 ✅）、**live-verify 默认 + 先查现成方案**（OC#3，用户可见行为落地前走真实生产路径 + 自定义前先做简短现成方案门 ✅，`core/src/prompts.ts` `LIVE_VERIFY_DISCIPLINE`）、**信任模型澄清**（OC#4，本地单算子边界 + prompt-injection-only 链不算安全 bug ✅，见权限模型章节后「信任模型」段 + APP.md §3）、凭据所有者隔离（OC#7，降级 owner 而非 fallback 凭据 ✅，见专章）、版本化状态守卫 + 配置自愈（OC#5，schemaVersion + 拒绝开更新版本 + `aih doctor --fix` 把 legacy 配置备份后迁到规范形态 ✅）、成熟度记分卡 / 覆盖ID+证据模式（OC#6，`aih coverage` 从冒烟分组标题派生稳定覆盖注册表 + mock/live 证据分类 + 按 profile 选子集，`npm run eval:quality` ✅）；明确不借：多渠道网关 / 伴随应用 / ClawHub 市场 / OTel 遥测 / Crabbox 云沙箱 / pnpm monorepo（撞"本地单算子"定位）。
-- **Harness-for-codex**（项目级脚手架）→ 借 `AGENTS.md` 单一事实源 + `CLAUDE.md` 桥接 ✅、`harness.yml` 规范 schema ✅、`docs/decisions.md` 留痕 ✅、`verification` 两级门禁（`scripts/eval`）✅；**CI 工作流 = 把 handoff 门禁自动化**（`.github/workflows/ci.yml`，push/PR 跑 check+test）✅。
-- **Apache Maka**（apache/maka，local-first agent workspace）→ 借 **事实层纪律**：append-only 事件即唯一事实源、UI/模型调用只是投影。已落地：compaction coverage digest（✅ MK#42，摘要必须证明覆盖范围，否则 fail-open）、tool/dispatch T1 事实 + RecoveryResolver 四态分类 + park 稳定码（✅ MK#44/45）、工具结果修剪 + archive_read 惰性归档（✅ MK#43）、工作区身份 UUID（✅ MK#47）、models.dev 快照 fail-closed 同步（✅ P#48）、steering/follow-up 双队列（✅ P#35）；明确不借 SQLite/Electron、Phase3/4 文件级 reconcile、provider-native 远程压缩。
-- **openai/codex**（Codex CLI，Rust）→ 借 `shell_environment_policy`（子进程 env 密钥过滤，✅ `cli/src/env-policy.ts`）、`codex debug prompt-input`（✅ `--debug-prompt` / `AgentLoop.onPromptInput`）、技能名册 2% 上下文预算（✅ `withSkillRoster`）；候选 roadmap：声明式 hooks（`hooks.json` + hash trust）、memories 目录、并行 subagents。
-- **Intelligent Terminal**（终端 UX 参考）→ 借 **shell 上下文感知**（agent 主动取用 shell 输出/退出码，✅ IT#1：`/shell` + `shell_context` 工具 + `AIH_SHELL_CONTEXT=auto`）+ **确定性 error-detect→一键送 agent**（✅ IT#2：`error-detect.ts` + 状态栏 `⚠ N failed` + `/fix`）+ **`?` 前缀快捷任务 + 上下文注入**（✅ IT#3：`question.ts` + TUI 输入行识别）+ **多 agent 会话管理面板**（✅ IT#4：`sessions.ts` + TUI `/sessions` dashboard/kill/view）+ **run-or-copy 命令批准**（✅ IT#5：`clipboard.ts` + `askRunOrCopy`）。
-- **AtomCode**（atomgit.com/atomgit_atomcode/atomcode，Rust 编码 agent）→ 借 **深度代码评审流水线**（✅ AC#1：4 维并行 fanout + finding 结构化 + 去重 + 独立 verify 回环 + diff 推导 impact plan + JSONL 审计，见 `docs/review-atomcode.md`）+ **轻量 LSP 代码图谱**（✅ AC#2：`list_symbols`/`read_symbol`/`find_references` 按需语言服务池，零依赖 LSP+tsserver 双适配，见 `codeintel.ts`）；余：执行策略位掩码（AC#3，待排期）；明确不借 WebUI/移动端远程访问、匿名遥测、闭源 CodingPlan 签名、Rust 迁移。
+- **deepseek-harness** (agent runtime platform) → borrowed `Session Log` replay
+  invariant, `sessions.fork`, `pre/post-execute` hooks (✅ D#11 redaction/timing +
+  skill-driven), goals/continue direction, parallel read-only tools (bounded ≤N,
+  ✅ F#29), background jobs (✅ D#13), Agent Teams (✅ D#15) — remaining: sandbox
+  seam (✅ D#12 interface reserved, default local).
+- **opencode** (terminal coding agent) → borrowed `build/plan`, **built-in general
+  toolset** (→ AIH `--dev`/general-tools), pattern+path permissions, `doom_loop`,
+  hidden system agent (compaction/title landed); TUI interaction (busy queue /
+  markdown / Tab completion / scroll wheel) aligned; post-write formatter
+  (prettier>biome>eslint, ✅ F#27); checkpoint rollback (✅ F#28 `/checkpoint`+`/restore`).
+- **MiMo-Code** (opencode fork, interaction enhancements) → borrowed `/goal` judge
+  auto-resume ✅, MEMORY.md memory ✅, sidebar Context/Todo panels ✅, skill layer ✅,
+  curl|bash installer ✅, usage display ✅, deterministic workflow
+  (`.aih/workflows/*.mjs` + `aih workflow run`, ✅ F#33). Remaining: cost/TPS ✅ F#30;
+  side-by-side diff ✅ F#31 (two-color cells + line-number column + narrow-screen fallback).
+- **LongHorizon-Harness** (AMAP-ML, long-horizon Loop Engineering) → borrowed
+  Final-State Guard (completion-honesty rules) + Task Contract discipline +
+  structured goal contract/extended verdict (`unmet` flows back into resume
+  instructions), landed as single-model guards in the system prompt and `/goal`
+  judge ✅ (`core/src/prompts.ts`); the MEA three-role judgment layer (independent
+  Auditor + verified-state ledger) ✅ delivered (`cli/src/mea.ts`, merged with the
+  codex Guardian — see the "MEA independent judgment layer" section).
+- **OpenClaw** (openclaw/openclaw, multi-channel AI assistant gateway) → borrowed
+  judgment-layer/engineering discipline only: **core per-call tax + repeat
+  need→seam governance yardstick** (OC#2, core strict-entry / skills·extensions
+  tax-free & encouraged / ≥2 independent wire-ins → extract seam ✅,
+  `docs/decisions.md` + APP.md §6), repair doctrine (OC#1, root-cause-first /
+  production LOC first-class / no consumer-only guards masking root causes ✅),
+  **live-verify default + check-existing-first** (OC#3, exercise real production
+  path before claiming user-visible behavior + brief existing-solution gate before
+  custom work ✅, `core/src/prompts.ts` `LIVE_VERIFY_DISCIPLINE`), trust-model
+  clarification (OC#4, local single-operator boundary + prompt-injection-only chains
+  are not security bugs ✅, see "Trust model" after the permissions section +
+  APP.md §3), credential-owner isolation (OC#7, degrade owner not fallback
+  credential ✅, dedicated section), versioned state guard + config self-healing
+  (OC#5, schemaVersion + refuse-to-open-newer + `aih doctor --fix` backs up legacy
+  config then migrates to canonical form ✅), maturity scorecard / coverage-ID +
+  evidence pattern (OC#6, `aih coverage` derives a stable coverage registry from
+  smoke-group titles + mock/live evidence classes + profile-based subset,
+  `npm run eval:quality` ✅); explicitly NOT borrowed: multi-channel gateway /
+  companion app / ClawHub market / OTel telemetry / Crabbox cloud sandbox / pnpm
+  monorepo (clashes with the "local single-operator" positioning).
+- **Harness-for-codex** (project-level scaffold) → borrowed `AGENTS.md` single
+  source of truth + `CLAUDE.md` bridge ✅, `harness.yml` schema ✅,
+  `docs/decisions.md` trail ✅, two-tier `verification` gates (`scripts/eval`) ✅;
+  **CI workflow = automating the handoff gate** (`.github/workflows/ci.yml`,
+  push/PR runs check+test) ✅.
+- **Apache Maka** (apache/maka, local-first agent workspace) → borrowed the
+  **fact-layer discipline**: append-only events are the only source of truth, UI/
+  model calls are mere projections. Landed: compaction coverage digest
+  (✅ MK#42, digest must prove coverage or fail-open), tool/dispatch T1 facts +
+  RecoveryResolver four-state classification + park stable codes (✅ MK#44/45),
+  tool-result pruning + archive_read lazy archiving (✅ MK#43), workspace identity
+  UUID (✅ MK#47), models.dev snapshot fail-closed sync (✅ P#48), steering/
+  follow-up dual queues (✅ P#35); explicitly NOT borrowed: SQLite/Electron,
+  Phase3/4 file-level reconcile, provider-native remote compaction.
+- **openai/codex** (Codex CLI, Rust) → borrowed `shell_environment_policy`
+  (subprocess env secret filtering, ✅ `cli/src/env-policy.ts`),
+  `codex debug prompt-input` (✅ `--debug-prompt` / `AgentLoop.onPromptInput`),
+  skill-roster 2% context budget (✅ `withSkillRoster`); candidate roadmap:
+  declarative hooks (`hooks.json` + hash trust), memories directory, parallel
+  subagents.
+- **Intelligent Terminal** (terminal UX reference) → borrowed **shell context
+  awareness** (agent pulls shell output/exit codes, ✅ IT#1: `/shell` +
+  `shell_context` tool + `AIH_SHELL_CONTEXT=auto`) + **deterministic
+  error-detect→one-click send-to-agent** (✅ IT#2: `error-detect.ts` + status-bar
+  `⚠ N failed` + `/fix`) + **`?`-prefix quick task + context injection** (✅ IT#3:
+  `question.ts` + TUI input-line recognition) + **multi-agent session panel**
+  (✅ IT#4: `sessions.ts` + TUI `/sessions` dashboard/kill/view) + **run-or-copy
+  command approval** (✅ IT#5: `clipboard.ts` + `askRunOrCopy`).
+- **AtomCode** (atomgit.com/atomgit_atomcode/atomcode, Rust coding agent) →
+  borrowed **deep code-review pipeline** (✅ AC#1: 4-dim parallel fanout +
+  structured findings + dedup + independent verify loop + diff-derived impact plan
+  + JSONL audit, see `docs/review-atomcode.md`) + **lightweight LSP code graph**
+  (✅ AC#2: `list_symbols`/`read_symbol`/`find_references` on-demand language-service
+  pool, zero-dep LSP+tsserver dual adapters, see `codeintel.ts`); remaining:
+  execution-strategy bitmask (AC#3, not scheduled); explicitly NOT borrowed:
+  WebUI/mobile remote access, anonymous telemetry, closed-source CodingPlan signing,
+  Rust migration.
 
-**差距行动清单**（按性价比，详见 `docs/roadmap.md` F 节）：① CI 门禁工作流（HfC）✅；② 写后自动格式化（opencode）✅；③ 结构化 checkpoint 回滚（opencode/P0#1）✅ `/checkpoint`+`/restore` + worktree 摘要；④ 并行只读工具（dsh ≤10）✅；⑤ 成本/TPS 面板（MiMo）✅ 面板 + /usage + stats（余流式 TPS）；⑥ side-by-side diff（MiMo，此前已承诺）✅ 双色单元格 + 行号列 + 窄屏回退 unified；⑦ 仓库卫生包：CHANGELOG/devcontainer（HfC）✅；⑧ 确定性 workflow（MiMo，P1#6 升期）✅；⑨ 深度代码评审 fanout+verify（AtomCode）✅ AC#1；⑩ 轻量 LSP 代码图谱（AtomCode）✅ AC#2。
+**Gap action list** (by cost-effectiveness, see `docs/roadmap.md` section F):
+① CI gate workflow (HfC) ✅; ② post-write auto-formatting (opencode) ✅;
+③ structured checkpoint rollback (opencode/P0#1) ✅ `/checkpoint`+`/restore` +
+worktree summary; ④ parallel read-only tools (dsh ≤10) ✅; ⑤ cost/TPS panel (MiMo)
+✅ panel + /usage + stats (streaming TPS remaining); ⑥ side-by-side diff (MiMo,
+previously promised) ✅ two-color cells + line-number column + narrow-screen
+fallback to unified; ⑦ repo hygiene: CHANGELOG/devcontainer (HfC) ✅;
+⑧ deterministic workflow (MiMo, P1#6 pulled forward) ✅; ⑨ deep code review
+fanout+verify (AtomCode) ✅ AC#1; ⑩ lightweight LSP code graph (AtomCode) ✅ AC#2.
 
-一句话总结：**写代码用 opencode / MiMo-Code（AIH `--dev` 也提供同类的编码工具集），搭通用 agent 系统用 deepseek-harness，给仓库配协作规约用 Harness-for-codex，把现有业务应用变成 AI 可操作的用 AIH。** AIH 本身作为 MCP server，可以挂进 opencode / codex / claude code 一起用，而不是替代它们；反过来 AIH `--dev` 又可当作一个独立的 coding agent 使用。
+One-line summary: **use opencode / MiMo-Code for coding** (AIH `--dev` also offers
+the same kind of coding toolset), **deepseek-harness for building generic agent
+systems**, **Harness-for-codex for conventions in one repo** — and AIH when you
+want to **connect any business app to an agent** (TUI/CLI/SDK + MCP server, zero
+code changes to your app).
 
-## 目录结构
+## Directory Structure
 
 ```
 aih/
-├── APP.md                    # L2：智能体行为契约（唯一事实源）
-├── harness.yml               # L2：规范命令 + 任务循环阶段
-├── CHANGELOG.md              # L2：发版条目（Keep a Changelog）
-├── .devcontainer/            # L2：容器内 agent 稳定环境（create 后自动 bootstrap+build）
-├── scripts/{doctor,check,eval}  # L2：标准命令入口
-├── tasks/TEMPLATE.md         # L2：任务简报模板
-├── docs/decisions.md         # L2：跨会话决策日志
-├── core/                     # L1：内核（零运行时依赖）
-├── mcp-server/               # L0：MCP 接入（含 TodoApp 示例适配器）
-├── cli/                      # CLI 接入：aih run/chat/tools/describe/workflow
-├── skills/                   # L3：技能
-├── .aih/workflows/           # 确定性工作流（.mjs，导出 phases）
-└── examples/opencode.json    # opencode 集成示例
+├── APP.md                    # L2: agent behavior contract (single source of truth)
+├── harness.yml               # L2: canonical commands + task-loop phases
+├── CHANGELOG.md              # L2: release entries (Keep a Changelog)
+├── .devcontainer/            # L2: stable in-container agent env (auto bootstrap+build after create)
+├── scripts/{doctor,check,eval}  # L2: standard command entry points
+├── tasks/TEMPLATE.md         # L2: task brief template
+├── docs/decisions.md         # L2: cross-session decision log
+├── core/                     # L1: kernel (zero runtime deps)
+├── mcp-server/               # L0: MCP integration (incl. TodoApp sample adapter)
+├── cli/                      # CLI: aih run/chat/tools/describe/workflow
+├── skills/                   # L3: skills
+├── .aih/workflows/           # deterministic workflows (.mjs, export phases)
+└── examples/opencode.json    # opencode integration example
 ```
 
 ## Community & License
 
-MIT。有问题欢迎在 GitHub 提 issue / PR。
+MIT. Issues / PRs welcome on GitHub.
 
 ---
 
-> **AIH 驱动开发**：本仓库的代码提交由 AIH（App Intelligence Harness）自身完成——
-> 从特性开发、联调测试到文档维护，全程由智能体在权限守卫与审计日志的监督下自主执行，
-> 正是对"应用接入 AI"这一理念的自我实践。
+> **AIH-driven development**: this repo's commits are made by AIH (App Intelligence
+> Harness) itself — from feature development and integration testing to documentation
+> maintenance, executed autonomously by the agent under permission guardrails and
+> audit logging. It is AIH's own demonstration of "connecting an app to AI".
