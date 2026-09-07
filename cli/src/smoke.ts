@@ -3699,6 +3699,39 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // opencode/mimo-code parity: the side panel is a FIXED-width sidebar (42 cols,
+  // both repos SIDEBAR_WIDTH=42), appears only when width>120 (wide guard), and
+  // carries a footer with the current path + brand version. The composer caps at
+  // TEXTAREA_MAX_ROWS=6. Verify the constants and the footer render.
+  const { Tui } = await import("./tui.js");
+  const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+  assert(Tui.SIDEBAR_WIDTH === 42, "opencode/mimo-code parity: SIDEBAR_WIDTH=42 (both repos)");
+  assert(Tui.PANEL_GAP === 4, "opencode/mimo-code parity: PANEL_GAP=4 (contentWidth = width-42-4)");
+  assert(Tui.INPUT_MAX_ROWS === 6, "opencode/mimo-code parity: INPUT_MAX_ROWS=6 (TEXTAREA_MAX_ROWS)");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "build", model: "m", provider: "p" }),
+    cwd: "/app/agents/aih",
+    statusLeft: "",
+    statusRight: "",
+    busy: () => false,
+    onLine: () => {},
+    ctxUsage: () => ({ used: 1000, limit: 131072 }),
+    version: "0.8.0",
+  });
+  const ff = tui.panelFooterForTest(42).map(strip);
+  assert(ff.at(-1) === "• aih v0.8.0", `panel footer last line = brand+version (got ${JSON.stringify(ff.at(-1))})`);
+  assert(ff.at(-2) === "/app/agents/aih", `panel footer path line = cwd (got ${JSON.stringify(ff.at(-2))})`);
+  // without a version the footer degrades to just the path line
+  const tui2 = new Tui({
+    placeholder: ">", meta: () => ({ agent: "build", model: "m", provider: "p" }), cwd: "/tmp", statusLeft: "", statusRight: "",
+    busy: () => false, onLine: () => {}, ctxUsage: () => ({ used: 1, limit: 100 }),
+  });
+  const ff2 = tui2.panelFooterForTest(42).map(strip);
+  assert(ff2.at(-1) === "/tmp", `panel footer without version = path only (got ${JSON.stringify(ff2.at(-1))})`);
+}
+
+{
   // sparkline: 8 steps, flat series mid-scale, fewer than 2 points = none
   const { Tui } = await import("./tui.js");
   assert(Tui.sparkline([1, 2, 3, 4, 5, 6, 7, 8]) === "▁▂▃▄▅▆▇█", "sparkline maps range to 8 blocks");

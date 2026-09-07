@@ -1836,7 +1836,10 @@ constructor(opts: TuiOptions) {
   #inputLineCount(width: number): number {
     if (this.#question || this.#confirmText) return 1;
     const limit = Math.max(4, width - 4);
-    return this.#wrapEdit(this.#edit, limit).length;
+    // opencode/mimo-code parity: the composer never grows past TEXTAREA_MAX_ROWS=6
+    // — it scrolls internally. Cap here so #viewHeight stays stable for long
+    // pastes (a 20-line paste must not shrink the body to zero rows).
+    return Math.min(Tui.INPUT_MAX_ROWS, this.#wrapEdit(this.#edit, limit).length);
   }
 
   #contentLines(): number {
@@ -2058,7 +2061,7 @@ constructor(opts: TuiOptions) {
   }
 
   #panelActive(): boolean {
-    if (this.#cols < 100) return false;
+    if (this.#cols <= 120) return false; // opencode/mimo-code: sidebar shows only when wide (>120)
     const todos = this.#panelTodos();
     return !!this.#panelCtx() || (!!todos && todos.some((t) => t.status !== "completed"));
   }
@@ -2066,10 +2069,16 @@ constructor(opts: TuiOptions) {
   #panelWidth(): number {
     if (this.#plain) return 0; // /vivid: no side panel
     if (!this.#panelActive()) return 0;
-    return Math.min(32, Math.max(24, this.#cols >> 2));
+    // opencode/mimo-code parity: SIDEBAR_WIDTH = 42 fixed (both repos). AIH
+    // keeps its panel right-anchored but uses the same 42-column width and the
+    // same >120 wide threshold, so a maximized terminal shows an identical
+    // sidebar silhouette. (Was min(32, max(24, cols>>2)) before the parity fix.)
+    return Tui.SIDEBAR_WIDTH;
   }
 
- static readonly PANEL_GAP = 3;
+ static readonly SIDEBAR_WIDTH = 42; // opencode/mimo-code: SIDEBAR_WIDTH = 42 (both repos)
+ static readonly PANEL_GAP = 4; // opencode/mimo-code: contentWidth = width - sidebar(42) - 4
+ static readonly INPUT_MAX_ROWS = 6; // opencode/mimo-code: TEXTAREA_MAX_ROWS = 6 (composer caps at 6 lines, scrolls beyond)
 
   /** Inline sparkline of recent per-turn prompt tokens (8 steps/cell, skill §5). */
   static sparkline(trend?: number[]): string {
@@ -2135,6 +2144,18 @@ constructor(opts: TuiOptions) {
    */
   panelLinesForTest(pw: number): string[] {
     return this.#panelLines(pw);
+  }
+
+  /** Test hook for #panelFooter (the pinned path+version block). */
+  panelFooterForTest(pw: number): string[] {
+    return this.#panelFooter(pw);
+  }
+
+  /** Test hook — mirrors #inputLayout so smoke can assert the opencode/mimo-code
+   *  6-line composer cap (TEXTAREA_MAX_ROWS=6) without a live PTY. Returns the
+   *  windowed lines + cursor cell for the current #edit/#cursor state. */
+  inputLayoutForTest(width: number): { lines: string[]; segs: string[]; ci: number; col: number } {
+    return this.#inputLayout(width);
   }
 
   #panelLines(pw: number): string[] {
@@ -2203,6 +2224,39 @@ constructor(opts: TuiOptions) {
       }
     }
     return lines;
+  }
+
+  /**
+   * opencode/mimo-code parity: the sidebar footer is a FIXED identity block
+   * pinned to the BOTTOM of the side panel — current path (parent dimmed + name
+   * in the primary colour) and brand+version. It renders regardless of whether
+   * the CONTEXT/TODO sections above are present, so the user always sees where
+   * they are and which aih build is running. Mirrors both repos' sidebar_footer
+   * (path line + "• MiMoCode vX" / "• OpenCode vX"). Returned separately from
+   * #panelLines so #paint can anchor it to the panel's bottom row(s) instead of
+   * top-pairing it with body rows (where it would be clipped when the body is
+   * shorter than the panel).
+   */
+  #panelFooter(pw: number): string[] {
+    void pw; // width reserved for future wrapping; path/version are short
+    const home = process.env.HOME || "";
+    let pathText = this.#opts.cwd;
+    if (home && pathText.startsWith(home)) pathText = "~" + pathText.slice(home.length);
+    const parts = pathText.split("/");
+    const name = parts.at(-1) ?? "";
+    // parent may be empty for root-level paths (/tmp, /app): then show the bare
+    // "/name" without a leading parent. Home-relative is already rewritten above.
+    const parent = parts.slice(0, -1).join("/");
+    const out: string[] = [""];
+    if (parent) {
+      out.push(`${muted(parent)}/${bold(name)}`);
+    } else {
+      out.push(bold(`/${name}`));
+    }
+    if (this.#opts.version) {
+      out.push(`${success("•")} ${accent(bold("aih"))} v${this.#opts.version}`);
+    }
+    return out;
   }
 
   #todoRow(t: TodoItem): string {
@@ -2470,9 +2524,35 @@ constructor(opts: TuiOptions) {
       };
     }
     const limit = Math.max(4, width - 4);
-    const segs = this.#wrapEdit(this.#edit, limit);
+    // opencode/mimo-code parity: the composer caps at TEXTAREA_MAX_ROWS=6 and
+    // scrolls beyond. AIH keeps the full text in #edit (send is unaffected) but
+    // renders a 6-line window centred on the cursor; overflow is signalled with
+    // an ellipsis marker so the user knows more lines exist above/below.
+    const all = this.#wrapEdit(this.#edit, limit);
+    let segs = all;
+    let topOffset = 0;
+    if (all.length > Tui.INPUT_MAX_ROWS) {
+      // find which wrapped line the cursor sits on
+      let before = 0;
+      let curLine = 0;
+      for (let i = 0; i < all.length; i += 1) {
+        if (this.#cursor <= before + all[i].length) {
+          curLine = i;
+          break;
+        }
+        before += all[i].length;
+      }
+      topOffset = Math.max(0, Math.min(curLine - (Tui.INPUT_MAX_ROWS >> 1), all.length - Tui.INPUT_MAX_ROWS));
+      segs = all.slice(topOffset, topOffset + Tui.INPUT_MAX_ROWS);
+    }
     const lines = segs.map((s, i) => (i === 0 ? s : `  ${s}`));
-    let before = 0;
+    // base offset: the wrapped length of every line ABOVE the window (when we
+    // scrolled past the top). ci/col are reported in window-relative terms so
+    // the cursor lands on the right visual cell even when the first visible
+    // line is not the first logical line.
+    let base = 0;
+    for (let i = 0; i < topOffset; i += 1) base += all[i].length;
+    let before = base;
     for (let i = 0; i < segs.length; i += 1) {
       if (this.#cursor <= before + segs[i].length) {
         return { lines, segs, ci: i, col: this.#cursor - before };
@@ -2702,17 +2782,38 @@ constructor(opts: TuiOptions) {
 
     const pw = this.#panelWidth();
     const panel = pw ? this.#panelLines(pw) : null;
+    // opencode/mimo-code parity: the sidebar footer (path + brand version) is
+    // pinned to the BOTTOM of the side panel, independent of body height. We
+    // reserve the last `footer.length` visible rows for it and top-pair the
+    // remaining rows with the CONTEXT/TODO lines. Without this the footer sat at
+    // the END of #panelLines and got clipped whenever the body was shorter than
+    // the panel (the common case on a fresh session).
+    const footer = pw ? this.#panelFooter(pw) : null;
     const leftW = panel ? Math.max(20, width - pw - Tui.PANEL_GAP) : width;
     let rowIdx = 0;
-    const row = (content: string): { left: string; right?: string } => {
+    const row = (content: string, i?: number): { left: string; right?: string } => {
+      const idx = i ?? -1;
       const left = this.#clip(content, leftW);
       if (!panel) return { left };
-      return { left, right: this.#panelSeg(panel[rowIdx++], pw) };
+      // bottom `footer.length` BODY rows carry the pinned footer. Rows outside
+      // the body window (input box / hints / status, i=-1) get a blank panel
+      // cell so the right column stays visually continuous without leaking the
+      // CONTEXT/TODO lines into the input area.
+      if (footer && idx >= 0 && idx >= view - footer.length) {
+        const fi = idx - (view - footer.length);
+        return { left, right: this.#panelSeg(footer[fi] ?? "", pw) };
+      }
+      if (idx < 0) return { left, right: this.#panelSeg("", pw) };
+      return { left, right: this.#panelSeg(panel[rowIdx++] ?? "", pw) };
     };
 
     const rows: Array<{ left: string; right?: string }> = [];
     for (let i = 0; i < view; i += 1) {
-      rows.push(row(this.#clip(body[this.#scrollTop + i] ?? "", leftW)));
+      // hoist the clip result into a local: passing `this.#clip(...)` inline as
+      // the first arg of row() trips a TS5.9 private-call + trailing-arg parse
+      // quirk (TS2554 "expected 2 got 1") even though it is type-correct.
+      const clipped = this.#clip(body[this.#scrollTop + i] ?? "", leftW);
+      rows.push(row(clipped, i));
     }
 
     if (this.#overlay) {
