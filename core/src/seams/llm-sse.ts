@@ -437,6 +437,45 @@ export function classifyProviderError(
   return "fatal";
 }
 
+/**
+ * Canonical NETWORK-failure regex (undici/node messages + TLS/socket codes).
+ * Lives in the classification layer (single source) and is used by:
+ *   - llm-openai: network failures extend the retry budget (×3, like capacity)
+ *   - agent-loop: a network failure that exhausts the adapter budget parks the
+ *     turn and retries (bounded) instead of killing the conversation
+ * ("terminated" also matches HTTP/2 "terminated" bodies — same family: the
+ * connection died mid-flight; retrying is the only sensible response).
+ */
+export const NETWORK_FAILURE_RE =
+  /fetch failed|terminated|socket hang ?up|other side closed|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|network error/i;
+
+/**
+ * UNREACHABLE endpoints (nothing listening / no such host): retrying these
+ * for minutes is pointless — the failure is instant and persistent (a
+ * misconfigured port, a dead box). They keep the BASE retry budget so
+ * misconfiguration fails fast, while mid-flight transient failures
+ * (ECONNRESET, socket hang up, "fetch failed" without a cause code) get the
+ * extended budget. undici wraps every fetch error as "fetch failed" and hides
+ * the OS code in `err.cause` — callers must flatten the cause into the
+ * message before classifying (see errFullText below).
+ */
+export const NETWORK_UNREACHABLE_RE =
+  /ECONNREFUSED|ENOTFOUND|connection refused|getaddrinfo|bad port/i;
+
+/**
+ * Flatten an error's undici `cause` into one classifiable string — undici
+ * reports every network failure as message "fetch failed" with the real OS
+ * error (code ECONNRESET/ECONNREFUSED/…) hidden in `err.cause`.
+ */
+export function errFullText(err: unknown): string {
+  const e = err as { message?: string; cause?: { code?: string; message?: string } | Error } | string;
+  const msg = typeof e === "string" ? e : e?.message ?? String(err);
+  const cause = typeof e === "object" && e !== null ? (e as { cause?: { code?: string; message?: string } }).cause : undefined;
+  if (!cause) return msg;
+  const cm = cause instanceof Error ? cause.message : cause.message ?? "";
+  return `${msg} ${cause.code ?? ""} ${cm}`;
+}
+
 // ── Quota-exhaustion detection (CC#51) ─────────────────────────────────
 //
 // A "quota" 429 is NOT a transient rate limit: the provider's usage window

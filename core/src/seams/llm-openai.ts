@@ -152,6 +152,9 @@ import {
   StallError,
   isNetworkErrorFinish,
   NetworkFinishError,
+  NETWORK_FAILURE_RE,
+  NETWORK_UNREACHABLE_RE,
+  errFullText,
 } from "./llm-sse.js";
 
 // CC#49 — stream-stall guards. Headers received but no data frame within
@@ -302,9 +305,30 @@ export class OpenAICompatibleLLM implements LLMAdapter {
       } catch (err) {
         if (req.signal?.aborted) throw err;
         lastError = err;
-        const cls = classifyProviderError(0, err instanceof Error ? err.message : String(err));
+        // Classify over message + cause: undici wraps every network failure
+        // as "fetch failed" and hides the OS code in err.cause.
+        const msg = errFullText(err);
+        const cls = classifyProviderError(0, msg);
         if (cls === "capacity") {
           attempts = Math.max(attempts, maxAttempts * CAPACITY_ATTEMPT_FACTOR);
+        }
+        // Network bursts outlast the flat retry budget: "fetch failed" /
+        // connection resets come in bursts of tens of seconds (Zen free tier,
+        // Cloudflare fronting) while the default budget tolerates ~20s — the
+        // turn then dies on a transient blip ("run_cmd … fetch failed" then
+        // the conversation just ends). Extend the budget for network-class
+        // failures the same way capacity errors are (×3): ~2min of tolerance
+        // instead of ~20s. opencode survives the same bursts exactly by
+        // retrying far longer. UNREACHABLE endpoints (connection refused /
+        // no such host) stay on the base budget: the failure is instant and
+        // persistent — minutes of retrying a dead port helps nobody.
+        // persists (a misconfigured port, a dead box) — do not retry at all:
+        // fail on the first attempt so `aih run` against a dead endpoint
+        // reports the error instantly instead of burning the backoff budget.
+        if (NETWORK_FAILURE_RE.test(msg) && !NETWORK_UNREACHABLE_RE.test(msg)) {
+          attempts = Math.max(attempts, maxAttempts * NETWORK_ATTEMPT_FACTOR);
+        } else if (NETWORK_UNREACHABLE_RE.test(msg)) {
+          attempts = 1;
         }
         if (attempt < attempts - 1) continue;
         throw err;
@@ -467,6 +491,8 @@ export class OpenAICompatibleLLM implements LLMAdapter {
 // TP#2: RETRYABLE / CAPACITY_ERROR / CAPACITY_ATTEMPT_FACTOR moved to llm-sse.ts classifyProviderError
 // Kept as legacy re-export for backward compatibility.
 const CAPACITY_ATTEMPT_FACTOR = 3;
+/** Network-class failures get the same ×3 budget extension (see the fetch-catch). */
+const NETWORK_ATTEMPT_FACTOR = 3;
 
 /** Default transient-failure retry budget: 7 attempts ≈ 20s of backoff. */
 export const DEFAULT_RETRIES = 6;

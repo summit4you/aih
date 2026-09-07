@@ -576,6 +576,54 @@ assert(fetchCalls === 2, "retryable 500 is retried once");
   }).catch((e: Error) => e);
   assert(plainCalls === 2, `non-capacity 503 keeps the base budget (got ${plainCalls})`);
   assert(plainErr instanceof Error, "plain 503 exhausts to an error");
+  {
+    // Network bursts — undici "fetch failed" (DNS drop, conn reset) — extend
+    // the attempt budget ×3 like capacity: the base budget tolerates ~20s
+    // while these bursts last tens of seconds, and without the extension the
+    // turn dies on a transient blip (observed live: run_cmd → "fetch failed"
+    // → conversation just ended).
+    let netCalls = 0;
+    let fatalCalls = 0;
+    const mkNet = (counter: () => number, throwMsg: string) =>
+      new OpenAICompatibleLLM({
+        baseUrl: "https://example.invalid/v1",
+        apiKey: "k",
+        model: "m",
+        retries: 1, // base attempts = 2
+        fetchImpl: (async () => {
+          counter();
+          throw new Error(throwMsg);
+        }) as typeof fetch,
+      });
+    const netErr = await mkNet(() => netCalls++, "fetch failed").complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+    }).catch((e: Error) => e);
+    assert(netCalls === 6, `network fetch-throw triples the attempt budget (got ${netCalls}, want 6)`);
+    assert(netErr instanceof Error, "network exhaustion still surfaces the error");
+    const fatalErr = await mkNet(() => fatalCalls++, "kaboom unusual").complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+    }).catch((e: Error) => e);
+    assert(fatalCalls === 2, `non-network fetch-throw keeps the base budget (got ${fatalCalls})`);
+    assert(fatalErr instanceof Error, "non-network fetch-throw exhausts to an error");
+    // UNREACHABLE endpoints look like "fetch failed" but carry the OS error
+    // in err.cause (ECONNREFUSED/ENOTFOUND). Retrying a dead port for minutes
+    // is pointless — stays on the base budget so misconfiguration fails fast.
+    let refCalls = 0;
+    const refErr = await new OpenAICompatibleLLM({
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "k",
+      model: "m",
+      retries: 1,
+      fetchImpl: (async () => {
+        refCalls += 1;
+        throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED", message: "connect ECONNREFUSED 127.0.0.1:1" } });
+      }) as typeof fetch,
+    }).complete({ messages: [{ role: "user", content: "hi" }], tools: [] }).catch((e: Error) => e);
+    assert(refCalls === 1, `unreachable endpoint fails instantly, no retry (got ${refCalls}, want 1)`);
+    assert(refErr instanceof Error, "unreachable endpoint exhausts to an error");
+  }
 }
 assert(
   retryRes.text === "ok" && retryRes.usage?.totalTokens === 15,
@@ -2581,6 +2629,102 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   }
   assert(noHookThrew, "no quotaWait hook → QuotaError propagates immediately");
   assert(noHookLog.all().filter((e) => e.type === "quota_wait").length === 0, "no quota_wait event in non-interactive mode");
+
+  // 6) Network failure parks the turn instead of killing it: "fetch failed"
+  //    ×2 then recovery → the SAME call is re-issued, quota_wait events carry
+  //    reason "network", and the turn COMPLETES (the live bug: run_cmd →
+  //    "fetch failed" → conversation just ended).
+  const prevPark = process.env.AIH_NETWORK_PARK_MS;
+  process.env.AIH_NETWORK_PARK_MS = "30,60"; // fast test waits
+  try {
+    let netTurnCalls = 0;
+    const netLlm: LLMAdapter = {
+      async complete(): Promise<LLMResponse> {
+        netTurnCalls += 1;
+        if (netTurnCalls <= 2) throw new Error("fetch failed");
+        return { text: "recovered after network", toolCalls: [], stopReason: "end_turn" };
+      },
+    };
+    const netLog = new SessionLog();
+    const netLoop = new AgentLoop({ llm: netLlm, tools: quotaTools, log: netLog });
+    const netRes = await netLoop.send("explain");
+    assert(netRes.stopReason === "end_turn", `network park recovers the turn (stopReason=${netRes.stopReason})`);
+    assert(netTurnCalls === 3, `turn-level park re-issued the call (got ${netTurnCalls}, want 3 = 2 fails + recovery)`);
+    const netWaits = netLog.all().filter((e) => e.type === "quota_wait" && (e as { reason?: string }).reason === "network");
+    assert(netWaits.length === 2, `network waits logged with reason=network (got ${netWaits.length})`);
+  } finally {
+    if (prevPark === undefined) delete process.env.AIH_NETWORK_PARK_MS;
+    else process.env.AIH_NETWORK_PARK_MS = prevPark;
+  }
+
+  // 7) A network outage that outlasts the park budget still ends the turn
+  //    honestly (bounded, not an infinite hang).
+  {
+    let deadCalls = 0;
+    const deadLlm: LLMAdapter = {
+      async complete(): Promise<LLMResponse> {
+        deadCalls += 1;
+        throw new Error("fetch failed");
+      },
+    };
+    const deadLog = new SessionLog();
+    const deadLoop = new AgentLoop({ llm: deadLlm, tools: quotaTools, log: deadLog });
+    let deadThrew = false;
+    try {
+      await deadLoop.send("explain");
+    } catch (err) {
+      deadThrew = /fetch failed/.test(String((err as Error).message));
+    }
+    assert(deadThrew, "dead network exhausts the park budget → error propagates");
+    assert(deadCalls === 3, `park attempts bounded (got ${deadCalls}, want 3 = 1 + 2 waits)`);
+    const deadWaits = deadLog.all().filter((e) => e.type === "quota_wait" && (e as { reason?: string }).reason === "network").length;
+    assert(deadWaits === 2, `park waits logged (got ${deadWaits})`);
+  }
+
+  // 8) A NON-network failure is not parked (fatal errors still kill the turn
+  //    immediately — no waiting on a failure waiting cannot fix).
+  {
+    let fatalCalls = 0;
+    const fatalLlm: LLMAdapter = {
+      async complete(): Promise<LLMResponse> {
+        fatalCalls += 1;
+        throw new Error("kaboom unusual");
+      },
+    };
+    const fatalLog = new SessionLog();
+    const fatalLoop = new AgentLoop({ llm: fatalLlm, tools: quotaTools, log: fatalLog });
+    let fatalThrew = false;
+    try {
+      await fatalLoop.send("explain");
+    } catch (err) {
+      fatalThrew = /kaboom/.test(String((err as Error).message));
+    }
+    assert(fatalThrew && fatalCalls === 1, `non-network failure kills the turn immediately (calls=${fatalCalls})`);
+  }
+
+  // 9) An UNREACHABLE endpoint (connection refused — undici "fetch failed"
+  //    with cause code ECONNREFUSED) is NOT parked: it fails fast, because
+  //    retrying a dead port for minutes is pointless (misconfig).
+  {
+    let refusedCalls = 0;
+    const refusedLlm: LLMAdapter = {
+      async complete(): Promise<LLMResponse> {
+        refusedCalls += 1;
+        throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED", message: "connect ECONNREFUSED 127.0.0.1:1" } });
+      },
+    };
+    const refusedLog = new SessionLog();
+    const refusedLoop = new AgentLoop({ llm: refusedLlm, tools: quotaTools, log: refusedLog });
+    let refusedThrew = false;
+    try {
+      await refusedLoop.send("explain");
+    } catch (err) {
+      const full = `${String((err as { message?: string })?.message ?? "")} ${String((err as { cause?: { message?: string } })?.cause?.message ?? "")}`;
+      refusedThrew = /ECONNREFUSED/.test(full);
+    }
+    assert(refusedThrew && refusedCalls === 1, `unreachable endpoint fails fast at turn level (calls=${refusedCalls})`);
+    assert(refusedLog.all().filter((e) => e.type === "quota_wait").length === 0, "no park wait for an unreachable endpoint");
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

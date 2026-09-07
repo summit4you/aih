@@ -282,6 +282,12 @@ export type SessionEvent =
       resumeAtMs: number;
       /** Which quota-wait this is (1-based), bounded by MAX_QUOTA_WAITS. */
       wait: number;
+      /**
+       * Why we're waiting: "quota" (provider usage window) or "network"
+       * (connection failure that exhausted the adapter's retry budget — the
+       * turn parks and re-issues the SAME call instead of dying).
+       */
+      reason?: "quota" | "network";
     }
   | {
       seq: number;

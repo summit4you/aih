@@ -11,6 +11,14 @@ the versions listed here (`scripts/package` derives the version from
 ## [0.8.0] - 2026-09-07
 
 ### Added
+- **OC-R#1 网络失败弹性（turn 级 park-and-retry）**（`core/src/agent-loop.ts` +
+  `core/src/seams/llm-sse.ts` + `core/src/seams/llm-openai.ts`）：
+  - `NETWORK_FAILURE_RE` / `NETWORK_UNREACHABLE_RE` 规范网络失败分类 + `errFullText()`
+    摊平 undici `err.cause`（"fetch failed" 掩盖真实 OS 码）；adapter 层网络类失败
+    重试预算 ×3（同 capacity），不可达端点（ECONNREFUSED/ENOTFOUND）快速失败（首试即抛）。
+  - AgentLoop 层：网络失败耗尽 adapter 预算后 park（`quota_wait` 事件 `reason:"network"`，
+    默认 10s/20s，`AIH_NETWORK_PARK_MS` 可调）并**重发同一调用**，而非杀死 turn——
+    修复「瞬时网络尖峰 = 整场对话结束」；死网络有界耗尽后仍诚实报错。
 - **CL-R#5 — hook 故障隔离**（`core/src/tool-registry.ts` + `core/src/seams/permissions.ts`）：
   hook 抛普通 `Error` 视为基础设施故障——跳过该 hook、调用继续（不得当作否决），
   有意为之的策略否决改走 `HookVetoError`，扩展的 `cancel` 语义升级为该异常类型。

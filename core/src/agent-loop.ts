@@ -1,5 +1,5 @@
 import type { LLMAdapter } from "./seams/llm.js";
-import { CONTEXT_LENGTH_RE, NetworkFinishError, QuotaError, StallError } from "./seams/llm-sse.js";
+import { CONTEXT_LENGTH_RE, NetworkFinishError, QuotaError, StallError, NETWORK_FAILURE_RE, NETWORK_UNREACHABLE_RE, errFullText } from "./seams/llm-sse.js";
 import { COMPACT_CONTINUE_PROMPT, EMPTY_RETRY_PROMPT, MAX_STEPS_PROMPT, STREAM_RESUME_PROMPT, TRUNCATED_RETRY_PROMPT } from "./prompts.js";
 import type { LoopObserver } from "./observers.js";
 import { LoopAbort, notifyObservers } from "./observers.js";
@@ -800,7 +800,11 @@ export class AgentLoop {
         // skip the generic error-recovery path and fall through to the normal
         // post-catch processing (log response, process tool calls).
         if (response === undefined) {
-          const message = err instanceof Error ? err.message : String(err);
+          let message = err instanceof Error ? err.message : String(err);
+          // undici hides the OS error in err.cause ("fetch failed"); flatten
+          // it so unreachable endpoints (ECONNREFUSED/ENOTFOUND) are told apart
+          // from transient mid-flight failures (which may warrant a park).
+          const fullMsg = errFullText(err);
           // Provider text is unreliable about WHY it failed: free-tier gateways
           // return generic "HTTP 500 Internal server error" when the real cause
           // is an oversized prompt. When the local estimate says we're near the
@@ -809,9 +813,62 @@ export class AgentLoop {
           const nearWindow =
             this.#contextWindow > 0 &&
             this.#estimateContext() >= OVERFLOW_SUSPECT_RATIO * this.#contextWindow;
+          const networkFailure = NETWORK_FAILURE_RE.test(fullMsg);
+          const unreachable = NETWORK_UNREACHABLE_RE.test(fullMsg);
           const opaqueFailure =
-            /HTTP [45]\d\d|fetch failed|terminated|socket hang|other side closed/i.test(message);
-          if (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure)) throw err;
+            /HTTP [45]\d\d/i.test(message) || networkFailure;
+          // A network failure that exhausted even the adapter's extended
+          // budget must NOT kill the turn: the connection comes back after
+          // tens of seconds (Zen/Cloudflare bursts), and killing the turn
+          // loses the whole in-flight task ("run_cmd … fetch failed" then the
+          // conversation just ends). Park briefly and re-issue the SAME call
+          // — bounded, so a truly dead network still ends the turn honestly.
+          if (!CONTEXT_ERROR.test(message) && networkFailure && !unreachable && !nearWindow) {
+            // Park waits (ms), test-tunable via AIH_NETWORK_PARK_MS="100,200".
+            const NET_WAITS_MS = ((): number[] => {
+              const raw = (process.env.AIH_NETWORK_PARK_MS ?? "").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+              return raw.length ? raw.slice(0, 3) : [10_000, 20_000];
+            })();
+            let recovered = false;
+            for (let netWait = 0; netWait < NET_WAITS_MS.length; netWait += 1) {
+              const waitMs = NET_WAITS_MS[netWait];
+              this.#log.append({
+                type: "quota_wait",
+                turnId,
+                retryAfterSec: Math.round(waitMs / 1000),
+                resumeAtMs: Date.now() + waitMs,
+                wait: netWait + 1,
+                reason: "network",
+              });
+              hooks?.quotaWait?.begin?.({ retryAfterSec: Math.round(waitMs / 1000), resumeAtMs: Date.now() + waitMs, wait: netWait + 1 });
+              await sleepMs(waitMs, ac.signal);
+              hooks?.quotaWait?.end?.(ac.signal.aborted ? "aborted" : "done");
+              if (ac.signal.aborted) break;
+              try {
+                response = await doComplete();
+                recovered = true;
+                break;
+              } catch (netErr) {
+                if (ac.signal.aborted) break;
+                err = netErr;
+                message = errFullText(err);
+                if (!NETWORK_FAILURE_RE.test(message) || NETWORK_UNREACHABLE_RE.test(message)) throw err; // different/dead-end failure — normal paths
+              }
+            }
+            if (recovered) {
+              // fall through to the normal post-catch processing below
+            } else if (!ac.signal.aborted && CONTEXT_ERROR.test(message)) {
+              // the parked retries surfaced a DIFFERENT (context) failure —
+              // fall through to the compact+retry path below
+            } else {
+              throw err;
+            }
+          }
+          // Recovered (response set) by the network park above → skip the
+          // overflow/compact path entirely; the response is processed by the
+          // normal post-catch flow.
+          if (response === undefined && (!CONTEXT_ERROR.test(message) && !(nearWindow && opaqueFailure))) throw err;
+          if (response === undefined) {
           // P#36④ — the failed request was part of THIS turn: its user request
           // and everything logged before it stay in the log, but compaction may
           // fold them into the summary. Re-prime the turn with an explicit
@@ -833,6 +890,7 @@ export class AgentLoop {
             });
           }
           response = await doComplete();
+          }
         }
       }
       usage = addUsage(usage, response.usage);
