@@ -831,6 +831,20 @@ sandbox)**:
   **can never auto-allow them**; human confirmation is a floor that config cannot
   bypass. Readonly calls unaffected.
 
+**Execution policy (AC#3, session-level command-category hard floor)**:
+- Bitmask categories: `NO_BUILD` (build/compile: `npm run build`, `tsc`, `cargo build`,
+  `make`…), `NO_TEST` (test/verify: `npm test`, `jest`, `pytest`, `cargo test`…),
+  `NO_SHELL` (direct script execution: `bash x.sh`, `pwsh x.ps1`, `python x.py`…).
+- Deterministic classifier (prefix + token scan, same style as the readonly
+  whitelist) — **fail-open**: only positively-identified commands are blocked;
+  the approval gate remains the real boundary.
+- Checked **before** the ruleset in `SessionGate.request()`: an explicit
+  `allow` rule cannot override it (session-level hard restriction, same
+  semantics as plan mode hiding write tools). Only `run_cmd` is classified.
+- Configuration (later wins): `aih.json` `executionPolicy` (number or
+  `"build,test"` string) < `AIH_EXEC_POLICY` env var < CLI flags
+  `--no-build` / `--no-test` / `--no-shell` (each sets one bit; OR-combined).
+
 ### Trust Model (OC#4 — local single operator, not a multi-tenant security boundary)
 
 AIH's threat model is **local single operator**:

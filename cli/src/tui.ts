@@ -648,9 +648,19 @@ constructor(opts: TuiOptions) {
     // Mouse tracking (?1000/?1006) IS supported on Win10+ conhost — enable it
     // so click-to-expand works. Bracketed paste (?2004) enables Ctrl+Shift+V
     // and right-click paste to arrive as literal text (not key events).
+    // ?1007 (alternate scroll): while in the alt screen, wheel events are
+    // delivered to the application as mouse SGR sequences (64/65) instead of
+    // being intercepted by the terminal for its own scrollback. Without it,
+    // Windows Terminal's default (alternateScroll: auto) swallows the wheel —
+    // the user sees the main-screen scrollback instead of scrolling the
+    // transcript. ?1007 is honored by Windows Terminal, xterm, and kitty;
+    // legacy conhost does not understand it, so it is only sent on non-legacy
+    // Windows terminals (where it is the fix, not noise).
     const modes = legacyWin
       ? `${CSI}?1000h${CSI}?1006h${CSI}?2004h`
-      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
+      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h${
+          process.platform === "win32" ? `${CSI}?1007h` : ""
+        }`;
     process.stdout.write(modes);
     if (legacyWin) {
       this.pushSystem(
@@ -658,11 +668,9 @@ constructor(opts: TuiOptions) {
         "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse · right-click = paste"
       );
     } else if (process.platform === "win32") {
-      // Windows Terminal: mouse tracking enabled, but wheel is intercepted
-      // by the terminal for its own scrollback. Tell the user how to fix.
+      // ?1007 enabled: the wheel now scrolls the aih transcript directly.
       this.pushSystem(
-        "Windows Terminal: mouse click works, but wheel scrolls the terminal's scrollback. " +
-        "To forward wheel to aih: settings.json → \"mouseTracking\": \"always\". " +
+        "Windows Terminal: mouse wheel scrolls the conversation (alternate scroll enabled). " +
         "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
       );
     }
@@ -680,9 +688,12 @@ constructor(opts: TuiOptions) {
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
     // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen).
+    // ?1007 (alternate scroll) is only enabled on non-legacy Windows terminals.
     const restore = this.#legacyWin
       ? `${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
-      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`;
+      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${
+          process.platform === "win32" ? `${CSI}?1007l` : ""
+        }${SHOW}`;
     process.stdout.write(restore);
   }
 
@@ -716,7 +727,9 @@ constructor(opts: TuiOptions) {
   };
 
   #restore = (): void => {
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${SHOW}`);
+    // ?1007l only when it was enabled (non-legacy Windows terminal).
+    const a1007 = process.platform === "win32" && !this.#legacyWin ? `${CSI}?1007l` : "";
+    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${a1007}${SHOW}`);
   };
 
   /** Begin a bulk insert (session replay): suppress per-item follow/paint. */

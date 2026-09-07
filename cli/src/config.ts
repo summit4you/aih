@@ -8,6 +8,7 @@ import { userAihDir, userAihDirs } from "./paths.js";
 import { readJson } from "./read-json.js";
 import { loadEnvSafety, mergeSafety } from "./safety.js";
 import type { SafetyConfig } from "./safety.js";
+import { parsePolicy } from "./exec-policy.js";
 
 /**
  * Global (user-level) config file. Resolves through the XDG data dir
@@ -406,6 +407,23 @@ export function loadAutoAllowReadonly(): boolean {
   for (const { config } of loadLayers()) {
     if (typeof config.autoAllowReadonly === "boolean") out = config.autoAllowReadonly;
   }
+  return out;
+}
+
+/**
+ * AC#3 — execution policy bitmask (NO_BUILD=1 | NO_TEST=2 | NO_SHELL=4).
+ * Sources (later wins): config `executionPolicy` (number or "build,test"
+ * string) < `AIH_EXEC_POLICY` env var (number or comma-separated names).
+ * 0 = off (no category restrictions).
+ */
+export function loadExecPolicy(): number {
+  let out = 0;
+  for (const { config } of loadLayers()) {
+    const p = (config as { executionPolicy?: number | string }).executionPolicy;
+    if (p !== undefined) out = parsePolicy(p);
+  }
+  const env = process.env.AIH_EXEC_POLICY;
+  if (env) out = parsePolicy(env);
   return out;
 }
 

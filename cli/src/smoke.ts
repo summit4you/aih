@@ -819,6 +819,121 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     console.log("ok: CC#54 autoAllowReadonly — deterministic whitelist, default off, floors intact");
   }
 
+  // AC#3 — execution policy bitmask (NO_BUILD/NO_TEST/NO_SHELL): session-level
+  // hard restriction on run_cmd command categories, checked before the ruleset
+  // so an explicit allow rule cannot override it.
+  {
+    const { NO_BUILD, NO_TEST, NO_SHELL, parsePolicy, classifyCommand, policyViolation, describePolicy } =
+      await import("./exec-policy.js");
+    const { SessionGate, DenyGate } = await import("./gate.js");
+
+    // bitmask constants
+    assert(NO_BUILD === 1 && NO_TEST === 2 && NO_SHELL === 4, "AC#3: bitmask values");
+
+    // parsePolicy: number passthrough, comma-separated names, unknown ignored
+    assert(parsePolicy(3) === 3, "AC#3: parsePolicy(3) === 3");
+    assert(parsePolicy("build,test") === 3, "AC#3: parsePolicy('build,test') === 3");
+    assert(parsePolicy("shell") === 4, "AC#3: parsePolicy('shell') === 4");
+    assert(parsePolicy(99) === 3, "AC#3: parsePolicy masks out-of-range bits (99 & 7 = 3)");
+    assert(parsePolicy("") === 0, "AC#3: parsePolicy('') === 0");
+
+    // classifyCommand: positive hits
+    assert(!!(classifyCommand("npm run build") & NO_BUILD), "AC#3: npm run build → NO_BUILD");
+    assert(!!(classifyCommand("yarn build") & NO_BUILD), "AC#3: yarn build → NO_BUILD");
+    assert(!!(classifyCommand("npx tsc -b") & NO_BUILD), "AC#3: npx tsc → NO_BUILD");
+    assert(!!(classifyCommand("cargo build --release") & NO_BUILD), "AC#3: cargo build → NO_BUILD");
+    assert(!!(classifyCommand("make") & NO_BUILD), "AC#3: make → NO_BUILD");
+    assert(!!(classifyCommand("npm test") & NO_TEST), "AC#3: npm test → NO_TEST");
+    assert(!!(classifyCommand("jest --coverage") & NO_TEST), "AC#3: jest → NO_TEST");
+    assert(!!(classifyCommand("pytest tests/") & NO_TEST), "AC#3: pytest → NO_TEST");
+    assert(!!(classifyCommand("cargo test") & NO_TEST), "AC#3: cargo test → NO_TEST");
+    assert(!!(classifyCommand("bash scripts/deploy.sh") & NO_SHELL), "AC#3: bash x.sh → NO_SHELL");
+    assert(!!(classifyCommand("pwsh .\\setup.ps1") & NO_SHELL), "AC#3: pwsh x.ps1 → NO_SHELL");
+    assert(!!(classifyCommand("python run.py") & NO_SHELL), "AC#3: python x.py → NO_SHELL");
+
+    // classifyCommand: fail-open for unrecognized commands
+    assert(classifyCommand("ls -la") === 0, "AC#3: ls → no category (fail-open)");
+    assert(classifyCommand("git status") === 0, "AC#3: git status → no category");
+    assert(!!(classifyCommand("npm run lint") & NO_TEST), "AC#3: npm run lint → NO_TEST (verification class)");
+    assert(classifyCommand("npm run clean") === 0, "AC#3: npm run clean → no category (unknown script, fail-open)");
+    assert(classifyCommand("") === 0, "AC#3: empty → no category");
+
+    // policyViolation
+    assert(policyViolation("npm run build", NO_BUILD) === NO_BUILD, "AC#3: violation detected");
+    assert(policyViolation("npm run build", NO_TEST) === 0, "AC#3: no cross-category violation");
+    assert(policyViolation("ls -la", NO_BUILD | NO_TEST | NO_SHELL) === 0, "AC#3: benign cmd passes any policy");
+
+    // describePolicy
+    assert(describePolicy(3) === "build + test", "AC#3: describePolicy(3)");
+    assert(describePolicy(0) === "(none)", "AC#3: describePolicy(0)");
+
+    // Gate integration: policy blocks BEFORE the ruleset — even an explicit
+    // allow rule cannot override it (session-level hard restriction).
+    const mkStubTui = (): { tui: unknown; prompts: string[]; sys: string[] } => {
+      const prompts: string[] = [];
+      const sys: string[] = [];
+      return {
+        prompts,
+        sys,
+        tui: {
+          askConfirm: async (detail: string) => { prompts.push(detail); return "once" as const; },
+          pushSystem: (m: string) => { sys.push(m); },
+        },
+      };
+    };
+    const attach = (gate: unknown, stub: { tui: unknown }): void => {
+      (gate as { attachTui(t: unknown): void }).attachTui(stub.tui);
+    };
+
+    // NO_BUILD: npm run build blocked, ls passes (no prompt needed for block).
+    const bStub = mkStubTui();
+    const bGate = new SessionGate(new DenyGate(), [], undefined, false, undefined, NO_BUILD);
+    attach(bGate, bStub);
+    const buildOk = await bGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm run build" } });
+    assert(buildOk === false && bStub.prompts.length === 0, "AC#3: gate blocks npm run build under NO_BUILD (silent, no prompt)");
+    assert(bStub.sys.some((m) => m.includes("exec-policy")), "AC#3: block surfaced via pushSystem");
+
+    // NO_TEST: npm test blocked; NO_SHELL: bash x.sh blocked; benign cmd not blocked.
+    const tStub = mkStubTui();
+    const tGate = new SessionGate(new DenyGate(), [], undefined, false, undefined, NO_TEST);
+    attach(tGate, tStub);
+    const testOk = await tGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm test" } });
+    assert(testOk === false, "AC#3: gate blocks npm test under NO_TEST");
+    const sStub = mkStubTui();
+    const sGate = new SessionGate(new DenyGate(), [], undefined, false, undefined, NO_SHELL);
+    attach(sGate, sStub);
+    const shOk = await sGate.request({ tool: "run_cmd", kind: "write", args: { command: "bash deploy.sh" } });
+    assert(shOk === false, "AC#3: gate blocks bash x.sh under NO_SHELL");
+
+    // An explicit ALLOW rule cannot override the execution policy (hard floor).
+    const oStub = mkStubTui();
+    const { AutoApprove } = await import("@aih/core");
+    const oGate = new SessionGate(
+      new AutoApprove(),
+      [{ tool: "run_cmd", pattern: "*", action: "allow" }],
+      undefined,
+      false,
+      undefined,
+      NO_BUILD,
+    );
+    attach(oGate, oStub);
+    const overrideOk = await oGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm run build" } });
+    assert(overrideOk === false, "AC#3: explicit allow rule does NOT override execution policy");
+
+    // Policy off (0): command is NOT blocked by policy — it falls through to
+    // the normal ask path (stub TUI denies), proving the policy layer is inert.
+    const offStub = mkStubTui();
+    const offGate = new SessionGate(new DenyGate(), [], undefined, false, undefined, 0);
+    attach(offGate, offStub);
+    const offOk = await offGate.request({ tool: "run_cmd", kind: "write", args: { command: "npm run build" } });
+    // stub answers "once" → approved; the PROMPT itself is the proof the
+    // command reached the normal ask path (policy layer inert), unlike the
+    // policy-blocked cases above which never prompted.
+    assert(offOk === true && offStub.prompts.length === 1, "AC#3: policy off — command reaches ask path (not policy-blocked)");
+
+    console.log("ok: AC#3 execution policy — NO_BUILD/NO_TEST/NO_SHELL bitmask, fail-open classifier, hard floor");
+  }
+
   // CC#60 — notification classification: injected input (serve/steering) can
   // never approve a pending ask; only TTY keyboard input can.
   {

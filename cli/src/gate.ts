@@ -4,6 +4,7 @@ import { RulesetGate, deriveScope } from "@aih/core";
 import { createInterface } from "node:readline";
 import { copyToClipboard } from "./clipboard.js";
 import { isReadonlyCommand } from "./readonly-allow.js";
+import { describePolicy, policyViolation } from "./exec-policy.js";
 import type { Tui } from "./tui.js";
 import {
   DEFAULT_GUARDIAN_POLICY,
@@ -56,6 +57,8 @@ export class SessionGate implements ApprovalGate {
   #persist?: (rule: PermissionRule) => string;
   /** CC#54 — auto-allow provably read-only commands when no explicit rule matched. */
   #autoAllowReadonly: boolean;
+  /** AC#3 — execution policy bitmask (NO_BUILD|NO_TEST|NO_SHELL); 0 = off. */
+  #execPolicy: number;
   /** MEA — optional Guardian reviewer for write "ask" floor. */
   #guardian?: GuardianReviewer;
   #guardianBreaker = new GuardianCircuitBreaker();
@@ -73,11 +76,18 @@ export class SessionGate implements ApprovalGate {
     persist?: (rule: PermissionRule) => string,
     autoAllowReadonly = false,
     guardian?: GuardianReviewer,
+    execPolicy = 0,
   ) {
     this.#ruleset = new RulesetGate(fallback, initial);
     this.#persist = persist;
     this.#autoAllowReadonly = autoAllowReadonly;
     this.#guardian = guardian;
+    this.#execPolicy = execPolicy & 7;
+  }
+
+  /** AC#3 — active execution policy bitmask (0 = off). */
+  execPolicy(): number {
+    return this.#execPolicy;
   }
 
   attachTui(tui: Tui): void {
@@ -166,6 +176,25 @@ export class SessionGate implements ApprovalGate {
   }
 
   async request(req: ApprovalRequest): Promise<boolean> {
+    // AC#3 — execution policy (NO_BUILD/NO_TEST/NO_SHELL bitmask): a
+    // session-level hard restriction, checked BEFORE the ruleset so an
+    // explicit allow rule cannot silently override it (same semantics as
+    // plan mode hiding write tools). Only run_cmd commands are classified;
+    // the classifier is conservative — it blocks what it positively
+    // identifies, and the approval gate remains the real boundary.
+    if (this.#execPolicy && req.tool === "run_cmd" && typeof req.args === "object" && req.args !== null) {
+      const cmd = (req.args as { command?: unknown }).command;
+      if (typeof cmd === "string") {
+        const violation = policyViolation(cmd, this.#execPolicy);
+        if (violation) {
+          const msg = `[exec-policy] blocked ${req.tool}: command matches disabled category (${describePolicy(violation)})`;
+          if (this.#tui) this.#tui.pushSystem(msg);
+          else process.stderr.write(`${msg}\n`);
+          this.lastDenySource = "human";
+          return false;
+        }
+      }
+    }
     const action = this.#ruleset.evaluate(req);
     if (action === "allow") return true;
     if (action === "deny") {

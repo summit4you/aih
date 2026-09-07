@@ -63,6 +63,7 @@ import {
   loadModelCatalog,
   loadPermissionRules,
   loadAutoAllowReadonly,
+  loadExecPolicy,
   loadAgentProfile,
   listAgentProfiles,
   normalizeModelEntries,
@@ -294,6 +295,9 @@ Options:
       --debug-prompt          print the exact model-visible prompt input before each LLM call
   -y, --yes                   auto-approve ask-permission tools
       --mock                  scripted LLM for offline demo/testing
+      --no-build              AC#3: block build/compile commands (npm run build, tsc, …)
+      --no-test               AC#3: block test commands (npm test, jest, pytest, …)
+      --no-shell              AC#3: block direct script execution (bash x.sh, pwsh x.ps1, …)
       --no-guardian           disable the MEA write-action Guardian reviewer
                               (on by default: independent LLM reviews "ask" write
                               actions before the human prompt; low-risk
@@ -868,6 +872,10 @@ export function makeSessionGate(flags: Record<string, string | boolean>): Sessio
     (rule) => savePermissionRule(rule),
     // CC#54 — opt-in read-only auto-allow from config (default off).
     loadAutoAllowReadonly(),
+    undefined,
+    // AC#3 — execution policy bitmask (NO_BUILD/NO_TEST/NO_SHELL) from
+    // config / AIH_EXEC_POLICY / CLI flags (--no-build --no-test --no-shell); 0 = off.
+    loadExecPolicy() | (bool(flags, "no-build") ? 1 : 0) | (bool(flags, "no-test") ? 2 : 0) | (bool(flags, "no-shell") ? 4 : 0),
   );
 }
 
