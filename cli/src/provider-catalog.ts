@@ -39,8 +39,11 @@ export interface CatalogProvider {
 /** Providers whose chat-completions endpoint is OpenAI-compatible. */
 const CATALOG: CatalogProvider[] = [
   // ---- Popular (opencode /connect priority order) ----
-  { id: "opencode", name: "OpenCode", baseUrl: "https://opencode.ai/zen/v1", apiKeyEnv: "OPENCODE_API_KEY", defaultModel: "big-pickle", models: ["big-pickle", "hy3-free", "mimo-v2.5-free", "x-preview-f-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "laguna-s-2.1-free"] },
-  { id: "opencode-go", name: "OpenCode Go", baseUrl: "https://opencode.ai/zen/go/v1", apiKeyEnv: "OPENCODE_API_KEY", defaultModel: "deepseek-v4-flash", models: ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3-flash", "glm-5.3", "kimi-k2.7-code", "kimi-k3", "qwen3.7-max", "qwen3.8-max", "mimo-v2.5", "minimax-m3", "gpt-5.6-luna"] },
+  // x-opencode-session: opencode Go REJECTS requests without it (HTTP 400
+  // "MissingSessionID") and Zen uses it for routing/prompt-cache affinity.
+  // "{sid}" resolves to the conversation-stable session id (see buildLlm).
+  { id: "opencode", name: "OpenCode", baseUrl: "https://opencode.ai/zen/v1", apiKeyEnv: "OPENCODE_API_KEY", defaultModel: "big-pickle", models: ["big-pickle", "hy3-free", "mimo-v2.5-free", "x-preview-f-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "laguna-s-2.1-free"], headers: { "x-opencode-session": "{sid}" } },
+  { id: "opencode-go", name: "OpenCode Go", baseUrl: "https://opencode.ai/zen/go/v1", apiKeyEnv: "OPENCODE_API_KEY", defaultModel: "deepseek-v4-flash", models: ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3-flash", "glm-5.3", "kimi-k2.7-code", "kimi-k3", "qwen3.7-max", "qwen3.8-max", "mimo-v2.5", "minimax-m3", "gpt-5.6-luna"], headers: { "x-opencode-session": "{sid}" } },
   { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", defaultModel: "gpt-4o", models: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o1", "o1-mini"] },
   { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", defaultModel: "openai/gpt-4o", models: ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash", "deepseek/deepseek-chat"] },
   { id: "github-copilot", name: "GitHub Copilot", baseUrl: "https://api.githubcopilot.com/v1", apiKeyEnv: "GITHUB_COPILOT_API_KEY", defaultModel: "gpt-4.1", models: ["gpt-4.1", "claude-sonnet-4"] },

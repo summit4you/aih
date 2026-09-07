@@ -47,6 +47,16 @@ export interface OpenAICompatibleOptions {
   /** extra request headers sent with every completion call (e.g. client identity) */
   headers?: Record<string, string>;
   /**
+   * Explicit, conversation-stable session id for "{sid}" header placeholders
+   * (opencode Go requires `x-opencode-session` per conversation: "Send a
+   * stable session ID ... for each conversation so we can optimize routing
+   * and prompt caching"). Without it a random id is minted per adapter
+   * instance — which changes whenever the runtime rebuilds the adapter
+   * (model switch / mode switch), breaking gateway-side session affinity.
+   * Per-request `req.sessionId` (compaction summaries) still overrides.
+   */
+  sessionId?: string;
+  /**
    * Cap for the model's max_tokens (max output tokens) per request. Some free
    * tiers reject requests that ask for more output than the account can afford
    * (e.g. OpenRouter upstreams 503 when max_tokens > remaining quota) — send an
@@ -201,7 +211,9 @@ export class OpenAICompatibleLLM implements LLMAdapter {
   constructor(options: OpenAICompatibleOptions) {
     this.#options = options;
     this.#fetch = options.fetchImpl ?? fetch;
-    this.#sid = opencodeIDBody();
+    // A caller-supplied session id wins: it survives adapter rebuilds
+    // (model/mode switches) so the gateway sees one conversation, one id.
+    this.#sid = options.sessionId ?? opencodeIDBody();
   }
 
   /**

@@ -631,6 +631,64 @@ assert(
 );
 assert(retryRes.genMs === undefined, "non-streaming response carries no genMs (F#30)");
 
+// Session affinity — OpenCode Go rejects header-less requests with HTTP 400
+// "MissingSessionID" ("Request is missing x-opencode-session and cannot be
+// routed efficiently"): "{sid}" headers must resolve to the conversation-
+// stable sessionId option, and a per-request sessionId (compaction summaries,
+// P#36) must override it on its own lane.
+{
+  const seen: string[] = [];
+  const sidLlm = new OpenAICompatibleLLM({
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 0,
+    sessionId: "s-20260907-121500",
+    headers: { "x-opencode-session": "{sid}" },
+    fetchImpl: (async (_url: string | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      seen.push(h.get("x-opencode-session") ?? "");
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "ok", tool_calls: [] } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch,
+  });
+  await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  await sidLlm.complete({ messages: [{ role: "user", content: "hi" }], tools: [], sessionId: "aih-compact-x" });
+  assert(
+    seen[0] === "s-20260907-121500",
+    `x-opencode-session resolves to the stable session id (got ${JSON.stringify(seen[0])})`,
+  );
+  assert(seen[1] === "aih-compact-x", "summary sessionId overrides the session-header lane");
+  // No sessionId option → a random id is minted per instance and stays stable
+  // across that instance's calls (per-conversation affinity).
+  const seen2: string[] = [];
+  const sidLlm2 = new OpenAICompatibleLLM({
+    baseUrl: "https://opencode.ai/zen/v1",
+    apiKey: "k",
+    model: "m",
+    retries: 0,
+    headers: { "x-opencode-session": "{sid}" },
+    fetchImpl: (async (_url: string | URL, init?: RequestInit) => {
+      seen2.push(new Headers(init?.headers).get("x-opencode-session") ?? "");
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "ok", tool_calls: [] } }], usage: {} }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch,
+  });
+  await sidLlm2.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  await sidLlm2.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+  assert(
+    seen2[0] !== "" && seen2[0] === seen2[1],
+    "implicit session id is non-empty and stable per adapter instance",
+  );
+}
+
 // Transient-failure resilience (opencode-parity): exponential backoff bounds
 // and generous default budget.
 assert(DEFAULT_RETRIES >= 5, "default retry budget spans multi-second provider bursts");

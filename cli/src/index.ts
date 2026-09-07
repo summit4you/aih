@@ -569,7 +569,7 @@ async function readPipedStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
-export function buildLlm(flags: Record<string, string | boolean>) {
+export function buildLlm(flags: Record<string, string | boolean>, sessionId?: string) {
   if (bool(flags, "mock")) {
     // AIH_MOCK_AUX_TEXT: non-empty reply for auxiliary tool-less calls (goal
     // judge / branch distiller) in mock mode — a testing hook without a key.
@@ -584,7 +584,7 @@ export function buildLlm(flags: Record<string, string | boolean>) {
       ...(aux ? [{ text: aux, stopReason: "end_turn" as const }] : []),
     ]);
   }
-  return buildRealLlm(flags);
+  return buildRealLlm(flags, sessionId);
 }
 
 /**
@@ -618,7 +618,21 @@ export function buildAuxLlm(flags: Record<string, string | boolean>) {
   return buildRealLlm(flags);
 }
 
-function buildRealLlm(flags: Record<string, string | boolean>) {
+/**
+ * Domain guard for opencode.ai endpoints (Zen + Go). Must recognize the
+ * scheme-prefixed form `https://opencode.ai/...` — the previous inline regex
+ * tested the RAW url against `/(^|\.)opencode\.ai/`, whose `^` anchor saw the
+ * scheme, not the domain, so the guard NEVER matched real URLs and the
+ * x-opencode-session header was silently never injected (Go's HTTP 400
+ * "MissingSessionID"). Strip the scheme first, then anchor on the domain
+ * (also rejects lookalikes: myopencode.ai, opencode.ai.evil.com).
+ */
+export function isOpencodeEndpoint(baseUrl: string): boolean {
+  const host = baseUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  return /(^|\.)opencode\.ai(:|\/|$)/.test(host);
+}
+
+function buildRealLlm(flags: Record<string, string | boolean>, sessionId?: string) {
   const resolved = resolveLlm({
     flagModel: str(flags, "model"),
     flagBaseUrl: str(flags, "base-url"),
@@ -667,13 +681,28 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
   // ALL retries (the "fetch failed" on every provider blip).
   const retries = parseRetryEnv(process.env.AIH_RETRIES);
   const owner = resolved.provider;
+  // OpenCode Go REJECTS requests that lack `x-opencode-session` (HTTP 400
+  // "MissingSessionID — request is missing x-opencode-session and cannot be
+  // routed efficiently"), and Zen free tier uses the header for routing and
+  // prompt-cache affinity. Inject it for every opencode.ai endpoint, even when
+  // the saved provider config predates the header (catalog entries now carry
+  // it explicitly; "{sid}" resolves to the conversation-stable session id).
+  const opencodeEndpoint = isOpencodeEndpoint(resolved.baseUrl.value ?? "");
+  const headers: Record<string, string> = { ...resolved.headers };
+  if (
+    opencodeEndpoint &&
+    !Object.keys(headers).some((k) => k.toLowerCase() === "x-opencode-session")
+  ) {
+    headers["x-opencode-session"] = "{sid}";
+  }
   return new OpenAICompatibleLLM({
     baseUrl: resolved.baseUrl.value ?? "https://api.openai.com/v1",
     apiKey,
     model: resolved.model.value,
     ...(resolved.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     ...(retries !== undefined ? { retries } : {}),
-    ...(Object.keys(resolved.headers).length > 0 ? { headers: resolved.headers } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(sessionId ? { sessionId } : {}),
     // OC#7 — credential ownership isolation: a credential failure on this
     // provider degrades ITS OWNER (recorded for `aih models`/doctor/status);
     // a later success auto-clears it. Never auto-falls back (the error still
@@ -1872,7 +1901,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       },
     });
     return new AgentLoop({
-      llm: buildLlm(flags),
+      // Conversation-stable session id for gateway headers (x-opencode-session):
+      // survives model/mode switch adapter rebuilds — one conversation, one id.
+      llm: buildLlm(flags, sessionPath ? basename(sessionPath).replace(/\.jsonl$/, "") : undefined),
       tools: registry,
       log,
       systemPrompt:

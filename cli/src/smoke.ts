@@ -4446,6 +4446,20 @@ await srv.connect(new StdioServerTransport());
     oc.length === 2 && oc.every((p) => p.headers?.["x-opencode-session"] === "{sid}"),
     "opencode catalog entries send x-opencode-session ({sid})",
   );
+  // Regression (MissingSessionID 400): the domain guard used to test the RAW
+  // url against /(^|\.)opencode\.ai/, whose `^` anchor saw the SCHEME, not
+  // the domain — `https://opencode.ai/...` never matched, so the header was
+  // silently never injected. The guard must recognize scheme-prefixed URLs
+  // and still reject lookalike domains.
+  const { isOpencodeEndpoint } = await import("./index.js");
+  assert(isOpencodeEndpoint("https://opencode.ai/zen/go/v1"), "guard matches https://opencode.ai/zen/go/v1");
+  assert(isOpencodeEndpoint("https://opencode.ai/zen/v1"), "guard matches https://opencode.ai/zen/v1");
+  assert(isOpencodeEndpoint("opencode.ai/v1"), "guard matches bare host");
+  assert(isOpencodeEndpoint("https://foo.opencode.ai/x"), "guard matches subdomain");
+  assert(!isOpencodeEndpoint("https://opencode.ai.evil.com/x"), "guard rejects suffix lookalike");
+  assert(!isOpencodeEndpoint("https://myopencode.ai/v1"), "guard rejects prefix lookalike");
+  assert(!isOpencodeEndpoint("https://api.openai.com/v1"), "guard rejects other hosts");
+  assert(!isOpencodeEndpoint(""), "guard rejects empty url");
 }
 
 // --- A: keyboard expand/collapse (Enter/o on empty composer) ------------------
