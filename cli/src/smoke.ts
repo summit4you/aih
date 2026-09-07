@@ -3072,6 +3072,42 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // C — grant-scope keymap (after a Guardian deny): g MUST grant, n must
+  // decline. Regression: the key handler used to resolve g as "once" while
+  // askGrantScope only treats "always" as a grant, so pressing g showed
+  // "grant declined". Lock the keymap: g/G → true, n/N → false, y/a inert.
+  const { Tui } = await import("./tui.js");
+  const mkTui = () =>
+    new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+  {
+    const tui = mkTui();
+    const p = tui.askGrantScope("run_cmd", "scope-x");
+    tui.feed("g");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 200))]);
+    assert(out === true, `grant-scope g=grant (got ${JSON.stringify(out)}) — 'grant declined' regression`);
+  }
+  {
+    const tui = mkTui();
+    const p = tui.askGrantScope("run_cmd", "scope-x");
+    tui.feed("y"); // confirm-mode key — must NOT answer the grant prompt
+    const stillOpen = await Promise.race([p.then(() => "answered"), new Promise((r) => setTimeout(() => r("OPEN"), 150))]);
+    assert(stillOpen === "OPEN", "grant-scope: 'y' does not answer (it is a confirm-mode key)");
+    tui.feed("n");
+    const out = await Promise.race([p, new Promise((r) => setTimeout(() => r("TIMEOUT"), 200))]);
+    assert(out === false, `grant-scope n=decline (got ${JSON.stringify(out)})`);
+  }
+  console.log("ok: grant-scope keymap locked (g=grant, n=decline, y inert)");
+}
+
+{
   // IT#3 — `?` prefix: classify + context composition (pure, no LLM).
   const {
     classifyQuestionPrefix,

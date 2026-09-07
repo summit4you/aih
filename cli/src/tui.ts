@@ -1371,7 +1371,11 @@ constructor(opts: TuiOptions) {
         const refuse =
           ch === "n" || ch === "N" || ch === "\r" || ch === "\n" || ch === "\x03" || ch === "\x1b";
         if (accept) {
-          done("once");
+          // grant-scope: the single affirmative key (g) IS the grant — resolve
+          // "always" so askGrantScope sees granted=true. (Previously it resolved
+          // "once", which askGrantScope treats as a decline — the reported bug
+          // where pressing g showed "grant declined".)
+          done(grant ? "always" : "once");
         } else if (secondary) {
           done("always");
         } else if (refuse) {
