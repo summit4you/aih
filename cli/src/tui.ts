@@ -650,17 +650,20 @@ constructor(opts: TuiOptions) {
     // and right-click paste to arrive as literal text (not key events).
     // ?1007 (alternate scroll): while in the alt screen, wheel events are
     // delivered to the application as mouse SGR sequences (64/65) instead of
-    // being intercepted by the terminal for its own scrollback. Without it,
-    // Windows Terminal's default (alternateScroll: auto) swallows the wheel —
-    // the user sees the main-screen scrollback instead of scrolling the
-    // transcript. ?1007 is honored by Windows Terminal, xterm, and kitty;
-    // legacy conhost does not understand it, so it is only sent on non-legacy
-    // Windows terminals (where it is the fix, not noise).
+    // being translated by the terminal into arrow keys (CSI A/B). Without it:
+    //  - Windows Terminal (alternateScroll: auto) swallows the wheel for its
+    //    own scrollback — the user sees the main-screen scrollback.
+    //  - Linux VTE terminals (GNOME Terminal, xfce4-terminal, Konsole) default
+    //    to alternate-scroll OFF: the wheel is translated into ↑/↓ arrow keys,
+    //    which the TUI reads as composer input-history recall — so scrolling
+    //    "works" until the transcript hits the top, then the wheel starts
+    //    editing the input history instead.
+    // ?1007 is honored by Windows Terminal, xterm, VTE (3.26+), kitty, foot.
+    // Legacy conhost does not understand it, so it is only sent on non-legacy
+    // terminals (where it is the fix, not noise).
     const modes = legacyWin
       ? `${CSI}?1000h${CSI}?1006h${CSI}?2004h`
-      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h${
-          process.platform === "win32" ? `${CSI}?1007h` : ""
-        }`;
+      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h${CSI}?1007h`;
     process.stdout.write(modes);
     if (legacyWin) {
       this.pushSystem(
@@ -671,6 +674,13 @@ constructor(opts: TuiOptions) {
       // ?1007 enabled: the wheel now scrolls the aih transcript directly.
       this.pushSystem(
         "Windows Terminal: mouse wheel scrolls the conversation (alternate scroll enabled). " +
+        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
+      );
+    } else if (process.platform === "linux") {
+      // ?1007 enabled: VTE terminals that translate the wheel into arrow keys
+      // (GNOME Terminal, xfce4-terminal, Konsole) now forward it to aih.
+      this.pushSystem(
+        "Mouse wheel scrolls the conversation (alternate scroll enabled). " +
         "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
       );
     }
@@ -687,13 +697,12 @@ constructor(opts: TuiOptions) {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
-    // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen).
-    // ?1007 (alternate scroll) is only enabled on non-legacy Windows terminals.
+    // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen,
+    // no ?1007 — conhost doesn't understand it). All other terminals get the
+    // full teardown including ?1007l (alternate scroll off).
     const restore = this.#legacyWin
       ? `${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
-      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${
-          process.platform === "win32" ? `${CSI}?1007l` : ""
-        }${SHOW}`;
+      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`;
     process.stdout.write(restore);
   }
 
@@ -727,9 +736,8 @@ constructor(opts: TuiOptions) {
   };
 
   #restore = (): void => {
-    // ?1007l only when it was enabled (non-legacy Windows terminal).
-    const a1007 = process.platform === "win32" && !this.#legacyWin ? `${CSI}?1007l` : "";
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${a1007}${SHOW}`);
+    // ?1007l is sent on every non-legacy terminal (it was enabled in start()).
+    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`);
   };
 
   /** Begin a bulk insert (session replay): suppress per-item follow/paint. */
