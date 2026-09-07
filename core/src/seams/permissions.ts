@@ -42,6 +42,19 @@ export class AskError extends Error {
   }
 }
 
+/**
+ * CL-R#5 companion — an INTENTIONAL veto thrown from a before-hook (policy
+ * extensions, audit rules). ToolRegistry distinguishes this from an
+ * infrastructure crash: a veto blocks the call, a generic Error is skipped
+ * (a crashing hook must not break the agent loop).
+ */
+export class HookVetoError extends Error {
+  constructor(message = "blocked by hook") {
+    super(message);
+    this.name = "HookVetoError";
+  }
+}
+
 export class AutoApprove implements ApprovalGate {
   async request(): Promise<boolean> {
     return true;
@@ -223,9 +236,14 @@ export class RulesetGate implements ApprovalGate {
     // AUTO-ALLOW when NO rule matched (base fallback) — is preserved: the
     // floor only fires when action === "allow" came from the base, not from
     // an explicit rule. Deny still dominates everything.
+    // KL-R#4 — explicit allow must match BOTH the path AND the tool name (or *).
+    // A path-scoped rule for tool "edit" does NOT exempt the guarded floor for
+    // a different tool ("write_file") — sibling coverage is preserved, but the
+    // floor still applies because the human didn't explicitly allow THIS tool.
     const explicitAllow = this.rules.some(
       (rule) =>
         rule.action === "allow" &&
+        (rule.tool === req.tool || rule.tool === "*") &&
         (matchPattern(rule.pattern, raw) || matchPattern(rule.pattern, abs)),
     );
     for (const rule of this.rules) {

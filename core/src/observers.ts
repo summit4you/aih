@@ -141,8 +141,7 @@ export function textSimilarity(a: string, b: string, n = 8): number {
 }
 
 /** Options for {@link RepetitionObserver} (all have sensible defaults). */
-export interface RepetitionObserverOptions {
-  /** Consecutive identical tool calls before a soft hint (default 3). */
+export interface RepetitionObserverOptions {  /** Consecutive identical tool calls before a soft hint (default 3). */
   hintAt?: number;
   /** Consecutive identical tool calls before a hard stop (default 6). */
   stopAt?: number;
@@ -261,4 +260,44 @@ export class RepetitionObserver implements LoopObserver {
     }
     if (trimmed) this.#lastText = trimmed;
   }
+}
+
+export interface DoomLoopEscalationOptions {
+  /** Consecutive doom-loop denials before the turn is aborted. Default 3. */
+  maxConsecutive?: number;
+}
+
+/**
+ * Doom-loop escalation — the missing second half of the doom-loop guard.
+ *
+ * The registry's guard denies an identical repeated call (DOOM_LOOP_DENY_AT)
+ * and tells the model to change approach — but a degraded long-context model
+ * can IGNORE that forever: one live session issued the identical
+ * `grep … dev-tools.ts` call 86 times, each denied, zero assistant text in
+ * between — pure "run_cmd failed" spam with nothing stopping the turn.
+ *
+ * This observer closes the loop: consecutive doom-loop denials are counted,
+ * and at the threshold the turn is aborted (LoopAbort → stopReason
+ * "observer_aborted") so the user regains control and sees why. Any
+ * non-doom-loop result resets the count.
+ */
+export function createDoomLoopEscalationObserver(
+  opts?: DoomLoopEscalationOptions,
+): LoopObserver {
+  const max = opts?.maxConsecutive ?? 3;
+  let consecutive = 0;
+  return {
+    onToolResult(_turnId, result) {
+      if (result.ok || !/doom loop guard/i.test(result.error ?? "")) {
+        consecutive = 0;
+        return;
+      }
+      consecutive += 1;
+      if (consecutive >= max) {
+        throw new LoopAbort(
+          `runaway doom loop: ${consecutive} consecutive doom-loop denials — the same call keeps being refused; the turn is stopped so a human can intervene`,
+        );
+      }
+    },
+  };
 }

@@ -2175,7 +2175,7 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
   });
   registryHooks.addHooks({
     before: (info) => {
-      if ((info.args as Record<string, unknown>).veto) throw new Error("nope");
+      if ((info.args as Record<string, unknown>).veto) throw new Error("nope"); // CL-R#5: a crash is SKIPPED, not a veto
     },
     after: (_info, outcome) =>
       outcome.ok ? { ...outcome, result: { ...(outcome.result as object), hooked: true } } : undefined,
@@ -2185,8 +2185,32 @@ for (const name of ["edit", "glob", "grep", "todo", "remember", "question", "tas
     hookOk.ok && (hookOk.result as Record<string, unknown>).hooked === true,
     "after hook rewrites the tool result",
   );
-  const hookDenied = await registryHooks.invoke("calc", { veto: true }, { turnId: "t", inject: () => {} });
-  assert(!hookDenied.ok && (hookDenied.error ?? "").includes("hook vetoed"), "before hook can veto a call");
+  // CL-R#5 — a hook CRASH is an infrastructure fault: the hook is skipped and
+  // the call proceeds (it must NOT be treated as a veto).
+  const hookCrashed = await registryHooks.invoke("calc", { veto: true }, { turnId: "t", inject: () => {} });
+  assert(hookCrashed.ok && (hookCrashed.result as Record<string, unknown>).hooked === true, "hook crash is skipped, call proceeds (CL-R#5)");
+  // CC#53 — an AskError from a before-hook forces the human ask; a denying
+  // gate rejects it ("user rejected", the ask floor). Dedicated DenyAll
+  // registry: AutoApprove (above) would just approve the ask.
+  {
+    const { DenyAll, AskError } = await import("@aih/core");
+    const denyHooks = new ToolRegistry(new DenyAll());
+    denyHooks.register({
+      name: "calc",
+      description: "d",
+      kind: "read",
+      permission: "allow",
+      parameters: { type: "object", properties: {}, required: [] },
+      execute: async () => ({ sum: 3 }),
+    });
+    denyHooks.addHooks({
+      before: (info) => {
+        if ((info.args as Record<string, unknown>).askGate) throw new AskError("sensitive operation");
+      },
+    });
+    const hookDenied = await denyHooks.invoke("calc", { askGate: true }, { turnId: "t", inject: () => {} });
+    assert(!hookDenied.ok && (hookDenied.error ?? "").includes("before-hook ask"), "before-hook AskError + denying gate → rejected (ask floor)");
+  }
 
   // D#11: builtin redaction + timing hooks
   const { redactSecrets, countSecrets, builtinHooks, composeHooks } = await import("./hooks.js");
@@ -3497,6 +3521,50 @@ await srv.connect(new StdioServerTransport());
   assert(cancelled === 1, "genuine double-Esc still cancels after OSC/DCS absorption");
   assert(lines.length === 0, "tmux control bytes never reach the composer");
   console.log("ok: tmux OSC/DCS control sequences are absorbed, not cancel-turn");
+}
+
+{
+  // Windows conpty residual-escape hardening: after a run_cmd (PowerShell)
+  // child exits, the terminal can flush leftover escape bytes — e.g. a
+  // truncated bracketed-paste marker split as `\x1b[20~`, or a trailing `\x1b`
+  // after a consumed CSI. Before the fix these were misread as the user's
+  // double-Esc → the running turn auto-cancelled ("turn cancelled" with no
+  // keypress) and `[20~` leaked into the composer.
+  const { Tui } = await import("./tui.js");
+  const lines: string[] = [];
+  let cancelled = 0;
+  let busy = false;
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => busy,
+    onLine: (l: string) => lines.push(l),
+    cancelTurn: () => {
+      cancelled += 1;
+    },
+  });
+  busy = true;
+  // Residual paste marker split across reads, and a lone trailing \x1b right
+  // after the consumed sequence — the exact conpty-leak shape.
+  tui.feed("\x1b[20~"); // truncated/misaligned paste-start marker
+  tui.feed("\x1b"); // trailing ESC flushed after the sequence
+  tui.feed("\x1b");
+  assert(cancelled === 0, "conpty residual \x1b bursts do not cancel a running turn");
+  // The residual bytes must not leak into the composer or submit a line:
+  // neither the malformed CSI text nor a stray Enter may reach onLine.
+  assert(lines.length === 0, "residual bytes never reach the composer/onLine");
+  // transcript must not contain the leaked paste marker either.
+  const transcript = tui.transcriptLines().join("\n");
+  assert(!transcript.includes("20~"), `residual [20~ never leaks into the transcript (got ${transcript})`);
+  // A real Esc-Esc AFTER the noise has settled still cancels.
+  await new Promise((r) => setTimeout(r, 200)); // let ESC_NOISE_MS pass
+  tui.feed("\x1b");
+  tui.feed("\x1b");
+  assert(cancelled === 1, "genuine double-Esc still cancels after conpty residual noise");
+  console.log("ok: conpty residual escapes are absorbed, not cancel-turn");
 }
 
 {

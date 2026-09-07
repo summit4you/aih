@@ -8,6 +8,52 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-07
+
+### Added
+- **CL-R#5 — hook 故障隔离**（`core/src/tool-registry.ts` + `core/src/seams/permissions.ts`）：
+  hook 抛普通 `Error` 视为基础设施故障——跳过该 hook、调用继续（不得当作否决），
+  有意为之的策略否决改走 `HookVetoError`，扩展的 `cancel` 语义升级为该异常类型。
+- **CL-R#7 — 凭据存储边界净化**（`cli/src/config.ts` `sanitizeCredential`）：
+  API key 等凭据写入配置前剥离控制字符/零宽空格/BOM/首尾空白，纯空白视为未配置。
+- **CC-R#6 — 技能可见性分层**（`cli/src/skills.ts`）：frontmatter `visibility:` 支持
+  `full`（默认）/ `name-only`（仅列名字）/ `off`（不进名册但仍可按名加载）。
+- **OMP-R#6 — edit 自动修复 + 受保护区**（`cli/src/general-tools.ts`）：
+  edit 失败时先做空白归一化匹配兜底，命中后标记 `protectedRanges` 保证替换区域精确。
+- **OMP-R#9 — prompt-cache 分桶统计**（`cli/src/index.ts`）：
+  `turn/end` 用量拆分为 cache read / cache write / uncached input，进入 TUI
+  Context 面板与 `/usage`；`P#41` prompt-cache 命中率。
+- **OMP-R#11 — 可逆 secret 占位符**（`cli/src/secrets-placeholder.ts`）：
+  模型回显已知 secret 时以 `{{secret:N}}` 占位（TUI 显示安全侧），工具执行前还原
+  真实值（功能侧），补足 `redactCredential` 单向遮蔽。
+- **KL-R#4 — 只读 shell 防御性否决（readOnlyBash）**（`core/src/seams/permissions.ts`）：
+  只读 bash 上下文检测重定向/管道/后台/`$()` 等写向模式并否决；受保护写工具
+  （shell + app write）在无显式规则时 floor 到 ask，显式 allow 须同时匹配路径与工具名。
+- **PI-R#2 — 分支蒸馏**（`cli/src/worktree.ts` `checkRestoreSafety` + `cli/src/index.ts`）：
+  checkpoint 恢复前检查回滚安全性（HEAD 前进/丢弃提交计数），被丢弃分支有实质会话
+  内容时自动快照并提示 `aih session distill-branch`。
+- **Doom-loop 升级观测器**（`core/src/observers.ts` `createDoomLoopEscalationObserver`）：
+  连续 doom-loop 否决达到阈值（默认 3）即中止本轮（`observer_aborted`），任何其他
+  结果重置计数——修复「同一调用被拒 86 次、零 assistant 文本、轮次永不停止」。
+- **FA#4 — 重复调用止损观测器接线**（`cli/src/index.ts`）：`RepetitionObserver`
+  软提示/硬停与 doom-loop 升级观测器接入交互轮与无头轮，提示以 TUI system 行呈现。
+- **AbortSignal 支持**（`cli/src/dev-tools.ts` `RunShellInput.signal` +
+  `core/src/types.ts` `ToolContext.signal`）：run_cmd 子进程支持外部取消，
+  abort 时立即 kill 子进程（为 background-hook 等场景铺路）。
+
+### Fixed
+- **Windows conpty 残留转义误触 double-Esc**（`cli/src/tui.ts`）：运行 PowerShell
+  子进程退出后 conpty 可能冲刷残留转义字节（截断的 bracketed-paste 标记、消耗过的
+  CSI 后的孤立 `\x1b`），此前被误读为用户 double-Esc → 运行中轮次被自动取消。
+  新增 `#lastSeqAt` + `ESC_NOISE_MS=150`：double-Esc 只在距上次已消费转义序列
+  ≥150ms 后生效，残留字节不再进入作曲器/转录。
+
+### 测试
+- `core/src/smoke.ts`：doom-loop 升级（阈值/重置/端到端轮次中止）、hook 故障隔离
+  （崩溃跳过 vs `HookVetoError` 否决）、before-hook ask floor（CC#53）。
+- `cli/src/smoke.ts`：conpty 残留转义（不取消轮次/不进作曲器/不泄漏 `[20~`、
+  真实 double-Esc 仍生效）。
+
 ## [0.7.2] - 2026-09-06
 
 ### Added

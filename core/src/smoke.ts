@@ -1411,6 +1411,63 @@ assert(
   console.log("ok: summary retry on finishReason=length stores the complete summary");
 }
 
+// Doom-loop escalation — the registry guard denies repeated identical calls,
+// but a degraded model can retry the SAME call forever (86 consecutive denials
+// observed, zero assistant text) — the turn never stopped. The observer must
+// abort after N consecutive denials and reset on any other result.
+{
+  const { createDoomLoopEscalationObserver } = await import("./observers.js");
+  const obs = createDoomLoopEscalationObserver({ maxConsecutive: 3 });
+  const doom = { callId: "c", name: "run_cmd", ok: false, error: "doom loop guard: identical call to run_cmd repeated 6 times — denied. Change approach or ask the user." };
+  let threw: unknown = null;
+  try { obs.onToolResult?.("t", doom); obs.onToolResult?.("t", doom); } catch (e) { threw = e; }
+  assert(threw === null, "doom-escalation: 2 consecutive denials (<3) do not stop the turn");
+  try { obs.onToolResult?.("t", doom); } catch (e) { threw = e; }
+  assert(threw instanceof LoopAbort && /runaway doom loop/.test(threw.message), "doom-escalation: 3rd consecutive denial → LoopAbort");
+  // reset path
+  const obs2 = createDoomLoopEscalationObserver();
+  try {
+    obs2.onToolResult?.("t", doom);
+    obs2.onToolResult?.("t", { callId: "x", name: "read_file", ok: true, result: "ok" });
+    obs2.onToolResult?.("t", doom);
+    obs2.onToolResult?.("t", doom);
+    threw = null;
+  } catch (e) { threw = e; }
+  assert(threw === null, "doom-escalation: a non-doom result resets the consecutive count");
+  console.log("ok: doom-loop escalation observer stops runaway denied-call spam");
+}
+
+// End-to-end: a model stuck repeating one identical call gets doom-loop
+// denials, and the escalation observer aborts the TURN (the live session ran
+// 86 denials with zero assistant text — nothing stopped the loop).
+{
+  const { AgentLoop: Loop } = await import("./agent-loop.js");
+  const { createDoomLoopEscalationObserver } = await import("./observers.js");
+  const dLog = new SessionLog();
+  const dGate = new PolicyGate([{ match: (r) => r.tool === "echo", action: "allow" }]);
+  const dTools = new ToolRegistry(dGate);
+  dTools.register(echo);
+  const repeatCall = () => [toolCall(`k${Date.now()}-${Math.random()}`, "echo", { text: "same" })];
+  const dScripted = new MockLLM(
+    Array.from({ length: 10 }, () => ({ text: "", toolCalls: repeatCall(), stopReason: "tool_use" })),
+  );
+  const dLoop = new Loop({
+    llm: { complete: (req) => dScripted.complete(req) },
+    tools: dTools,
+    log: dLog,
+    systemPrompt: "sys",
+    contextWindow: 5000,
+    compactAt: 0.8,
+    observers: [createDoomLoopEscalationObserver()],
+  });
+  const dRes = await dLoop.send("doomed task");
+  const denials = dLog.all().filter((e) => e.type === "tool/result" && String(e.error ?? "").includes("doom loop guard"));
+  assert(denials.length >= 3, `doom-e2e: doom-loop denials recorded (${denials.length})`);
+  assert(denials.length <= 4, `doom-e2e: the turn STOPPED after ~3 denials, not 86 (${denials.length})`);
+  assert(dRes.stopReason === "cancelled" || dRes.stopReason === "observer_aborted", `doom-e2e: turn aborted (stopReason=${dRes.stopReason})`);
+  assert(dLog.all().some((e) => e.type === "turn/end"), "doom-e2e: turn/end recorded");
+}
+
 // compactContext — an authoritative state snapshot (e.g. todo list) must be
 // folded into EVERY compaction summary prompt so a compacted agent cannot
 // forget what is done vs pending (the FB#5/#6 "re-did after compaction"

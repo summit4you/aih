@@ -377,21 +377,49 @@ export function registerGeneralTools(
       const oldString = String(a.old_string ?? "");
       if (!oldString) throw new Error("old_string is required");
       const { file, text } = readToolFile(cwd, a.path);
-      const count = text.split(oldString).length - 1;
+      // OMP-R#6 — auto-repair: try exact match first; on failure, retry with
+      // normalized whitespace (trim trailing spaces per line) as a fallback.
+      let count = text.split(oldString).length - 1;
+      let effectiveText = text;
+      let effectiveOld = oldString;
       if (count === 0) {
-        throw new Error(
-          `old_string not found in ${file}; read the file and retry with the exact text (whitespace included)`,
-        );
+        // Retry: normalize trailing whitespace in both the file content and old_string.
+        const normText = text.replace(/[ \t]+$/gm, "");
+        const normOld = oldString.replace(/[ \t]+$/gm, "");
+        count = normText.split(normOld).length - 1;
+        if (count > 0) {
+          effectiveText = normText; // use the normalized file content
+          effectiveOld = normOld; // and the normalized search string
+        } else {
+          throw new Error(
+            `old_string not found in ${file}; read the file and retry with the exact text (whitespace included)`,
+          );
+        }
       }
       if (count > 1 && !a.replace_all) {
         throw new Error(`old_string occurs ${count} times in ${file}; pass replace_all=true or a more specific old_string`);
       }
       const newString = String(a.new_string ?? "");
-      const updated = a.replace_all ? text.split(oldString).join(newString) : text.replace(oldString, newString);
+      const updated = a.replace_all
+        ? effectiveText.split(effectiveOld).join(newString)
+        : effectiveText.replace(effectiveOld, newString);
       publishFile(file, updated);
       // F#27: post-write auto-format (prettier/biome/eslint), never blocks.
       const fmt = await formatAfterWrite(file, cwd);
-      return { path: file, replacements: a.replace_all ? count : 1, _diff: lineDiff(oldString, newString), ...fmt };
+      // OCL-R#6 — protected ranges: when auto-repair normalized whitespace,
+      // the original old_string is the "protected range" (user's literal text).
+      // Report it so the parent knows which part was user-provided vs repaired.
+      const protectedRanges = effectiveOld !== oldString
+        ? [{ original: oldString, repaired: effectiveOld, reason: "trailing-whitespace normalization" }]
+        : undefined;
+      return {
+        path: file,
+        replacements: a.replace_all ? count : 1,
+        _diff: lineDiff(oldString, newString),
+        ...(effectiveOld !== oldString ? { autoRepaired: true } : {}),
+        ...(protectedRanges ? { protectedRanges } : {}),
+        ...fmt,
+      };
     },
   });
 
@@ -557,8 +585,10 @@ export function registerGeneralTools(
       properties: {
         action: {
           type: "string",
-          enum: ["append", "set"],
-          description: "append a dated entry, or set (replace) the whole memory",
+          enum: ["append", "set", "supersede"],
+          description:
+            "append a dated entry, set (replace) the whole memory, or supersede an existing entry " +
+            "(mark it as replaced by this new fact — OMP-R#12)",
         },
         text: { type: "string", description: "the memory content to store" },
         scope: {
@@ -566,11 +596,17 @@ export function registerGeneralTools(
           enum: ["project", "user"],
           description: "project (default, .aih/memory.md) or user (cross-project, XDG data dir)",
         },
+        supersedeMatch: {
+          type: "string",
+          description:
+            "OMP-R#12 — for action=supersede: a substring that identifies the OLD entry to mark as superseded. " +
+            "The old entry gets a `[superseded by <new-text>]` marker.",
+        },
       },
       required: ["action", "text"],
     },
     execute: async (args) => {
-      const a = args as { action?: unknown; text?: unknown; scope?: unknown };
+      const a = args as { action?: unknown; text?: unknown; scope?: unknown; supersedeMatch?: unknown };
       const action = String(a.action ?? "append");
       const text = String(a.text ?? "").trim();
       if (!text) throw new Error("remember requires non-empty text");
@@ -581,6 +617,28 @@ export function registerGeneralTools(
       mkdirSync(dirname(path), { recursive: true });
       if (action === "set") {
         writeFileSync(path, `${header}\n\n${text}\n`);
+      } else if (action === "supersede") {
+        // OMP-R#12 — mark an existing entry as superseded by this new fact.
+        const match = String(a.supersedeMatch ?? "").trim();
+        if (!match) throw new Error("remember action=supersede requires supersedeMatch (substring identifying the old entry)");
+        const stamp = new Date().toISOString().slice(0, 10);
+        const existing = existsSync(path) ? readFileSync(path, "utf8") : `${header}\n`;
+        // Find the line containing the match and append a superseded marker.
+        const lines = existing.split("\n");
+        let found = false;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes(match)) {
+            if (!lines[i].includes("[superseded")) {
+              lines[i] = lines[i].replace(/\s*$/, ` [superseded by ${stamp} entry]`);
+            }
+            found = true;
+            break;
+          }
+        }
+        if (!found) throw new Error(`remember supersede: no entry containing "${match}" found in ${path}`);
+        // Append the new entry after the superseded one.
+        lines.push("", `- ${stamp} — ${text}`);
+        writeFileSync(path, lines.join("\n") + "\n");
       } else {
         const stamp = new Date().toISOString().slice(0, 10);
         const existing = existsSync(path) ? readFileSync(path, "utf8") : `${header}\n`;
@@ -1075,7 +1133,8 @@ export function registerGeneralTools(
     name: "task",
     description:
       "Delegate a self-contained subtask to a focused subagent (own context, up to 8 steps, no nested tasks). " +
-      "Use for research or multi-step work you want isolated from the main conversation.",
+      "Use for research or multi-step work you want isolated from the main conversation. " +
+      "OMP-R#8 — delegation tier: prefer direct execution for simple tasks; delegate when isolation or parallelism helps.",
     kind: "read",
     permission: "allow",
     parameters: {
@@ -1083,13 +1142,23 @@ export function registerGeneralTools(
       properties: {
         description: { type: "string", description: "short (3-8 word) task label" },
         prompt: { type: "string", description: "full instructions for the subagent" },
+        readonly: {
+          type: "boolean",
+          description:
+            "KL-R#6 — explore mode: restrict the subagent to read-only tools (grep/glob/read/list/webfetch/websearch). " +
+            "Write tools (edit/write_file/apply_patch/run_cmd) are hidden. Use for research/exploration tasks.",
+        },
       },
       required: ["description", "prompt"],
     },
     execute: async (args) => {
-      const a = args as { description?: unknown; prompt?: unknown };
+      const a = args as { description?: unknown; prompt?: unknown; readonly?: unknown };
       const prompt = String(a.prompt ?? "");
       if (!prompt) throw new Error("task requires a prompt");
+      const readonly = Boolean(a.readonly);
+      // OCL-R#5 — canonical task_id: a stable identifier for this subagent invocation.
+      // Persisted in the result so the parent can reference it for audit/retry.
+      const taskId = `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       if (!opts.gate || !opts.llm || !opts.toolsProvider) {
         throw new Error("task subagent is not wired in this context (chat only)");
       }
@@ -1103,10 +1172,18 @@ export function registerGeneralTools(
       // parent's DENY rules propagate, ALLOW/ask do not; no human inside the
       // subagent, so writes resolve to deny and the subagent keeps exploring.
       const subRegistry = new Registry(makeSubagentGate(opts.gate));
+      // KL-R#6 — readonly explore mode: only read-only tools are available.
+      const READONLY_TOOLS = new Set([
+        "grep", "glob", "read_file", "list_dir", "list_symbols", "read_symbol",
+        "find_references", "webfetch", "websearch", "app_context", "app_describe",
+        "shell_context", "memory_recall", "archive_read",
+      ]);
       for (const schema of parent.schemas()) {
         // KL-R#3 — subagents must not delegate further (no task/best_of_n) nor
         // rewrite the parent's todo state (no todowrite): recursion guard.
         if (schema.name === "task" || schema.name === "question" || schema.name === "best_of_n" || schema.name === "todowrite") continue;
+        // KL-R#6 — readonly mode: filter to read-only tools only.
+        if (readonly && !READONLY_TOOLS.has(schema.name)) continue;
         const def = parent.get(schema.name);
         if (def) subRegistry.register(def);
       }
@@ -1148,6 +1225,7 @@ export function registerGeneralTools(
       // a degraded view, not the full finding.
       const schemaOverridden = capped.truncated;
       return {
+        taskId, // OCL-R#5 — canonical task identity for audit/retry
         description: String(a.description ?? ""),
         steps: result.steps,
         stopReason: result.stopReason,
@@ -1170,7 +1248,9 @@ export function registerGeneralTools(
       "(bounded concurrency, AIH_TOOL_CONCURRENCY). By default all N work on the same prompt; " +
       "pass `prompts` (an array of short strategy prompts) to run one subagent PER STRATEGY " +
       "(multi-strategy mode, wider exploration) — candidate i follows prompts[i % len]. " +
-      "Use for high-stakes answers where one shot is not enough.",
+      "Use for high-stakes answers where one shot is not enough. " +
+      "OMP-R#8 — delegation tier: gated models (free/limited) should use N=2-3 max; " +
+      "eager models can fan out to N=5+. Prefer task over best_of_n for routine work.",
     kind: "read",
     permission: "allow",
     parameters: {

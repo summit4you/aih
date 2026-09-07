@@ -96,6 +96,8 @@ export interface ToolContext {
    * never approve a pending action.
    */
   source?: "tty" | "injected";
+  /** AbortSignal for the current turn — tools should pass this to child processes. */
+  signal?: AbortSignal;
 }
 
 export interface ToolDefinition {

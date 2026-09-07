@@ -1,5 +1,5 @@
 import type { ApprovalGate } from "./seams/permissions.js";
-import { AskError } from "./seams/permissions.js";
+import { AskError, HookVetoError } from "./seams/permissions.js";
 import type {
   ToolContext,
   ToolDefinition,
@@ -209,11 +209,20 @@ export class ToolRegistry {
             permission: "denied",
           };
         }
-        return {
-          ok: false,
-          error: `hook vetoed ${name}: ${err instanceof Error ? err.message : String(err)}`,
-          permission: "denied",
-        };
+        // CL-R#5 — hook infrastructure failure (non-AskError throw): degrade
+        // gracefully, skip this hook, and continue with the tool call. A hook
+        // crash is NOT a veto — it's an infrastructure fault that must not
+        // break the agent loop. Intentional vetoes use HookVetoError (policy
+        // extensions) or AskError (the ask floor).
+        if (err instanceof HookVetoError) {
+          return {
+            ok: false,
+            error: `hook vetoed ${name}: ${err.message}`,
+            permission: "denied",
+          };
+        }
+        console.error(`[hook] before-hook for ${name} crashed (skipped): ${err instanceof Error ? err.message : String(err)}`);
+        continue;
       }
     }
 

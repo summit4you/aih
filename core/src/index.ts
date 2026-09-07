@@ -45,12 +45,14 @@ export {
   stableStringify,
   textSimilarity,
   RepetitionObserver,
+  createDoomLoopEscalationObserver,
 } from "./observers.js";
 export type {
   LoopObserver,
   ObserverToolCall,
   ObserverToolResult,
   RepetitionObserverOptions,
+  DoomLoopEscalationOptions,
 } from "./observers.js";
 export { ToolRegistry, REJECTION_SUFFIX } from "./tool-registry.js";
 export type {
@@ -104,6 +106,7 @@ export {
   DenyAll,
   PolicyGate,
   RulesetGate,
+  HookVetoError,
   GUARDED_WRITE_TOOLS,
   deriveScope,
   matchPattern,

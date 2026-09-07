@@ -41,6 +41,8 @@ import {
   describeFact,
   PARK_REASON,
   isUnrecoverableTurnError,
+  createDoomLoopEscalationObserver,
+  RepetitionObserver,
 } from "@aih/core";
 import type {
   ApprovalGate,
@@ -76,7 +78,7 @@ import {
 } from "./config.js";
 import { buildSafetyHooks, ESCALATE_EXIT_CODE } from "./safety.js";
 import type { SafetyHooks } from "./safety.js";
-import { projectTrustState, setProjectTrustState } from "./config.js";
+import { projectTrustState, setProjectTrustState, sanitizeCredential } from "./config.js";
 import { collectRulesSync, renderRules } from "./rules.js";
 import { migrateConfigFile, configMigrationTargets } from "./migrate.js";
 import { buildKeybindDispatch, loadKeybinds } from "./keybinds.js";
@@ -221,7 +223,7 @@ import {
   type Trace,
 } from "./measure.js";
 
-export const VERSION = "0.7.2";
+export const VERSION = "0.8.0";
 export const DEFAULT_SERVER_ENTRY = fileURLToPath(
   new URL("../../mcp-server/dist/index.js", import.meta.url),
 );
@@ -620,10 +622,14 @@ function buildRealLlm(flags: Record<string, string | boolean>) {
     envModel: process.env.AIH_MODEL,
     envBaseUrl: process.env.AIH_BASE_URL,
   });
-  const apiKey =
+  // CL-R#7 — sanitize credential at the storage boundary (strip control chars,
+  // zero-width spaces, BOM, leading/trailing whitespace). Pure whitespace → ""
+  // (treated as "not configured").
+  const apiKey = sanitizeCredential(
     str(flags, "api-key") ??
     process.env[resolved.apiKeyEnv] ??
-    process.env.AIH_API_KEY;
+    process.env.AIH_API_KEY,
+  );
   // Keyless is legitimate for: (a) providers carrying identity headers (opencode
   // Zen free tier authenticates by client fingerprint) — but ONLY when the
   // request actually goes to that provider's own endpoint, and (b) self-hosted
@@ -1025,6 +1031,9 @@ export function withSkillRoster(
   ctxWindow?: number,
 ): string {
   if (!skills.length) return prompt;
+  // CC-R#6 — filter by visibility tier: "off" skills are excluded from the roster.
+  const visible = skills.filter((s) => s.visibility !== "off");
+  if (!visible.length) return prompt;
   // Context budget for the initial roster (Codex rule): at most 2% of the
   // model's context window, or 8000 chars when the window is unknown.
   const budget = Math.max(
@@ -1032,15 +1041,18 @@ export function withSkillRoster(
     Math.floor((ctxWindow && ctxWindow > 0 ? ctxWindow * 0.02 : 8000)),
   );
   const header = `\n\n## Skills\n`;
-  let lines = skills.map(
-    (s) => `- ${s.name}: ${s.description} (call load_skill to activate)`,
-  );
+  // CC-R#6 — name-only skills show just the name (no description).
+  let lines = visible.map((s) => {
+    if (s.visibility === "name-only") return `- ${s.name} (call load_skill to activate)`;
+    return `- ${s.name}: ${s.description} (call load_skill to activate)`;
+  });
   let body = lines.join("\n");
   let omitted = false;
   if (header.length + body.length > budget) {
     // First shorten descriptions, front-loading the name so matching survives.
-    lines = skills.map((s) => {
-      const keep = Math.max(40, budget - header.length - skills.length * 40);
+    lines = visible.map((s) => {
+      if (s.visibility === "name-only") return `- ${s.name} (call load_skill to activate)`;
+      const keep = Math.max(40, budget - header.length - visible.length * 40);
       const d =
         s.description.length > keep
           ? `${s.description.slice(0, Math.max(0, keep - 1))}…`
@@ -1065,7 +1077,7 @@ export function withSkillRoster(
     body = kept.join("\n");
   }
   const warning = omitted
-    ? `\n(${skills.length - body.split("\n").length + 2} more skills hidden to stay within the roster context budget; use /skills to list all)`
+    ? `\n(${visible.length - body.split("\n").length + 2} more skills hidden to stay within the roster context budget; use /skills to list all)`
     : "";
   return `${prompt}${header}${body}${warning}`;
 }
@@ -1426,6 +1438,13 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
     }
     await probeWindow(flags);
     const safety = wireSafety(flags, { interactive: false });
+    // Repetition stop-loss (FA#4) + doom-loop escalation: the registry's
+    // doom-loop guard denies repeated identical calls, but a degraded
+    // long-context model can ignore the denials forever (86 consecutive
+    // "run_cmd failed" rows observed) — these observers turn the runaway
+    // into an actual turn stop.
+    const repObs = new RepetitionObserver();
+    repObs.bind({ inject: (t) => process.stderr.write(`[aih] ${t}\n`) });
     const loop = new AgentLoop({
       llm,
       tools: registry,
@@ -1438,6 +1457,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
       compactContext: () => compactTodoContext(log, process.cwd()),
+      observers: [createDoomLoopEscalationObserver(), repObs],
       ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       ...(bool(flags, "debug-prompt")
         ? {
@@ -1672,6 +1692,8 @@ async function cmdWorkflow(
       const llm = buildLlm(flags);
       await probeWindow(flags);
       const safety = wireSafety(flags, { interactive: false });
+      const repObs = new RepetitionObserver();
+      repObs.bind({ inject: (t) => process.stderr.write(`[aih] ${t}\n`) });
       const loop = new AgentLoop({
         llm,
         tools: registry,
@@ -1681,6 +1703,7 @@ async function cmdWorkflow(
         contextWindow: resolveContextWindow(flags),
         compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
         compactContext: () => compactTodoContext(log, process.cwd()),
+        observers: [createDoomLoopEscalationObserver(), repObs],
         ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
       // MEA — write-action Guardian reviewer for this workflow run (default-on).
@@ -1831,6 +1854,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     | (SafetyHooks & { costOf?: (u: import("@aih/core").TokenUsage) => number })
     | undefined;
   function makeLoop(): AgentLoop {
+    // Repetition stop-loss (FA#4) + doom-loop escalation (see the headless
+    // wiring for rationale). Hints surface as TUI system rows.
+    const repObs = new RepetitionObserver();
+    repObs.bind({
+      inject: (t) => {
+        if (tuiRef.current) tuiRef.current.pushSystem(t);
+        else process.stderr.write(`[aih] ${t}\n`);
+      },
+    });
     return new AgentLoop({
       llm: buildLlm(flags),
       tools: registry,
@@ -1844,6 +1876,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
       compactContext: () => compactTodoContext(log, process.cwd()),
+      observers: [createDoomLoopEscalationObserver(), repObs],
       ...(tuiSafety
         ? {
             budget: tuiSafety.budget,
@@ -3295,6 +3328,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           intentNote = `\nℹ checkpoint intent was "${rpIntent}" (no active goal now)`;
         }
       }
+      // PI-R#2 — auto-distill the discarded branch: if there were substantive
+      // conversation events between the checkpoint and the old HEAD, generate
+      // a branch summary so the context isn't lost (the user can reference it).
+      const discarded = log.all().slice(target.seq + 1);
+      const hasConversation = discarded.some((e) => e.type === "user/message" || e.type === "assistant/message");
+      if (hasConversation && snapshot) {
+        tui.pushSystem(
+          `ℹ ${discarded.length} event(s) in the discarded branch were snapshotted to ${snapshot}. ` +
+            `Use \`aih session distill-branch\` to create a summary of that branch for reference.`,
+        );
+      }
       tui.pushSystem(
         `restored to checkpoint #${target.seq}${target.note ? ` — ${target.note}` : ""}\n` +
           `context now rolls back to that point; the discarded suffix was snapshotted to ${snapshot || "(ephemeral — no session file)"} for audit` +
@@ -3464,9 +3508,23 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       } else if (total > 0) {
         lines.push("cost: — (no price table entry for the active model; set `prices` in aih.json)");
       }
-      // P#41: prompt-cache hit rate (only when the provider reports cache data)
+      // P#41 + OMP-R#9: prompt-cache hit rate + cache token bucket breakdown.
       const chr = cacheHitRate(log.all());
       if (chr !== undefined) lines.push(`cache hit rate: ${Math.round(chr * 100)}% of prompt tokens`);
+      // OMP-R#9 — cache token buckets: read vs write vs uncached input.
+      let cacheReadTokens = 0;
+      let cacheWriteTokens = 0;
+      for (const e of ends) {
+        const u = e.type === "turn/end" ? e.usage : undefined;
+        if (u) {
+          if (typeof u.cachedTokens === "number") cacheReadTokens += u.cachedTokens;
+          if (typeof u.cacheWriteTokens === "number") cacheWriteTokens += u.cacheWriteTokens;
+        }
+      }
+      if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
+        const uncached = Math.max(0, prompt - cacheReadTokens);
+        lines.push(`cache tokens: read ${cacheReadTokens.toLocaleString()} / write ${cacheWriteTokens.toLocaleString()} / uncached input ${uncached.toLocaleString()}`);
+      }
       // P#41: idle-gap TTL waste attribution (heuristic over observable facts)
       const ttlWaste = cacheTtlWaste(log.all());
       if (ttlWaste && ttlWaste.gaps > 0) {

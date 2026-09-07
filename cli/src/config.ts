@@ -645,6 +645,20 @@ function hostOf(url: string | undefined): string | undefined {
   }
 }
 
+/**
+ * CL-R#7 — sanitize a credential string at the storage boundary.
+ * Strips control characters, zero-width spaces, BOM, and leading/trailing
+ * whitespace. Pure whitespace → empty string (treated as "not configured").
+ */
+export function sanitizeCredential(value: string | undefined): string {
+  if (!value) return "";
+  // Remove BOM, zero-width chars, control chars (except \n\t which we strip via trim).
+  let out = value.replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
+  out = out.replace(/[\x00-\x1F\x7F]/g, ""); // control chars + DEL
+  out = out.trim(); // leading/trailing whitespace
+  return out;
+}
+
 export function credentialSafeHeaders(
   headers: Record<string, string>,
   homeBaseUrl: string | undefined,

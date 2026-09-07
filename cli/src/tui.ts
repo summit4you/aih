@@ -122,6 +122,13 @@ const OSC11_BG =
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // Show the spinner only after this much busy time (avoids a flash for fast ops).
 const SPINNER_DELAY_MS = 200;
+// A double-Esc arriving within this window after a consumed escape SEQUENCE
+// (mouse/scroll/paste/OSC) is treated as residual terminal noise (conpty
+// children flushing leftover bytes), not a user cancel gesture. Windows:
+// `run_cmd` PowerShell exit → terminal flushes residual ESC/<CSI> bytes →
+// they must never cancel a running turn. 150ms is far below human Esc-Esc
+// cadence yet covers same-read burst pairing.
+const ESC_NOISE_MS = 150;
 
 // Content of the read-only help dialog (? with empty input, /help, palette).
 // Kept short enough for the dialog width; each line is clipped anyway.
@@ -1140,6 +1147,16 @@ constructor(opts: TuiOptions) {
 
   #escAt = 0;
   #lastBareEscAt = 0;
+  /**
+   * Last time a real escape SEQUENCE (CSI/SS3/SGR/OSC/DCS — mouse, scroll,
+   * paste marker, title) was consumed by #escape. A double-Esc must not fire
+   * within a hair of one, because leftover escape bytes flushed by a conpty
+   * child (e.g. a PowerShell process that run_cmd spawned) look exactly like a
+   * user's Esc-Esc when they arrive back-to-back — but they are terminal
+   * noise, not a cancel gesture. Only a second \x1b arriving well after the
+   * sequence has settled counts as the user pressing Esc again.
+   */
+  #lastSeqAt = 0;
 
   #doubleEsc(): void {
     const wasBusy = this.#opts.busy();
@@ -1480,11 +1497,40 @@ constructor(opts: TuiOptions) {
         this.#escAt = 0;
         this.#lastBareEscAt = 0;
         this.#held = "";
-        this.#doubleEsc();
+        // Same conpty-noise hardening as below: two \x1b bytes landing right
+        // after a consumed escape sequence are residual terminal bytes (split
+        // CSI trailing ESC), not the user's Esc-Esc cancel. Require the last
+        // sequence to have settled before honouring the gesture.
+        if (now - this.#lastSeqAt >= ESC_NOISE_MS) {
+          this.#doubleEsc();
+        }
         return;
       }
       this.#escAt = now;
       this.#held = "\x1b";
+      // Confirm prompt: a LONE Esc means deny (the footer advertises Esc as
+      // the cancel affordance). e055216 routed all \x1b bytes through the
+      // escape machine (so SGR mouse bursts can't auto-deny), which orphaned
+      // the single-Esc case — nothing ever resolved it and the approval
+      // wedged forever (deterministic: "confirm Esc denies (got TIMEOUT)").
+      // Resolution: if no sequence-continuation byte has consumed the held
+      // Esc within a hair (60ms), it was a real Esc → deny. A mouse/scroll
+      // burst continues with '['/'O'/'<' within the same stdin read, so it
+      // never hits the timer; a second Esc clears #held first (double-Esc
+      // branch), also safe.
+      const confirm = this.#confirm;
+      if (confirm) {
+        const timer = setTimeout(() => {
+          if (this.#confirm === confirm && this.#held === "\x1b") {
+            this.#held = "";
+            this.#escAt = 0;
+            this.#lastBareEscAt = 0;
+            confirm("deny");
+          }
+        }, 60);
+        // A pending Esc-deny must never keep a headless process alive.
+        timer.unref?.();
+      }
       return;
     }
     if (this.#held === "\x1b") {
@@ -1510,7 +1556,15 @@ constructor(opts: TuiOptions) {
       const now = Date.now();
       if (this.#lastBareEscAt > 0 && now - this.#lastBareEscAt < 500) {
         this.#lastBareEscAt = 0;
-        this.#doubleEsc();
+        // Harden against conpty leftover-escapes: a second \x1b right after a
+        // consumed escape sequence (within ESC_NOISE_MS) is almost certainly
+        // residual terminal noise (the paste/CSI was split, and the trailing
+        // \x1b arrived separately), not the user pressing Esc again — ignore
+        // it instead of cancelling a running turn. Genuine double-Esc presses
+        // are spaced apart by human timing, so this never eats a real one.
+        if (now - this.#lastSeqAt >= ESC_NOISE_MS) {
+          this.#doubleEsc();
+        }
       } else {
         this.#lastBareEscAt = now;
       }
@@ -1532,6 +1586,16 @@ constructor(opts: TuiOptions) {
 
   #escape(seq: string): void {
     this.#held = "";
+    // Any real CSI/SS3/SGR sequence consumes the ESC deliberately — it is
+    // terminal noise (mouse/scroll/paste/OSC), NOT a bare-Esc keystroke.
+    // Reset the bare-Esc pair timer so a sequence burst (e.g. leftover
+    // escape bytes flushed by a conpty child process after run_cmd exits)
+    // can never pair with a neighboring bare \x1b into a double-Esc cancel.
+    // Observed bug (Windows): `run_cmd` → PowerShell exits → terminal flushes
+    // residual ESC/[20~ bytes → TUI misread them as double-Esc, auto-cancelled
+    // the running turn, and leaked "[20~" into the composer.
+    this.#lastBareEscAt = 0;
+    this.#lastSeqAt = Date.now();
     const kind = seq.slice(2);
     if (kind.startsWith("<")) {
       const m = /^<(\d+);(\d+);(\d+)([Mm])$/.exec(kind);

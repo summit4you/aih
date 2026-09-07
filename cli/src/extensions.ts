@@ -31,7 +31,7 @@ import type {
   ToolHooks,
 } from "@aih/core";
 import type { ToolRegistry } from "@aih/core";
-import { AskError } from "@aih/core";
+import { AskError, HookVetoError } from "@aih/core";
 
 export interface ExtensionContext {
   cwd: string;
@@ -202,9 +202,12 @@ export function createExtensionEventBridge(): ExtensionEventBridge & { hookSet()
                       throw new AskError(String(rec.ask === true ? "extension requires confirmation" : rec.ask));
                     }
                     if ("cancel" in rec) {
-                      // Cancel semantics ride the existing hook waterfall:
-                      // throwing vetoes the call (ToolRegistry before-hook contract).
-                      throw new Error(String(rec.cancel ?? "cancelled by extension"));
+                      // CL-R#5 — an intentional policy veto must ride
+                      // HookVetoError: the registry now skips generic hook
+                      // crashes (infrastructure faults), so a plain Error
+                      // would silently STOP blocking — extensions could never
+                      // deny again. HookVetoError is honored as a veto.
+                      throw new HookVetoError(String(rec.cancel ?? "cancelled by extension"));
                     }
                   }
                 }

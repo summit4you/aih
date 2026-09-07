@@ -12,6 +12,9 @@ import { rank } from "./bm25.js";
 import { loadSkillRegistry } from "./config.js";
 import { userAihDirs } from "./paths.js";
 
+/** CC-R#6 — skill visibility tier: controls how the skill appears in the roster. */
+export type SkillVisibility = "full" | "name-only" | "off";
+
 export interface Skill {
   name: string;
   description: string;
@@ -25,6 +28,13 @@ export interface Skill {
    * match is treated as the secret.
    */
   secretPatterns?: string[];
+  /**
+   * CC-R#6 — visibility tier (from frontmatter `visibility:` field):
+   * - "full" (default): name + description in roster
+   * - "name-only": only the skill name appears (description hidden)
+   * - "off": skill is not listed in the roster at all (still loadable by name)
+   */
+  visibility?: SkillVisibility;
 }
 
 /**
@@ -76,6 +86,7 @@ export function parseSkillMd(
   description: string;
   body: string;
   secretPatterns?: string[];
+  visibility?: SkillVisibility;
 } {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
   if (!m) return { name: fallbackName, description: "", body: raw.trim() };
@@ -92,11 +103,18 @@ export function parseSkillMd(
         .map((s) => s.trim())
         .filter(Boolean)
     : undefined;
+  // CC-R#6 — visibility tier from frontmatter.
+  const visRaw = (meta.visibility || "").toLowerCase();
+  const visibility: SkillVisibility | undefined =
+    visRaw === "off" ? "off" :
+    visRaw === "name-only" ? "name-only" :
+    visRaw === "full" ? "full" : undefined;
   return {
     name: meta.name || fallbackName,
     description: meta.description || "",
     body: m[2].trim(),
     ...(secretPatterns && secretPatterns.length ? { secretPatterns } : {}),
+    ...(visibility ? { visibility } : {}),
   };
 }
 

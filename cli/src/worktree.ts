@@ -67,6 +67,38 @@ export function gitStatusSummary(opts?: {
   };
 }
 
+/**
+ * CL-R#2 — checkpoint restore safety check.
+ *
+ * Before restoring a checkpoint's worktree state, verify that HEAD has not
+ * moved past the checkpoint (i.e., no new commits were made after the
+ * checkpoint was taken). If HEAD has advanced, report how many commits would
+ * be discarded so the user can make an informed decision.
+ *
+ * Returns:
+ *   - `ok: true` — safe to restore (HEAD matches or is behind checkpoint)
+ *   - `ok: false, reason: "head-advanced", discardedCommits: N` — HEAD has
+ *     moved past the checkpoint; restoring would discard N commits
+ */
+export function checkRestoreSafety(
+  cwd: string,
+  checkpointHead: string | null,
+): { ok: boolean; reason?: string; discardedCommits?: number } {
+  if (!checkpointHead) return { ok: true }; // no HEAD recorded — can't compare, allow
+  const current = git(cwd, ["rev-parse", "HEAD"]);
+  if (!current.ok) return { ok: true }; // not a repo or git failed — allow (non-git restore)
+  const currentSha = current.out.trim();
+  if (currentSha === checkpointHead) return { ok: true }; // exact match — safe
+
+  // Count commits between checkpoint and HEAD (how many would be discarded).
+  const countRes = git(cwd, ["rev-list", "--count", `${checkpointHead}..HEAD`]);
+  if (!countRes.ok) return { ok: true }; // can't determine — allow with warning
+  const discarded = parseInt(countRes.out.trim(), 10) || 0;
+  if (discarded === 0) return { ok: true }; // HEAD is behind or equal — safe
+
+  return { ok: false, reason: "head-advanced", discardedCommits: discarded };
+}
+
 /** Human-readable lines for TUI/CLI display ("worktree: …" block). */
 export function formatWorktreeSummary(w: WorktreeSummary): string[] {
   const where = [w.branch ?? "(detached)", w.head ? `@ ${w.head}` : null]

@@ -224,6 +224,8 @@ export interface RunShellInput {
   sandbox?: string;
   keep_output?: boolean;
   output_path?: string;
+  /** AbortSignal — when aborted, the child process is killed immediately. */
+  signal?: AbortSignal;
 }
 
 /** Structured result of a shell execution (mirrors the run_cmd tool output). */
