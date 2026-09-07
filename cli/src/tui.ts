@@ -702,12 +702,24 @@ constructor(opts: TuiOptions) {
     this.#paintTimer = null;
     this.#paintScheduled = false;
     process.stdin.setRawMode(false);
+    // Clear the TUI's screen before leaving: on alt-screen terminals ?1049l
+    // restores the pre-session main screen, but on terminals WITHOUT alt
+    // screen (legacy conhost — which never gets ?1049h because of its resize
+    // bug — and minimal terminals/tmux configs whose ?1049 save/restore is
+    // a raw buffer switch that preserves nothing), the transcript was painted
+    // straight onto the main screen and STAYED there after exit: the user saw
+    // the whole conversation above the freshly shown shell prompt. ESC[2J
+    // clears whatever screen we are on at this moment — a no-op visually on
+    // alt-screen terminals (the main screen is about to replace it) and the
+    // clear fix for everything else. NOTE: order matters — clear FIRST, then
+    // leave the alt screen, then show the cursor.
+    const clear = `${CSI}H${CSI}2J`;
     // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen,
     // no ?1007 — conhost doesn't understand it). All other terminals get the
     // full teardown including ?1007l (alternate scroll off).
     const restore = this.#legacyWin
-      ? `${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
-      : `${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`;
+      ? `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
+      : `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`;
     process.stdout.write(restore);
   }
 
@@ -753,7 +765,9 @@ constructor(opts: TuiOptions) {
 
   #restore = (): void => {
     // ?1007l is sent on every non-legacy terminal (it was enabled in start()).
-    process.stdout.write(`${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`);
+    // Same clear-then-restore order as stop(): ESC[2J wipes the screen the TUI
+    // painted on (alt or main), then the alt-screen leave restores the shell.
+    process.stdout.write(`${CSI}H${CSI}2J${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`);
   };
 
   /** Begin a bulk insert (session replay): suppress per-item follow/paint. */
