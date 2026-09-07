@@ -3741,6 +3741,30 @@ await srv.connect(new StdioServerTransport());
   const ff3 = tui3.panelFooterForTest(42).map(strip);
   assert(ff3.at(-1) === "• aih v0.8.0" && ff3.at(-2) === "/app/agents/aih",
     `footer renders with limit=0 (mock): path+version both present (got ${JSON.stringify(ff3.slice(-2))})`);
+  // Regression guard: the painted frame must be EXACTLY the terminal height.
+  // A stray fixed row (a refactor leftover duplicated the pad-above blank)
+  // pushed the frame to rows+1, so the final write scrolled the terminal and
+  // the path row of the sidebar footer was lost — only the version row
+  // survived. Drive a real paint and assert the frame height equals #rows.
+  const tui4 = new Tui({
+    placeholder: ">", meta: () => ({ agent: "build", model: "mock", provider: "mock" }), cwd: "/app/agents/aih",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    ctxUsage: () => ({ used: 1, limit: 131072 }), version: "0.8.0",
+  });
+  const H = 30, W = 140;
+  Object.defineProperty(process.stdout, "rows", { value: H, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: W, configurable: true });
+  (process.stdin as any).isTTY = true;
+  (process.stdin as any).setRawMode = () => {};
+  (process.stdin as any).resume = () => {};
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as any;
+  tui4.start();
+  await new Promise((r) => setTimeout(r, 30));
+  const fh = tui4.frameForTest().length;
+  tui4.stop();
+  process.stdout.write = origWrite;
+  assert(fh === H, `painted frame height == terminal rows (got ${fh}, terminal ${H}); frame overflow scrolls and drops the footer path row`);
 }
 
 {

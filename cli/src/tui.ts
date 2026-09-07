@@ -2869,10 +2869,13 @@ constructor(opts: TuiOptions) {
       }
     }
 
-    rows.push(row(""));
     // C — input box breathing room: one blank line above AND below (opencode
-    // pads its prompt box top/bottom by 1). The `-8` in #viewHeight already
-    // accounts for both pad rows.
+    // pads its prompt box top/bottom by 1). #viewHeight (rows - 6 - k) accounts
+    // for exactly these fixed rows: pad-above(1) + box-top(1) + k input +
+    // box-bottom(1) + pad-below(1) + hints(1) + status(1) = 6 + k. A second
+    // stray pad row here (a refactor leftover) pushed the frame to rows+1, so
+    // the final write scrolled the terminal and the path row of the sidebar
+    // footer was lost — only the version row survived.
     rows.push(row(""));
     rows.push(row(this.#boxLine("", leftW)));
     let cursorIdx = -1;
