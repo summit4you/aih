@@ -526,6 +526,11 @@ export class Tui {
   #running = false;
   #frame = 0;
   #busySince = 0;
+  #arrowTimes: number[] = [];
+  #sgrWheelSeen = false;
+  #mouseHintShown = false;
+  #swallowArrows = false;
+  #burstSnapshot: { edit: string; cursor: number; hist: number } | null = null;
   #timer: ReturnType<typeof setInterval> | null = null;
   #paintScheduled = false;
   #paintTimer: ReturnType<typeof setTimeout> | null = null;
@@ -714,6 +719,17 @@ constructor(opts: TuiOptions) {
       this.#paintTimer = null;
       this.#paint();
     }, 16);
+  }
+
+  /** Test/embedding hook: run one paint synchronously (start() not required). */
+  paintNow(): void {
+    const was = this.#running;
+    this.#running = true;
+    try {
+      this.#paint();
+    } finally {
+      this.#running = was;
+    }
   }
 
   #tick = (): void => {
@@ -1629,9 +1645,13 @@ constructor(opts: TuiOptions) {
       if (m) {
         const button = Number(m[1]);
         const row = Number(m[3]);
-        if (button === 64 || button === 4) this.#scrollBy(-3);
-        else if (button === 65 || button === 5) this.#scrollBy(3);
-        else if (m[4] === "M" && button === 0) this.#clickAt(row);
+        if (button === 64 || button === 4) {
+          this.#sgrWheelSeen = true;
+          this.#scrollBy(-3);
+        } else if (button === 65 || button === 5) {
+          this.#sgrWheelSeen = true;
+          this.#scrollBy(3);
+        } else if (m[4] === "M" && button === 0) this.#clickAt(row);
       }
       return;
     }
@@ -1643,18 +1663,10 @@ constructor(opts: TuiOptions) {
         this.#inPaste = false;
         break;
       case "A":
-        if (this.#history.length) {
-          if (this.#histCursor < 0) this.#histCursor = this.#history.length - 1;
-          else this.#histCursor = Math.max(0, this.#histCursor - 1);
-          this.#chooseHistory();
-        }
+        this.#arrowKey(-1);
         break;
       case "B":
-        if (this.#histCursor >= 0) {
-          this.#histCursor += 1;
-          if (this.#histCursor >= this.#history.length) this.#histCursor = -1;
-          this.#chooseHistory();
-        }
+        this.#arrowKey(1);
         break;
       case "C":
         this.#cursor = Math.min(this.#edit.length, this.#cursor + 1);
@@ -1722,6 +1734,69 @@ constructor(opts: TuiOptions) {
     this.#edit = value;
     this.#cursor = value.length;
     this.requestPaint();
+  }
+
+  /**
+   * ↑/↓ arrow: composer input-history recall — UNLESS the keys arrive as a
+   * rapid burst, which is the signature of a mouse WHEEL delivered as arrows
+   * because mouse tracking was silently cleared mid-session (terminal quirk,
+   * multiplexer reset; the modes we set in start() only die this way). The
+   * user scrolled the transcript and got input-history recall instead —
+   * exactly the reported "scroll breaks and starts editing the input line"
+   * bug. Fix: re-assert the tracking modes (?1000/?1006/?1007) and undo the
+   * burst — restore the composer to its pre-burst text (the first arrows of
+   * the flick already recalled history over whatever the user had typed) so
+   * the flick leaves the composer untouched. If the terminal honours the
+   * re-assert, wheel events arrive as SGR again (#sgrWheelSeen re-arms for
+   * the next loss). If it never sends SGR at all, only this first burst is
+   * swallowed — later bursts pass through as normal arrow recall.
+   */
+  #arrowKey(dir: -1 | 1): void {
+    const now = Date.now();
+    this.#arrowTimes.push(now);
+    this.#arrowTimes = this.#arrowTimes.filter((t) => now - t <= 900);
+    if (this.#arrowTimes.length === 1) {
+      // Fresh burst window: the previous flick is over — pass arrows through
+      // again and snapshot the composer so a burst inside THIS window can be
+      // undone completely.
+      this.#swallowArrows = false;
+      this.#burstSnapshot = { edit: this.#edit, cursor: this.#cursor, hist: this.#histCursor };
+    }
+    if (!this.#legacyWin && this.#sgrWheelSeen && this.#arrowTimes.length >= 3) {
+      if (this.#burstSnapshot) {
+        this.#edit = this.#burstSnapshot.edit;
+        this.#cursor = this.#burstSnapshot.cursor;
+        this.#histCursor = this.#burstSnapshot.hist;
+      }
+      // Keep #arrowTimes — clearing it would re-open the window instantly and
+      // let the rest of this same flick through. The window expires on its
+      // own (900ms), ending the swallow.
+      this.#sgrWheelSeen = false;
+      this.#swallowArrows = true; // swallow the rest of this flick
+      if (this.#running || process.stdout.isTTY) {
+        process.stdout.write(`${CSI}?1000h${CSI}?1006h${CSI}?1007h`);
+      }
+      if (!this.#mouseHintShown) {
+        this.#mouseHintShown = true;
+        this.pushSystem(
+          "mouse tracking was lost (wheel arrived as arrow keys) — re-enabled; scroll the transcript again",
+        );
+      }
+      this.requestPaint();
+      return;
+    }
+    if (this.#swallowArrows) return; // rest of the burst: not a real ↑/↓
+    if (dir === -1) {
+      if (this.#history.length) {
+        if (this.#histCursor < 0) this.#histCursor = this.#history.length - 1;
+        else this.#histCursor = Math.max(0, this.#histCursor - 1);
+        this.#chooseHistory();
+      }
+    } else if (this.#histCursor >= 0) {
+      this.#histCursor += 1;
+      if (this.#histCursor >= this.#history.length) this.#histCursor = -1;
+      this.#chooseHistory();
+    }
   }
 
   #scrollBy(delta: number): void {
@@ -2690,6 +2765,51 @@ constructor(opts: TuiOptions) {
     return this.#clip(`${l}${" ".repeat(Math.min(pad, 200))}${r}`, width);
   }
 
+  /**
+   * Last-line-of-defense paint guard (render-desync fix): every row written to
+   * the terminal must be EXACTLY ≤ #cols display cells and contain no cursor
+   * control characters. A row that slips past its component's clip — an
+   * embedded `\n`/`\r` from tool output, an ANSI-styled string whose visible
+   * width was miscounted (CJK/emoji) — makes the terminal auto-wrap or scroll
+   * mid-frame. Every subsequent row-addressed diff then draws against a
+   * shifted screen: history lines smear over the input box and status bar and
+   * ONLY a window resize (#clearNext full repaint) fixes it. Strip control
+   * chars, hard-cap the display width, keep SGR styling intact, then pad back
+   * to the cell's target width (a sanitized row must still overwrite its old
+   * tail — the diff painter relies on full-width rows).
+   */
+  #paintGuard(line: string, padTo: number): string {
+    // Drop C0 controls that move the cursor or ring bells; keep \x1b (SGR
+    // styling below relies on it) — non-SGR escapes are stripped with the
+    // width walk, since only `ESC[...m` sequences are recognized there.
+    const clean = line.replace(/[\r\n\x07\x08\x09\x0b\x0c]/g, " ");
+    let out = "";
+    let n = 0;
+    let i = 0;
+    while (i < clean.length && n < padTo) {
+      if (clean[i] === "\x1b") {
+        const m = /^\x1b\[[0-9;?]*[A-Za-z]/.exec(clean.slice(i));
+        if (m) {
+          // SGR (…m) is styling — zero width, pass through. Anything else
+          // (cursor moves, mode sets) inside a content row is poison — drop it.
+          if (m[0].endsWith("m")) out += m[0];
+          i += m[0].length;
+          continue;
+        }
+        i += 1; // lone ESC — drop
+        continue;
+      }
+      const cp = clean.codePointAt(i)!;
+      const ch = String.fromCodePoint(cp);
+      const w = width(ch);
+      if (n + w > padTo) break;
+      out += ch;
+      n += w;
+      i += ch.length;
+    }
+    return out + " ".repeat(Math.max(0, padTo - n));
+  }
+
   #clip(line: string, limit: number): string {
     let out = "";
     let n = 0;
@@ -2933,6 +3053,23 @@ constructor(opts: TuiOptions) {
       }
     }
 
+    // Paint guard (render-desync fix): sanitize every cell BEFORE both the
+    // diff bookkeeping and the terminal write — an embedded \n or a miscounted
+    // wide-char row must never reach the screen (auto-wrap there shifts the
+    // whole frame and only a resize fixes the smear). Pad back to the cell's
+    // original width so a sanitized row still overwrites its old tail.
+    // Frame-height invariant: writing MORE lines than the terminal has rows
+    // scrolls the buffer and permanently desyncs the row-addressed diff (tiny
+    // terminals where view is floored at 1: rows.length = 7+k > #rows). Drop
+    // the surplus and force a full repaint so the screen stays consistent.
+    if (rows.length > this.#rows) {
+      rows.length = this.#rows;
+      this.#clearNext = true;
+    }
+    for (const r of rows) {
+      r.left = this.#paintGuard(r.left, leftW);
+      if (r.right !== undefined) r.right = this.#paintGuard(r.right, pw);
+    }
     const lines = rows.map((r) => r.left + (r.right ?? ""));
     // Row-level diff against the previous frame (pi-style): rewrite only rows
     // whose string changed, erase surplus rows when the frame got shorter
@@ -2963,8 +3100,16 @@ constructor(opts: TuiOptions) {
     const panelCol = width - pw + 1;
     for (let i = 0; i < rows.length; i += 1) {
       if (!this.#clearNext && this.#lastLines[i] === lines[i]) continue;
-      out += `${CSI}${i + 1};1H${rows[i].left}`;
-      if (rows[i].right) out += `${CSI}${i + 1};${panelCol}H${rows[i].right}`;
+      // Close ANY SGR state left open by the previously written row before
+      // starting this one. The diff painter skips unchanged rows, but the
+      // terminal's SGR state does NOT skip with them: a background opened by
+      // the last written row (user-row surface, sidebar panelSeg) bleeds onto
+      // the NEXT row that is written — the reported regression where tool
+      // output rows and the "esc escape twice" hint row acquired a background
+      // they never declare. Every row is self-contained (its own SGR + RESET),
+      // so resetting at row boundaries is always correct and never visible.
+      out += `${CSI}${i + 1};1H${RESET}${rows[i].left}`;
+      if (rows[i].right) out += `${CSI}${i + 1};${panelCol}H${RESET}${rows[i].right}`;
     }
     if (!this.#clearNext) {
       for (let i = rows.length; i < prevLen; i += 1) {

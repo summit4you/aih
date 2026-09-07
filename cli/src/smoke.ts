@@ -4338,6 +4338,116 @@ await srv.connect(new StdioServerTransport());
   assert(tui.transcriptLines().some((l) => l.includes("APPENDED")), "pushDelta after cache invalidates and re-renders");
 }
 
+// --- Wheel delivered as arrow keys (mouse tracking silently lost) ------------
+{
+  // When ?1000/?1006 get cleared mid-session, the terminal translates the
+  // wheel into ↑/↓ arrows — which aih read as composer input-history recall
+  // ("scroll stops working and starts editing the input line"). A rapid burst
+  // of ≥4 arrows within 900ms must re-assert the tracking modes and swallow
+  // that burst instead of mangling the composer; a later lone arrow still
+  // recalls history normally (terminals that never send SGR keep working).
+  const { Tui } = await import("./tui.js");
+  const submitted: string[] = [];
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: (l: string) => submitted.push(l),
+  });
+  tui.seedHistory(["old-1", "old-2"]);
+  tui.feed("keep-me");
+  tui.feed("\x1b[<64;1;1M"); // one real SGR wheel event arms the detector
+  for (let i = 0; i < 5; i += 1) tui.feed("\x1b[A"); // wheel-as-arrows burst
+  tui.feed("\r");
+  assert(
+    submitted[0] === "keep-me",
+    `arrow burst (wheel fallback) restores the pre-burst composer, no history junk (got ${JSON.stringify(submitted)})`,
+  );
+  // Re-seed (the submit above put "keep-me" into history) and confirm a lone
+  // arrow after the burst window expires still recalls history normally.
+  await new Promise((r) => setTimeout(r, 1000)); // burst window (900ms) expires
+  tui.seedHistory(["old-1", "old-2"]);
+  tui.feed("\x1b[A"); // lone arrow — normal recall
+  tui.feed("\r");
+  assert(
+    submitted[1] === "old-2",
+    `lone arrow after the burst recalls history normally (got ${JSON.stringify(submitted)})`,
+  );
+  const sysText = tui.transcriptLines().map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+  assert(sysText.includes("mouse tracking"), "restored-tracking hint surfaced once");
+}
+
+// --- Paint guard: rows never move the cursor or exceed the terminal ----------
+{
+  // A row that reaches the terminal wider than #cols or carrying \n/\r makes
+  // the terminal auto-wrap/scroll mid-frame; the row-addressed diff painter
+  // then draws against a shifted screen (history smears over the input box
+  // and status bar; only a window resize fixed it). #paintGuard strips the
+  // controls and hard-caps every cell at write time.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+    width: 40,
+  });
+  const long = "你".repeat(60) + "emoji🎉🎉🎉 tail";
+  tui.push({ role: "user", text: `bad\nchars\rand\u0007bell\ttab ${long}` });
+  const captured: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  (process.stdout as { write: unknown }).write = ((s: string | Uint8Array) => {
+    captured.push(String(s));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    tui.paintNow();
+  } finally {
+    process.stdout.write = realWrite as typeof process.stdout.write;
+  }
+  const frame = captured.join("");
+  assert(
+    !/[\n\r\x07\x08\x0b\x0c]/.test(frame),
+    "painted frame carries no cursor-moving control characters",
+  );
+  assert(
+    frame.includes("chars and bell") || frame.includes("chars"),
+    "sanitized text still rendered (not dropped wholesale)",
+  );
+  // SGR-state isolation (regression: tool-output rows + the "esc escape twice"
+  // hint row inherited a background left open by the previous written row,
+  // because the diff painter skips unchanged rows while the terminal's SGR
+  // state does not skip with them). Every row the painter writes must be
+  // preceded by a full SGR reset at its cursor-home, so a surface row
+  // (user-row / input box / sidebar) can never bleed its background onto a
+  // following plain row.
+  const rowHome = /\x1b\[(\d+);1H/g;
+  const homes: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = rowHome.exec(frame)) !== null) homes.push(m[0]);
+  assert(homes.length > 0, "diff painter writes row-addressed homes");
+  const allHomesReset = homes.every((h) => frame.indexOf(h + "\x1b[0m") !== -1);
+  assert(allHomesReset, "every painted row home is followed by an SGR reset (no bg bleed across rows)");
+}
+
+// --- opencode Go session header (x-opencode-session) --------------------------
+{
+  // Go rejects header-less requests with HTTP 400 MissingSessionID; the
+  // catalog must carry the "{sid}" header for both opencode endpoints.
+  const { connectCatalog } = await import("./provider-catalog.js");
+  const oc = connectCatalog().filter((p) => p.id === "opencode" || p.id === "opencode-go");
+  assert(
+    oc.length === 2 && oc.every((p) => p.headers?.["x-opencode-session"] === "{sid}"),
+    "opencode catalog entries send x-opencode-session ({sid})",
+  );
+}
+
 // --- A: keyboard expand/collapse (Enter/o on empty composer) ------------------
 {
   const { Tui } = await import("./tui.js");
