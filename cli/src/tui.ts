@@ -2151,6 +2151,12 @@ constructor(opts: TuiOptions) {
     return this.#panelFooter(pw);
   }
 
+  /** Test hook: the last painted frame, ANSI-stripped (authoritative render). */
+  frameForTest(): string[] {
+    const strip = (s: string): string => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b[()][0-9A-Z]/g, "");
+    return this.#lastLines.map(strip);
+  }
+
   /** Test hook — mirrors #inputLayout so smoke can assert the opencode/mimo-code
    *  6-line composer cap (TEXTAREA_MAX_ROWS=6) without a live PTY. Returns the
    *  windowed lines + cursor cell for the current #edit/#cursor state. */
@@ -2603,11 +2609,11 @@ constructor(opts: TuiOptions) {
     // Scroll-back indicator (used to ride the now-removed dashed separator
     // row): shown on the hints row when scrolled up from the bottom.
     const tag = this.#scrollTop > 0 ? `  ↑${this.#scrollTop}` : "";
-    // opencode-parity second row: lead with the aih version on the left
-    // (opencode's home footer shows the app version; we fold it into the
-    // second footer row above the status line).
-    const ver = this.#opts.version ? cyan(`aih v${this.#opts.version}`) : "";
-    const left = dim(`${ver ? `${ver}   ` : ""}${this.#opts.cwd}   ${hint}${tag}`);
+    // The aih version + cwd path used to lead this row, but they now live in the
+    // sidebar footer (bottom-aligned, opencode/mimo-code parity) — keeping them
+    // here too would duplicate. This row is now purely the actionable hint +
+    // scroll-back tag.
+    const left = dim(`${hint}${tag}`);
     if (!usage) return this.#clip(left, width);
     const right = usage;
     const pad = Math.max(1, width - cols(left) - cols(right) - 1);
@@ -2791,19 +2797,14 @@ constructor(opts: TuiOptions) {
     const footer = pw ? this.#panelFooter(pw) : null;
     const leftW = panel ? Math.max(20, width - pw - Tui.PANEL_GAP) : width;
     let rowIdx = 0;
-    const row = (content: string, i?: number): { left: string; right?: string } => {
-      const idx = i ?? -1;
+    const row = (content: string): { left: string; right?: string } => {
       const left = this.#clip(content, leftW);
       if (!panel) return { left };
-      // bottom `footer.length` BODY rows carry the pinned footer. Rows outside
-      // the body window (input box / hints / status, i=-1) get a blank panel
-      // cell so the right column stays visually continuous without leaking the
-      // CONTEXT/TODO lines into the input area.
-      if (footer && idx >= 0 && idx >= view - footer.length) {
-        const fi = idx - (view - footer.length);
-        return { left, right: this.#panelSeg(footer[fi] ?? "", pw) };
-      }
-      if (idx < 0) return { left, right: this.#panelSeg("", pw) };
+      // Body rows top-pair with the CONTEXT/TODO lines; rows outside the body
+      // window (input box / hints / status) get a blank panel cell. The footer
+      // is anchored separately to the BOTTOM of the frame (see below) so it
+      // sits level with the status line, not floating in the body area.
+      if (rowIdx >= (panel?.length ?? 0)) return { left, right: this.#panelSeg("", pw) };
       return { left, right: this.#panelSeg(panel[rowIdx++] ?? "", pw) };
     };
 
@@ -2813,7 +2814,7 @@ constructor(opts: TuiOptions) {
       // the first arg of row() trips a TS5.9 private-call + trailing-arg parse
       // quirk (TS2554 "expected 2 got 1") even though it is type-correct.
       const clipped = this.#clip(body[this.#scrollTop + i] ?? "", leftW);
-      rows.push(row(clipped, i));
+      rows.push(row(clipped));
     }
 
     if (this.#overlay) {
@@ -2883,6 +2884,21 @@ constructor(opts: TuiOptions) {
     // #statusRow), dropping the box row AND the dashed separator row.
     rows.push(row(this.#hintsRow(leftW)));
     rows.push(row(this.#statusRow(leftW)));
+
+    // opencode/mimo-code parity: the sidebar footer (cwd path + "• aih vX") is
+    // pinned to the BOTTOM of the side column — level with the hints/status
+    // lines, not floating up in the body area. We overwrite the right cell of
+    // the last `footer.length` rows with it. This is what makes it "bottom-
+    // aligned" as the user requested: it now sits at the very bottom of the
+    // sidebar, matching both repos' sidebar_footer which renders at the panel's
+    // lowest row.
+    if (footer) {
+      const start = Math.max(0, rows.length - footer.length);
+      for (let fi = 0; fi < footer.length; fi += 1) {
+        const r = rows[start + fi];
+        if (r) r.right = this.#panelSeg(footer[fi] ?? "", pw);
+      }
+    }
 
     const lines = rows.map((r) => r.left + (r.right ?? ""));
     // Row-level diff against the previous frame (pi-style): rewrite only rows
