@@ -2269,7 +2269,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     keybindWarnings: kbWarnings,
     meta: () => ({ agent: agentMode, model: modelLabel, provider: providerLabel }),
     cwd: process.cwd(),
-    statusLeft: `${appName} · aih ${VERSION}`,
+    // opencode-parity footer: version lives on the second (hints) row's
+    // left side; keep statusLeft as the bare app name so it is not duplicated.
+    version: VERSION,
+    statusLeft: appName,
     statusRight: `S:${initialTitle ?? sessionName}`,
     statusBadge: () => {
       const n = registry.schemas().length;

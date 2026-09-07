@@ -33,6 +33,8 @@ export interface TuiItem {
 export interface TuiOptions {
   placeholder: string;
   meta(): { agent: string; model: string; provider: string };
+  /** opencode-parity footer: aih version shown at the left of the second row. */
+  version?: string;
   cwd: string;
   statusLeft: string;
   statusRight: string;
@@ -2500,8 +2502,14 @@ constructor(opts: TuiOptions) {
 
   #metaContent(): string {
     const m = this.#opts.meta();
-    const agent = m.agent === "plan" ? warn(bold(m.agent)) : accent(bold(m.agent));
-    return `${agent}${muted(" · ")}${m.model}${muted(" · ")}${muted(m.provider)}`;
+    // opencode-parity footer: the current model leads the bottom status line
+    // (opencode's statusline shows model info on the right; we put it on the
+    // left per user request), with the provider dimmed next to it, and the
+    // agent mode demoted to a trailing tag — the model is the identity users
+    // need to see first.
+    const model = accent(bold(m.model));
+    const agent = m.agent === "plan" ? warn(bold(m.agent)) : muted(m.agent);
+    return `${model}${muted(" · ")}${muted(m.provider)}${muted(" · ")}${agent}`;
   }
 
   #hintsRow(width: number): string {
@@ -2515,7 +2523,11 @@ constructor(opts: TuiOptions) {
     // Scroll-back indicator (used to ride the now-removed dashed separator
     // row): shown on the hints row when scrolled up from the bottom.
     const tag = this.#scrollTop > 0 ? `  ↑${this.#scrollTop}` : "";
-    const left = dim(`${this.#opts.cwd}   ${hint}${tag}`);
+    // opencode-parity second row: lead with the aih version on the left
+    // (opencode's home footer shows the app version; we fold it into the
+    // second footer row above the status line).
+    const ver = this.#opts.version ? cyan(`aih v${this.#opts.version}`) : "";
+    const left = dim(`${ver ? `${ver}   ` : ""}${this.#opts.cwd}   ${hint}${tag}`);
     if (!usage) return this.#clip(left, width);
     const right = usage;
     const pad = Math.max(1, width - cols(left) - cols(right) - 1);
