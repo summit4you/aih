@@ -3729,6 +3729,18 @@ await srv.connect(new StdioServerTransport());
   });
   const ff2 = tui2.panelFooterForTest(42).map(strip);
   assert(ff2.at(-1) === "/tmp", `panel footer without version = path only (got ${JSON.stringify(ff2.at(-1))})`);
+  // The sidebar footer is IDENTITY info: it must render on every wide screen,
+  // even when context-usage is absent (mock / fresh session, limit=0). Before
+  // the #panelActive fix, limit=0 + no todos suppressed the whole sidebar and
+  // with it the footer. Guard that regression.
+  const tui3 = new Tui({
+    placeholder: ">", meta: () => ({ agent: "build", model: "mock", provider: "mock" }), cwd: "/app/agents/aih",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    ctxUsage: () => ({ used: 0, limit: 0 }), version: "0.8.0",
+  });
+  const ff3 = tui3.panelFooterForTest(42).map(strip);
+  assert(ff3.at(-1) === "• aih v0.8.0" && ff3.at(-2) === "/app/agents/aih",
+    `footer renders with limit=0 (mock): path+version both present (got ${JSON.stringify(ff3.slice(-2))})`);
 }
 
 {

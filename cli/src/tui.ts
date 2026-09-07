@@ -2062,8 +2062,13 @@ constructor(opts: TuiOptions) {
 
   #panelActive(): boolean {
     if (this.#cols <= 120) return false; // opencode/mimo-code: sidebar shows only when wide (>120)
-    const todos = this.#panelTodos();
-    return !!this.#panelCtx() || (!!todos && todos.some((t) => t.status !== "completed"));
+    // The sidebar footer (cwd path + "• aih vX") is IDENTITY info and must render
+    // on every wide screen — it does not depend on context-usage data or todos
+    // being present. So once we are wide, the panel is active; the CONTEXT/TODO
+    // sections above it simply stay empty when there is nothing to show. This
+    // fixes the mock / fresh-session case where limit=0 and no todos used to
+    // suppress the whole sidebar (and with it the footer).
+    return true;
   }
 
   #panelWidth(): number {
