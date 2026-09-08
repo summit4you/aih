@@ -850,6 +850,61 @@ export function compactTodoContext(
   return `# Authoritative todo state (from .aih/todos.json)\n${lines.join("\n")}`;
 }
 
+/**
+ * Worktree snapshot folded into compaction summaries (anti-amnesia).
+ *
+ * The compaction summary is written by an LLM from the conversation text —
+ * it can only know a change is "done" if the conversation SAID it was. When
+ * work is done but NOT yet committed (the normal state mid-task), or when a
+ * previous commit is later superseded by uncommitted edits, the summary
+ * routinely mis-records "Completed X (commit abc123)" while the real state
+ * is "X was reverted/replaced in the worktree, uncommitted". After
+ * compaction the agent then re-does or misreads the work — the amnesia
+ * reported for the Windows Terminal wheel fix (summary said 23d5423 ?1007
+ * was done; the worktree held the uncommitted useAltScrollFor correction).
+ *
+ * This is a DETERMINISTIC, zero-LLM snapshot (git porcelain + rev-parse),
+ * injected as authoritative state so the summarizer must carry the
+ * uncommitted reality forward even when the conversation never stated it
+ * in words. `gitStatusSummary`/`formatWorktreeSummary` already exist for
+ * checkpoint restore safety (CL-R#2) — reuse them per check-existing-first.
+ */
+export function compactWorktreeContext(cwd: string): string {
+  const wt = gitStatusSummary({ cwd });
+  if (!wt) return ""; // not a git repo / git unavailable — nothing to say
+  const lines = formatWorktreeSummary(wt);
+  // Uncommitted work is the anti-amnesia crux: name it explicitly so the
+  // summary cannot collapse it into "Completed (commit …)".
+  if (!wt.clean) {
+    lines.push("");
+    lines.push(
+      "The files above are CHANGED BUT NOT COMMITTED. " +
+        "Any commit mentioned in the conversation may predate these edits. " +
+        "Do NOT record the named commit as the final state of these files; " +
+        "the worktree is the source of truth.",
+    );
+  } else if (wt.head) {
+    // Clean worktree: anchor the summary's "Completed" claims to the actual HEAD.
+    lines.push("");
+    lines.push("Worktree is CLEAN — the current HEAD includes all committed work.");
+  }
+  return `# Authoritative worktree state\n${lines.join("\n")}`;
+}
+
+/**
+ * Combined authoritative snapshot for compaction: todo list + worktree state.
+ * Both are deterministic; the worktree half is anti-amnesia insurance (the
+ * summary LLM cannot see the worktree, so it must be told).
+ */
+export function compactStateContext(
+  log: { all: () => readonly SessionEvent[] },
+  cwd: string,
+): string {
+  const parts = [compactTodoContext(log, cwd), compactWorktreeContext(cwd)].filter(Boolean);
+  if (parts.length === 0) return "";
+  return parts.join("\n\n");
+}
+
 export function loadSystemPrompt(): string {
   const appMd = `${process.cwd()}/APP.md`;
 // The language rule now lives in core (LANGUAGE_RULE) and is appended at the
@@ -1493,7 +1548,7 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
       maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
-      compactContext: () => compactTodoContext(log, process.cwd()),
+      compactContext: () => compactStateContext(log, process.cwd()),
       observers: [createDoomLoopEscalationObserver(), repObs],
       ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       ...(bool(flags, "debug-prompt")
@@ -1739,7 +1794,7 @@ async function cmdWorkflow(
         maxStepsPerTurn: Number(str(flags, "max-steps") ?? Infinity) || Infinity,
         contextWindow: resolveContextWindow(flags),
         compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
-        compactContext: () => compactTodoContext(log, process.cwd()),
+        compactContext: () => compactStateContext(log, process.cwd()),
         observers: [createDoomLoopEscalationObserver(), repObs],
         ...(safety ? { budget: safety.budget, costOf: safety.costOf, sensors: safety.sensors, onTripwire: safety.onTripwire, onEscalate: safety.onEscalate } : {}),
       });
@@ -1914,7 +1969,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       maxStepsPerTurn: maxSteps,
       contextWindow: resolveContextWindow(flags),
       compactAt: Number(process.env.AIH_COMPACT_AT ?? "") || 0.8,
-      compactContext: () => compactTodoContext(log, process.cwd()),
+      compactContext: () => compactStateContext(log, process.cwd()),
       observers: [createDoomLoopEscalationObserver(), repObs],
       ...(tuiSafety
         ? {

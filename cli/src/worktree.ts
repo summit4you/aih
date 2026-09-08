@@ -15,7 +15,7 @@
  */
 import { spawnSync } from "node:child_process";
 import type { WorktreeSummary } from "@aih/core";
-import { workspaceIdentity } from "./workspace-identity.js";
+import { peekWorkspaceIdentity } from "./workspace-identity.js";
 
 /** Hard upper bound on stored entries so the session log stays small. */
 export const MAX_DIRTY_ENTRIES = 50;
@@ -56,7 +56,7 @@ export function gitStatusSummary(opts?: {
   const headRes = git(cwd, ["rev-parse", "--short", "HEAD"]);
   const head = headRes.ok ? headRes.out.trim() || null : null;
   // MK#47: attach the logical workspace identity (best-effort, may be undefined).
-  const identity = workspaceIdentity({ cwd });
+  const identity = peekWorkspaceIdentity({ cwd });
   return {
     ...(identity ? { workspaceId: identity.uuid } : {}),
     branch,

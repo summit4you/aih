@@ -8250,3 +8250,42 @@ async function testOmpMKlBatch(): Promise<void> {
 }
 
 await testOmpMKlBatch();
+
+{
+  // Anti-amnesia: compactWorktreeContext / compactStateContext must surface
+  // UNCOMMITTED work deterministically. Regression: the compaction summary
+  // is LLM-written from conversation text only; when work was done but not
+  // committed the summary routinely recorded "Completed (commit abc123)"
+  // while the worktree held a newer uncommitted correction — after
+  // compaction the agent re-did or misread the work (Windows Terminal wheel
+  // fix saga). The worktree snapshot is authoritative and must survive.
+  const { compactWorktreeContext, compactStateContext } = await import("./index.js");
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "aih-wt-"));
+  try {
+    const run = (cmd: string) => {
+      const r = spawnSync("bash", ["-c", cmd], { cwd: dir, encoding: "utf8" });
+      if (r.status !== 0) throw new Error(`git "${cmd}" failed: ${r.stderr}`);
+    };
+    run("git init -q && git config user.email t@t && git config user.name t");
+    run("echo a > f.txt && git add f.txt && git commit -qm init");
+    // Dirty worktree: uncommitted edit exists.
+    run("echo b >> f.txt");
+    const dirty = compactWorktreeContext(dir);
+    assert(dirty.includes("CHANGED BUT NOT COMMITTED"), `anti-amnesia: dirty worktree flagged (got ${JSON.stringify(dirty.slice(0, 120))})`);
+    assert(dirty.includes("f.txt"), `anti-amnesia: dirty file named (got ${JSON.stringify(dirty.slice(0, 200))})`);
+    // Clean worktree: must say CLEAN, not flag uncommitted.
+    run("git add f.txt && git commit -qm second");
+    const clean = compactWorktreeContext(dir);
+    assert(clean.includes("CLEAN"), `anti-amnesia: clean worktree says CLEAN (got ${JSON.stringify(clean.slice(0, 120))})`);
+    assert(!clean.includes("CHANGED BUT NOT COMMITTED"), "anti-amnesia: clean worktree has no uncommitted flag");
+    // compactStateContext joins todo + worktree; empty-todo still yields worktree.
+    const combined = compactStateContext({ all: () => [] }, dir);
+    assert(combined.includes("Authoritative worktree state"), "anti-amnesia: state context carries worktree");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("ok: anti-amnesia worktree snapshot in compaction context");
+}
