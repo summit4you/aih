@@ -711,15 +711,20 @@ constructor(opts: TuiOptions) {
     // the whole conversation above the freshly shown shell prompt. ESC[2J
     // clears whatever screen we are on at this moment — a no-op visually on
     // alt-screen terminals (the main screen is about to replace it) and the
-    // clear fix for everything else. NOTE: order matters — clear FIRST, then
-    // leave the alt screen, then show the cursor.
+    // clear fix for everything else.
+    // Exit cleanliness: the user wanted the post-exit prompt at the TOP row
+    // (either keep the session history on the main screen, or clear like
+    // `clear`). We choose the clear: after ?1049l the pre-session main screen
+    // (and its old cursor row) comes back, so a SECOND ESC[2J wipes that main
+    // screen too and CSI H parks the cursor at 1,1 — the new shell prompt
+    // starts at the top row, exactly like running `clear`.
     const clear = `${CSI}H${CSI}2J`;
     // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen,
     // no ?1007 — conhost doesn't understand it). All other terminals get the
     // full teardown including ?1007l (alternate scroll off).
     const restore = this.#legacyWin
-      ? `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${SHOW}`
-      : `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`;
+      ? `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}H${SHOW}`
+      : `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}?1007l${CSI}H${SHOW}`;
     process.stdout.write(restore);
   }
 
@@ -766,8 +771,11 @@ constructor(opts: TuiOptions) {
   #restore = (): void => {
     // ?1007l is sent on every non-legacy terminal (it was enabled in start()).
     // Same clear-then-restore order as stop(): ESC[2J wipes the screen the TUI
-    // painted on (alt or main), then the alt-screen leave restores the shell.
-    process.stdout.write(`${CSI}H${CSI}2J${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${CSI}?1007l${SHOW}`);
+    // painted on (alt or main), then the alt-screen leave restores the shell,
+    // then a second ESC[2J + CSI H wipes the restored main screen and parks the
+    // cursor at the top row — the post-exit prompt starts at 1,1 (clear-like).
+    const clear = `${CSI}H${CSI}2J`;
+    process.stdout.write(`${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}?1007l${CSI}H${SHOW}`);
   };
 
   /** Begin a bulk insert (session replay): suppress per-item follow/paint. */
