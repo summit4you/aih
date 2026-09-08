@@ -4707,7 +4707,7 @@ await srv.connect(new StdioServerTransport());
   tui.push({ role: "user", text: "hello" });
   tui.push({ role: "assistant", text: "world" });
   const vivid = tui.transcriptLines().join("\n");
-  assert(vivid.includes("│"), "default render keeps the user-row border (│)");
+  assert(vivid.includes("┃"), "default render keeps the user-row border (┃)");
   tui.setPlain(true);
   assert(tui.isPlain(), "setPlain(true) toggles on");
   const plain = tui.transcriptLines().join("\n");

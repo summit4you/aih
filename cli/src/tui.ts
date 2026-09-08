@@ -2410,27 +2410,32 @@ constructor(opts: TuiOptions) {
     if (this.#plain) return this.#clip(line, this.#bodyCols());
     const bg = this.#surface();
     // inner width: bodyCols - 4 (1 border + 2 content pad + 1 right margin) so
-    // a CJK-wide border glyph on Windows can never push the row onto the panel.
+    // the row never touches the panel edge; ┃ is the wider, original border the
+    // user prefers (Windows CJK fonts render it 1 cell like │ — the right
+    // margin is what keeps the box off the sidebar, not the glyph).
     const inner = Math.max(1, this.#bodyCols() - 4);
-    const raw = `${cyan("│")}  ${this.#clip(line, inner)}`;
+    const raw = `${cyan("┃")}  ${this.#clip(line, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #boxLine(content: string, width: number): string {
     if (this.#plain) return this.#clip(content, width);
     const bg = this.#surface();
-    // inner width: width - 4 (1 border + 2 content pad + 1 right margin) —
-    // the trailing 1-cell margin means a CJK-wide border glyph on Windows
-    // (where ┃ can render 2 cells and swallow the panel gap) can never push
-    // the input box background onto the sidebar: worst case it eats the
-    // margin, never the panel.
+    // inner width: width - 4 (1 border + 2 content pad + 1 right margin) — the
+    // trailing 1-cell margin keeps the input box off the sidebar even if a
+    // Windows font renders ┃ wide; the border stays the original ┃ glyph.
     const inner = Math.max(1, width - 4);
-    const raw = `${cyan("│")}  ${this.#clip(content, inner)}`;
+    const raw = `${cyan("┃")}  ${this.#clip(content, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #renderBlock(item: TuiItem): string[] {
-    const limit = Math.max(1, this.#bodyCols() - 3);
+    // Right margin: every message family keeps 1 cell clear of the sidebar
+    // (user rows already do via inner=bodyCols-4; assistant/tool did not and
+    // their text ran flush against the panel — the "glued to the sidebar" look
+    // on Windows). Wrap at bodyCols-4 (3 left indent + 1 right) so neither the
+    // wrapped text nor its trailing space ever touches the panel edge.
+    const limit = Math.max(1, this.#bodyCols() - 4);
     if (item.role === "assistant") {
       const lines = this.#markdown(item.text, limit);
       // opencode-style block spacing: a 1-line gap above each message block
@@ -2461,19 +2466,20 @@ constructor(opts: TuiOptions) {
       case "tool": {
         const rows = this.#toolRow(item);
         const t = item.tool;
+        const bc = this.#bodyCols(); // keep 1-cell right margin like #toolRow
         if (t && t.ok === false && t.error) {
-          for (const line of this.#wrap(t.error, this.#bodyCols())) rows.push(this.#clip(`   ${red(line)}`, this.#bodyCols()));
+          for (const line of this.#wrap(t.error, bc - 1)) rows.push(this.#clip(`   ${red(line)}`, bc - 1));
         }
         if (t && typeof t.output === "string" && t.output.trim()) {
           const all = t.output.replace(/\r\n?/g, "\n").split("\n");
           const shown = t.expanded ? all : all.slice(0, 3);
-          for (const l of shown) rows.push(this.#clip(`   ${dim(l || " ")}`, this.#bodyCols()));
+          for (const l of shown) rows.push(this.#clip(`   ${dim(l || " ")}`, bc - 1));
           if (!t.expanded && all.length > 3) {
-            rows.push(this.#clip(dim(`   … ${all.length - 3} more · enter to expand`), this.#bodyCols()));
+            rows.push(this.#clip(dim(`   … ${all.length - 3} more · enter to expand`), bc - 1));
           } else if (t.expanded) {
-            rows.push(this.#clip(dim("   enter to collapse"), this.#bodyCols()));
+            rows.push(this.#clip(dim("   enter to collapse"), bc - 1));
           }
-          if (t.outputCapped) rows.push(this.#clip(dim("   … output truncated at 32KB"), this.#bodyCols()));
+          if (t.outputCapped) rows.push(this.#clip(dim("   … output truncated at 32KB"), bc - 1));
         }
         if (item.tool?.ok && item.tool.diff && item.tool.diff.length) {
           rows.push(...this.#diffRows(item));
@@ -2491,13 +2497,14 @@ constructor(opts: TuiOptions) {
   #toolRow(item: TuiItem): string[] {
     const t = item.tool;
     const bodyCols = this.#bodyCols();
-    if (!t) return [this.#clip(item.text, bodyCols)];
+    if (!t) return [this.#clip(item.text, bodyCols - 1)];
     const icon = t.ok === undefined ? warn("▶") : t.ok ? success("✓") : danger("✗");
     const name = t.ok === false ? danger(`${t.name} failed`) : t.name;
     const argText = (t.args ?? "").replace(/\s*\n+\s*/g, " ").trim();
-    // All tool rows are plain full-width lines (no background, no border);
-    // the argument text wraps onto extra lines instead of being clipped.
-    const line = (s: string): string => this.#clip(s, bodyCols);
+    // All tool rows are plain lines (no background, no border); the argument
+    // text wraps onto extra lines instead of being clipped. Right margin: rows
+    // are clipped to bodyCols-1 so the panel's 1-cell gap is never touched.
+    const line = (s: string): string => this.#clip(s, bodyCols - 1);
     if (!argText) return [line(`${icon} ${name}`)];
     const nameVisible = t.ok === false ? t.name.length + 8 : t.name.length;
     const first = Math.max(8, bodyCols - 5 - nameVisible);
@@ -2573,7 +2580,7 @@ constructor(opts: TuiOptions) {
       );
     });
     if (t.truncated) {
-      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
+      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols - 1));
     }
     return rows;
   }
@@ -2585,7 +2592,7 @@ constructor(opts: TuiOptions) {
     const bodyCols = this.#bodyCols();
     const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
     const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
-    const cell = (bg: string, text: string): string => `${bg}${this.#clip(text, bodyCols)}${RESET}`;
+    const cell = (bg: string, text: string): string => `${bg}${this.#clip(text, bodyCols - 1)}${RESET}`;
     const rows = t.diff.map((l) => {
       const no = l.t === "del" ? l.a : l.b;
       const mark = l.t === "del" ? "-" : "+";
@@ -2593,7 +2600,7 @@ constructor(opts: TuiOptions) {
       return cell(bg, `${typeof no === "number" ? `${no} ` : ""}${mark} ${l.s}`);
     });
     if (t.truncated) {
-      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols));
+      rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols - 1));
     }
     return rows;
   }
