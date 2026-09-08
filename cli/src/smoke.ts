@@ -3856,7 +3856,7 @@ await srv.connect(new StdioServerTransport());
   // TEXTAREA_MAX_ROWS=6. Verify the constants and the footer render.
   const { Tui } = await import("./tui.js");
   const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
-  assert(Tui.SIDEBAR_WIDTH === 42, "opencode/mimo-code parity: SIDEBAR_WIDTH=42 (both repos)");
+  assert(Tui.SIDEBAR_WIDTH === 34, "user: SIDEBAR_WIDTH=34 (42×0.8 — 42 was too wide)");
   assert(Tui.PANEL_GAP === 4, "opencode/mimo-code parity: PANEL_GAP=4 (contentWidth = width-42-4)");
   assert(Tui.INPUT_MAX_ROWS === 9, "INPUT_MAX_ROWS=9 (user request: 1.5× the opencode composer 6)");
   // P#UI — 4 input-area regressions guarded together:

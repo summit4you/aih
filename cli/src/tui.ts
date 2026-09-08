@@ -2195,11 +2195,12 @@ constructor(opts: TuiOptions) {
     // opencode/mimo-code parity: SIDEBAR_WIDTH = 42 fixed (both repos). AIH
     // keeps its panel right-anchored but uses the same 42-column width and the
     // same >120 wide threshold, so a maximized terminal shows an identical
-    // sidebar silhouette. (Was min(32, max(24, cols>>2)) before the parity fix.)
+    // sidebar silhouette. User found 42 too wide → 34 (42×0.8, keeps the same
+    // silhouette at ~81%, more room for the transcript).
     return Tui.SIDEBAR_WIDTH;
   }
 
- static readonly SIDEBAR_WIDTH = 42; // opencode/mimo-code: SIDEBAR_WIDTH = 42 (both repos)
+ static readonly SIDEBAR_WIDTH = 34; // user: 42 was too wide → 34 (42×0.8)
  static readonly PANEL_GAP = 4; // opencode/mimo-code: contentWidth = width - sidebar(42) - 4
  static readonly INPUT_MAX_ROWS = 9; // user request: 6 → 1.5× (opencode TEXTAREA_MAX_ROWS=6; composer caps at 9 lines, scrolls beyond)
 
