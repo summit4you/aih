@@ -173,6 +173,20 @@ export const TOOL_ICONS: Record<string, string> = {
   load_skill: "→",
 };
 
+/**
+ * ?1007 (alternate scroll) policy per platform. POSIX terminals (xterm/VTE/
+ * kitty) translate the wheel to ↑/↓ arrows in the alt screen; sending ?1007h
+ * makes them deliver SGR 64/65 after our first-flick recovery. Windows
+ * Terminal must NOT get it: under active mouse tracking (?1000/?1006) it
+ * already forwards the wheel as SGR 64/65 ("mouse tracking takes precedence" —
+ * microsoft/terminal#13187), and ?1007h there forces arrow translation — the
+ * first flick falls into input-history recall and never scrolls (the reported
+ * "Windows Terminal wheel can't scroll the transcript" bug).
+ */
+export function useAltScrollFor(platform: string): boolean {
+  return platform !== "win32";
+}
+
 // Display width follows the standard `string-width` algorithm (the same one
 // Bun.stringWidth and opencode/mimo use): emoji = 2 cells, East-Asian
 // Wide/Fullwidth = 2, Ambiguous = 1 (narrow) by default, Neutral = 1, and
@@ -531,6 +545,17 @@ export class Tui {
   #mouseHintShown = false;
   #swallowArrows = false;
   #burstSnapshot: { edit: string; cursor: number; hist: number } | null = null;
+  /**
+   * Should we send ?1007 (alternate scroll)? Only on non-Windows terminals.
+   * Windows Terminal resolves wheel events itself: with mouse tracking
+   * enabled (?1000/?1006) it forwards the wheel as SGR 64/65 — "mouse
+   * tracking takes precedence" (microsoft/terminal#13187). Sending ?1007h
+   * there instead converts the wheel to ↑/↓ arrows, which our #arrowKey
+   * only recovers from AFTER seeing an SGR wheel first (a chicken-and-egg:
+   * the first flick never scrolls and edits the input history instead —
+   * the reported "Windows Terminal wheel can't scroll the transcript" bug).
+   */
+  #useAltScroll = false;
   #timer: ReturnType<typeof setInterval> | null = null;
   #paintScheduled = false;
   #paintTimer: ReturnType<typeof setTimeout> | null = null;
@@ -648,6 +673,14 @@ constructor(opts: TuiOptions) {
     // Terminal / VS Code get the full set.
     const legacyWin = process.platform === "win32" && !process.env.WT_SESSION && !process.env.TERM_PROGRAM;
     this.#legacyWin = legacyWin;
+    // ?1007 (alternate scroll) is a Linux/Unix-terminal behavior (xterm/VTE/
+    // kitty): it makes the wheel arrive as ↑/↓ arrows so the app can scroll
+    // itself, and our #arrowKey burst-detection recovers SGR after the first
+    // flick. On Windows Terminal we must NOT send it — WT already honours
+    // mouse-tracking precedence and delivers the wheel as SGR 64/65 directly
+    // (see #useAltScroll; sending ?1007h there forces arrow conversion and the
+    // first flick falls into input-history recall instead of scrolling).
+    this.#useAltScroll = useAltScrollFor(process.platform);
     // Legacy conhost: NO alt-screen (?1049) — its resize handler has a buffer
     // overflow bug that crashes when the TUI writes during reallocation.
     // Mouse tracking (?1000/?1006) IS supported on Win10+ conhost — enable it
@@ -663,12 +696,15 @@ constructor(opts: TuiOptions) {
     //    which the TUI reads as composer input-history recall — so scrolling
     //    "works" until the transcript hits the top, then the wheel starts
     //    editing the input history instead.
-    // ?1007 is honored by Windows Terminal, xterm, VTE (3.26+), kitty, foot.
-    // Legacy conhost does not understand it, so it is only sent on non-legacy
-    // terminals (where it is the fix, not noise).
+    // ?1007 is honored by xterm, VTE (3.26+), kitty, foot — but NOT sent on
+    // Windows (WT forwards the wheel as SGR under mouse tracking; see
+    // #useAltScroll). Legacy conhost does not understand it either, and its
+    // resize bug forbids ?1049 (see above) — legacy keeps mouse/paste only.
     const modes = legacyWin
       ? `${CSI}?1000h${CSI}?1006h${CSI}?2004h`
-      : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h${CSI}?1007h`;
+      : this.#useAltScroll
+        ? `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h${CSI}?1007h`
+        : `${CSI}?1049h${CSI}?1000h${CSI}?1006h${CSI}?2004h`;
     process.stdout.write(modes);
     if (legacyWin) {
       this.pushSystem(
@@ -676,9 +712,11 @@ constructor(opts: TuiOptions) {
         "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse · right-click = paste"
       );
     } else if (process.platform === "win32") {
-      // ?1007 enabled: the wheel now scrolls the aih transcript directly.
+      // Windows Terminal: mouse tracking (?1000/?1006) forwards the wheel as
+      // SGR 64/65 directly — no ?1007 (which would convert it to arrows and
+      // break the first flick). The wheel scrolls the transcript natively.
       this.pushSystem(
-        "Windows Terminal: mouse wheel scrolls the conversation (alternate scroll enabled). " +
+        "Windows Terminal: mouse wheel scrolls the conversation (SGR mouse tracking). " +
         "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
       );
     } else if (process.platform === "linux") {
@@ -721,10 +759,12 @@ constructor(opts: TuiOptions) {
     const clear = `${CSI}H${CSI}2J`;
     // Legacy conhost: restore mouse tracking + bracketed paste (no alt-screen,
     // no ?1007 — conhost doesn't understand it). All other terminals get the
-    // full teardown including ?1007l (alternate scroll off).
+    // full teardown; ?1007l only if we sent ?1007h (#useAltScroll).
     const restore = this.#legacyWin
       ? `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}H${SHOW}`
-      : `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}?1007l${CSI}H${SHOW}`;
+      : this.#useAltScroll
+        ? `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}?1007l${CSI}H${SHOW}`
+        : `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}H${SHOW}`;
     process.stdout.write(restore);
   }
 
@@ -769,13 +809,17 @@ constructor(opts: TuiOptions) {
   };
 
   #restore = (): void => {
-    // ?1007l is sent on every non-legacy terminal (it was enabled in start()).
-    // Same clear-then-restore order as stop(): ESC[2J wipes the screen the TUI
-    // painted on (alt or main), then the alt-screen leave restores the shell,
-    // then a second ESC[2J + CSI H wipes the restored main screen and parks the
-    // cursor at the top row — the post-exit prompt starts at 1,1 (clear-like).
+    // ?1007l is only sent when ?1007h was sent (#useAltScroll; Windows Terminal
+    // never gets it — see start()). Same clear-then-restore order as stop():
+    // ESC[2J wipes the screen the TUI painted on (alt or main), then the
+    // alt-screen leave restores the shell, then a second ESC[2J + CSI H wipes
+    // the restored main screen and parks the cursor at the top row — the
+    // post-exit prompt starts at 1,1 (clear-like).
     const clear = `${CSI}H${CSI}2J`;
-    process.stdout.write(`${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}${CSI}?1007l${CSI}H${SHOW}`);
+    const base = `${clear}${CSI}?1000l${CSI}?1006l${CSI}?2004l${CSI}?1049l${clear}`;
+    process.stdout.write(
+      `${base}${this.#useAltScroll ? `${CSI}?1007l` : ""}${CSI}H${SHOW}`,
+    );
   };
 
   /** Begin a bulk insert (session replay): suppress per-item follow/paint. */
@@ -1796,7 +1840,11 @@ constructor(opts: TuiOptions) {
       this.#sgrWheelSeen = false;
       this.#swallowArrows = true; // swallow the rest of this flick
       if (this.#running || process.stdout.isTTY) {
-        process.stdout.write(`${CSI}?1000h${CSI}?1006h${CSI}?1007h`);
+        process.stdout.write(
+          this.#useAltScroll
+            ? `${CSI}?1000h${CSI}?1006h${CSI}?1007h`
+            : `${CSI}?1000h${CSI}?1006h`,
+        );
       }
       if (!this.#mouseHintShown) {
         this.#mouseHintShown = true;

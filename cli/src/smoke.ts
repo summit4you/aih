@@ -6559,6 +6559,7 @@ import { buildChildEnv } from "./env-policy.js";
 
 {
   // TP#4.9 — matchPattern: glob patterns (against path segments, not absolute)
+  const { useAltScrollFor } = await import("./tui.js");
   assert(matchPattern("*", "/any/path") === true, "TP#4.9 matchPattern: * matches all");
   assert(matchPattern("**", "/any/path/deep") === true, "TP#4.9 matchPattern: ** matches deep");
   assert(matchPattern(undefined, "/any/path") === true, "TP#4.9 matchPattern: undefined matches all");
@@ -6585,6 +6586,11 @@ import { buildChildEnv } from "./env-policy.js";
     matchPattern("/tmp/X/Y", "/tmp/x/y", "linux") === false,
     "TP#4.9 posix: case stays sensitive",
   );
+  // ?1007 (alternate scroll) policy: Windows Terminal must NOT get it (it
+  // converts the wheel to arrows and breaks the first flick; SGR 64/65 under
+  // mouse tracking already works there); POSIX keeps it.
+  assert(useAltScrollFor("win32") === false, "TP#4.9 alt-scroll: win32 does not send ?1007");
+  assert(useAltScrollFor("linux") === true && useAltScrollFor("darwin") === true, "TP#4.9 alt-scroll: POSIX sends ?1007");
   console.log("ok: TP#4.9 matchPattern glob patterns");
 }
 
