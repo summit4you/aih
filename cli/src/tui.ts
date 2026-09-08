@@ -2295,7 +2295,12 @@ constructor(opts: TuiOptions) {
       const used = Math.min(ctx.used, ctx.limit);
       const pct = Math.round((used / ctx.limit) * 100);
       lines.push(accent(bold("CONTEXT")));
-      const bw = Math.min(12, Math.max(8, pw - 8));
+      // User: stretch the bar out to the panel's right edge — but keep an
+      // even left/right margin. #panelSeg pads every line with 2 leading
+      // spaces, so a bar of pw-4 (2 left + 2 right) is symmetric with the
+      // left indent and reads as a full-width gauge. (Was capped at 12 from
+      // the 42-wide era; at 34 the capped bar left a huge dead zone.)
+      const bw = Math.max(4, pw - 4);
       lines.push(this.#progressBar(pct, bw));
       // Sparkline uses block glyphs (▁…█) which legacy conhost GBK renders as
       // two cells each; drop it there — the text % is still readable.
