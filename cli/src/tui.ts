@@ -1948,8 +1948,12 @@ constructor(opts: TuiOptions) {
   }
 
   #inputLineCount(width: number): number {
-    if (this.#question || this.#confirmText) return 1;
-    const limit = Math.max(4, width - 4);
+    if (this.#confirmText) return 1;
+    if (this.#question) {
+      const limit = Math.max(4, width - 6);
+      return Math.min(Tui.INPUT_MAX_ROWS, this.#wrapEdit(this.#qbuf, limit).length);
+    }
+    const limit = Math.max(4, width - 6); // 2-space wrap indent fits inner (width-4)
     // opencode/mimo-code parity: the composer never grows past TEXTAREA_MAX_ROWS=6
     // — it scrolls internally. Cap here so #viewHeight stays stable for long
     // pastes (a 20-line paste must not shrink the body to zero rows).
@@ -2197,7 +2201,7 @@ constructor(opts: TuiOptions) {
 
  static readonly SIDEBAR_WIDTH = 42; // opencode/mimo-code: SIDEBAR_WIDTH = 42 (both repos)
  static readonly PANEL_GAP = 4; // opencode/mimo-code: contentWidth = width - sidebar(42) - 4
- static readonly INPUT_MAX_ROWS = 6; // opencode/mimo-code: TEXTAREA_MAX_ROWS = 6 (composer caps at 6 lines, scrolls beyond)
+ static readonly INPUT_MAX_ROWS = 9; // user request: 6 → 1.5× (opencode TEXTAREA_MAX_ROWS=6; composer caps at 9 lines, scrolls beyond)
 
   /** Inline sparkline of recent per-turn prompt tokens (8 steps/cell, skill §5). */
   static sparkline(trend?: number[]): string {
@@ -2405,17 +2409,23 @@ constructor(opts: TuiOptions) {
   #userRow(line: string): string {
     if (this.#plain) return this.#clip(line, this.#bodyCols());
     const bg = this.#surface();
-    const inner = Math.max(1, this.#bodyCols() - 3);
-    // ┃ + 2 spaces so multi-line user content does not hug the gutter
-    const raw = `${cyan("┃")}  ${this.#clip(line, inner)}`;
+    // inner width: bodyCols - 4 (1 border + 2 content pad + 1 right margin) so
+    // a CJK-wide border glyph on Windows can never push the row onto the panel.
+    const inner = Math.max(1, this.#bodyCols() - 4);
+    const raw = `${cyan("│")}  ${this.#clip(line, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
   #boxLine(content: string, width: number): string {
     if (this.#plain) return this.#clip(content, width);
     const bg = this.#surface();
-    const inner = Math.max(1, width - 3);
-    const raw = `${cyan("┃")}  ${this.#clip(content, inner)}`;
+    // inner width: width - 4 (1 border + 2 content pad + 1 right margin) —
+    // the trailing 1-cell margin means a CJK-wide border glyph on Windows
+    // (where ┃ can render 2 cells and swallow the panel gap) can never push
+    // the input box background onto the sidebar: worst case it eats the
+    // margin, never the panel.
+    const inner = Math.max(1, width - 4);
+    const raw = `${cyan("│")}  ${this.#clip(content, inner)}`;
     return bg + raw.split(RESET).join(RESET + bg) + RESET;
   }
 
@@ -2634,8 +2644,20 @@ constructor(opts: TuiOptions) {
 
   #inputLayout(width: number): { lines: string[]; segs: string[]; ci: number; col: number } {
     if (this.#question) {
-      const hint = dim("  Enter to send · ctrl-c to cancel");
-      return { lines: [`${cyan("❯")} ${this.#qbuf}${hint}`], segs: [this.#qbuf], ci: 0, col: this.#qbuf.length };
+      // Hint only while the answer is empty — once the user types, the hint
+      // must step aside (it was crowding the answer text and made the input
+      // look like a placeholder that never cleared).
+      const hint = this.#qbuf ? "" : dim("  Enter to send · ctrl-c to cancel");
+      // Long answers wrap (same limit as the composer) so a long question
+      // answer never vanishes behind the box's right edge.
+      const qlimit = Math.max(4, width - 6);
+      const wrapped = this.#wrapEdit(this.#qbuf, qlimit);
+      const lines = wrapped.map((s, i) => (i === 0 ? `${cyan("❯")} ${s}` : `  ${s}`));
+      if (wrapped.length === 1) lines[0] += hint;
+      // cursor lands at the end of the answer (last wrapped line)
+      const ci = Math.min(wrapped.length - 1, Tui.INPUT_MAX_ROWS - 1);
+      const col = wrapped[ci]?.length ?? 0;
+      return { lines, segs: wrapped.slice(0, Tui.INPUT_MAX_ROWS), ci, col };
     }
     if (this.#confirmText) {
       const at = this.#confirmText.indexOf("always");
@@ -2648,7 +2670,7 @@ constructor(opts: TuiOptions) {
         col: 0,
       };
     }
-    const limit = Math.max(4, width - 4);
+    const limit = Math.max(4, width - 6); // 2-space wrap indent fits inner (width-4)
     // opencode/mimo-code parity: the composer caps at TEXTAREA_MAX_ROWS=6 and
     // scrolls beyond. AIH keeps the full text in #edit (send is unaffected) but
     // renders a 6-line window centred on the cursor; overflow is signalled with

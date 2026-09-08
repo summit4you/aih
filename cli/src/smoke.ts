@@ -3858,7 +3858,44 @@ await srv.connect(new StdioServerTransport());
   const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
   assert(Tui.SIDEBAR_WIDTH === 42, "opencode/mimo-code parity: SIDEBAR_WIDTH=42 (both repos)");
   assert(Tui.PANEL_GAP === 4, "opencode/mimo-code parity: PANEL_GAP=4 (contentWidth = width-42-4)");
-  assert(Tui.INPUT_MAX_ROWS === 6, "opencode/mimo-code parity: INPUT_MAX_ROWS=6 (TEXTAREA_MAX_ROWS)");
+  assert(Tui.INPUT_MAX_ROWS === 9, "INPUT_MAX_ROWS=9 (user request: 1.5× the opencode composer 6)");
+  // P#UI — 4 input-area regressions guarded together:
+  //  (1) composer wraps at inner-minus-indent so the LAST character of a
+  //      wrapped line is never clipped by the box's right edge (#boxLine
+  //      inner = width-4; wrap limit = width-6 keeps the 2-space indent inside).
+  //  (2) the box leaves a 1-cell right margin (bg never touches the panel).
+  //  (3) a question's hint disappears once the user types.
+  //  (4) a long question answer wraps (multi-line) instead of vanishing.
+  {
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+    // (1) fill a line to the exact inner width; the last char must survive.
+    const W = 40;
+    const inner = W - 4; // border(1) + 2 pad + 1 right margin
+    const limit = W - 6; // wraps so `  ${line}` == inner
+    const long = "x".repeat(limit * 2 + 3);
+    tui.feed(long); // typing into the composer
+    const il = tui.inputLayoutForTest(W);
+    const joined = il.segs.join("");
+    assert(joined === long, `wrap keeps full text (${joined.length}/${long.length} chars)`);
+    const firstRow = il.lines[0] ?? "";
+    const rowW = firstRow.length; // plain test: no ANSI
+    assert(rowW <= W - 3, `composer row fits the box inner width (row ${rowW} ≤ ${W - 3})`);
+    // (3)+(4) question with a long answer: hint gone once typing, wraps.
+    const qp = tui.askQuestion("q?");
+    tui.feed("a".repeat(limit + 5));
+    const qil = tui.inputLayoutForTest(W);
+    assert(!qil.lines[0].includes("Enter to send"), "question hint hides after the first typed char");
+    assert(qil.lines.length > 1, `long question answer wraps (${qil.lines.length} lines)`);
+    qp.catch(() => {});
+  }
   const tui = new Tui({
     placeholder: ">",
     meta: () => ({ agent: "build", model: "m", provider: "p" }),
@@ -4670,12 +4707,12 @@ await srv.connect(new StdioServerTransport());
   tui.push({ role: "user", text: "hello" });
   tui.push({ role: "assistant", text: "world" });
   const vivid = tui.transcriptLines().join("\n");
-  assert(vivid.includes("┃"), "default render keeps the user-row border (┃)");
+  assert(vivid.includes("│"), "default render keeps the user-row border (│)");
   tui.setPlain(true);
   assert(tui.isPlain(), "setPlain(true) toggles on");
   const plain = tui.transcriptLines().join("\n");
   assert(plain.includes("hello") && plain.includes("world"), "plain render still shows the text");
-  assert(!plain.includes("┃"), "plain render drops the user-row border");
+  assert(!plain.includes("│"), "plain render drops the user-row border");
   assert(!plain.includes("\x1b[48"), "plain render drops the surface background");
   tui.setPlain(false);
   assert(!tui.isPlain(), "setPlain(false) toggles back off");
