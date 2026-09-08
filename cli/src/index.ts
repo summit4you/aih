@@ -2369,7 +2369,9 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     statusLeft: appName,
     statusRight: `S:${initialTitle ?? sessionName}`,
     statusBadge: () => {
-      const n = registry.schemas().length;
+      // Count only MCP backend tools (registry.schemas() would include the
+      // local built-in tools and mislabel the total as "MCP").
+      const n = backendDefs.length;
       return { glyph: "⊙", ok: n > 0, label: `${n} MCP` };
     },
     // IT#2 — shell-failure indicator (red ⚠ when a run_cmd failed; hidden when green).
