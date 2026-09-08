@@ -6565,6 +6565,26 @@ import { buildChildEnv } from "./env-policy.js";
   assert(matchPattern("src/*", "src/foo") === true, "TP#4.9 matchPattern: src/* matches src/foo");
   assert(matchPattern("src/*", "lib/bar") === false, "TP#4.9 matchPattern: src/* rejects lib/bar");
   assert(matchPattern("src/**", "src/deep/nested") === true, "TP#4.9 matchPattern: src/** matches deep");
+  // Windows temp-scope regression: a scope granted via resolve() — uppercase
+  // drive + backslashes — must match a later request built from a lowercase
+  // env var (`c:/users/…` or `c:\users\…`); POSIX stays case-sensitive.
+  const win = "win32" as NodeJS.Platform;
+  assert(
+    matchPattern("C:\\Users\\X\\AppData\\Local\\Temp\\**", "c:\\users\\x\\appdata\\local\\temp\\a.txt", win),
+    "TP#4.9 win32: \\\\ + case-insensitive scope matches a new temp file",
+  );
+  assert(
+    matchPattern("C:/Users/X/AppData/Local/Temp/**", "c:\\users\\x\\appdata\\local\\temp\\sub\\b.txt", win),
+    "TP#4.9 win32: forward-slash scope matches backslash target",
+  );
+  assert(
+    matchPattern("Temp\\*", "temp\\sub\\c.txt", win) === false,
+    "TP#4.9 win32: single * stays segment-scoped (\\ becomes /)",
+  );
+  assert(
+    matchPattern("/tmp/X/Y", "/tmp/x/y", "linux") === false,
+    "TP#4.9 posix: case stays sensitive",
+  );
   console.log("ok: TP#4.9 matchPattern glob patterns");
 }
 

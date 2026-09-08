@@ -119,9 +119,26 @@ export function targetOf(req: ApprovalRequest): string | undefined {
   return undefined;
 }
 
-export function matchPattern(pattern: string | undefined, target: string | undefined): boolean {
+export function matchPattern(
+  pattern: string | undefined,
+  target: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
   if (!pattern || pattern === "*" || pattern === "**") return true;
   if (!target) return false;
+  // Windows: paths are case-insensitive and `\` == `/` (C:\Users\X and
+  // c:/users/x are the same file). Normalize BOTH sides before compiling the
+  // regex — otherwise a scope granted via resolve() (uppercase drive `C:\`)
+  // never matches a later request built from a lowercase env var (`c:\` or
+  // `c:/`), so every new temp filename re-prompts (the reported Windows bug:
+  // "every different file in temp needs approval again"). POSIX stays
+  // case-sensitive and `/`-only — untouched behavior.
+  const norm =
+    platform === "win32"
+      ? (s: string): string => s.toLowerCase().replaceAll("\\", "/")
+      : (s: string): string => s;
+  pattern = norm(pattern);
+  target = norm(target);
   let re = "^";
   for (let i = 0; i < pattern.length; i += 1) {
     const ch = pattern[i];
