@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import os from "node:os";
 import { createInterface } from "node:readline";
 import { userAihDir, userAihDirs } from "./paths.js";
 import { judgePanel, parseGoalVerdict } from "./maxmode.js";
@@ -164,6 +165,18 @@ import {
   type Skill,
 } from "./skills.js";
 import { isKnownSlashCommand } from "./slash.js";
+import {
+  checkLatestVersion,
+  checkUpdate,
+  compareVersions,
+  downloadTarball,
+  applyUpdate,
+  detectInstallDir,
+  readState,
+  shouldPrompt,
+  markSkipped,
+  tarballName,
+} from "./update.js";
 import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
 import { registerDevTools, runShellCommand } from "./dev-tools.js";
 import { extractShellContext, formatShellContext, describeCommand } from "./shell-context.js";
@@ -258,6 +271,9 @@ aih session <list|show|rm|export|import|fork> [args]
   aih connect [<id>] [--key <k>]  connect an API provider (catalog / save config)
                                    --key <API_KEY> persists the key to the AIH env file
                                    (AIH_ENV_PATH, default ~/.aih/env, chmod 600)
+  aih update [version]            self-update from GitHub releases
+                                   --check: report only · --yes: skip confirm
+                                   (TUI: /update — download to local staging first)
   aih init [dir]                  scaffold a new app harness
   aih workflow <list|run> [name]  deterministic multi-phase agent runs
                                    list: list .aih/workflows/*.mjs
@@ -1719,6 +1735,74 @@ async function cmdRun(positionals: string[], flags: Record<string, string | bool
   }
 }
 
+/**
+ * `aih update [version]` — CLI self-update (opencode `upgrade` parity).
+ *   aih update --check   only report latest vs installed
+ *   aih update           check → confirm (TTY) → download to local staging → apply
+ *   aih update 0.9.0     pin a specific version
+ *   --yes                skip the confirmation (non-TTY safe)
+ */
+async function cmdUpdate(positionals: string[], flags: Record<string, string | boolean>): Promise<void> {
+  if (process.env.AIH_DISABLE_UPDATE_CHECK === "1") {
+    console.error("update checks disabled (AIH_DISABLE_UPDATE_CHECK=1)");
+    process.exit(1);
+  }
+  const target = (positionals[0] ?? "").replace(/^v/, "");
+  const checkOnly = bool(flags, "check", "c");
+  const yes = bool(flags, "yes", "y");
+
+  const latest = target || (await checkLatestVersion());
+  if (!latest) {
+    console.error("error: could not reach the GitHub release API (network?)");
+    process.exit(1);
+  }
+  if (checkOnly) {
+    const cmp = compareVersions(latest, VERSION);
+    console.log(`current:  v${VERSION}`);
+    console.log(`latest:   v${latest}`);
+    console.log(cmp > 0 ? "status:   update available" : cmp === 0 ? "status:   up to date" : "status:   local is newer");
+    return;
+  }
+  if (!target && compareVersions(latest, VERSION) <= 0) {
+    console.log(`already up to date (v${VERSION})`);
+    return;
+  }
+  if (detectInstallDir() === null) {
+    console.error("error: not a tarball install (expected <dir>/app/aih) — install with:");
+    console.error(`  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latest)}`);
+    process.exit(1);
+  }
+  if (!yes && process.stdin.isTTY) {
+    const { createInterface } = await import("node:readline");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ans = await new Promise<string>((r) =>
+      rl.question(`update v${VERSION} → v${latest}? [y/N] `, (a) => {
+        rl.close();
+        r(a.trim().toLowerCase());
+      }),
+    );
+    if (ans !== "y" && ans !== "yes") {
+      markSkipped(latest);
+      console.log(`skipped v${latest} (remembered; /update or aih update to install)`);
+      return;
+    }
+  } else if (!yes && !process.stdin.isTTY) {
+    console.error("error: non-interactive update requires --yes");
+    process.exit(1);
+  }
+  const staging = join(os.tmpdir(), `aih-update-${latest.replace(/\./g, "-")}`);
+  process.stdout.write(`downloading aih-${latest}-node.tar.gz → ${staging} …\n`);
+  const { bytes } = await downloadTarball(latest, staging);
+  process.stdout.write(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MiB — applying…\n`);
+  try {
+    await applyUpdate(join(staging, tarballName(latest)), latest);
+  } catch (e) {
+    console.error(`update failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  console.log(`✓ updated to v${latest} — restart AIH to use it`);
+}
+
 async function cmdWorkflow(
   positionals: string[],
   flags: Record<string, string | boolean>,
@@ -1846,6 +1930,60 @@ async function cmdWorkflow(
   }
   console.error(`error: unknown workflow subcommand "${sub}" (list|run)`);
   process.exit(1);
+}
+
+/**
+ * /update (TUI) — opencode upgrade parity: check → confirm → download (to
+ * local staging FIRST) → apply (atomic swap) → restart hint. `skip` is
+ * remembered per version; a newer release re-triggers the nudge.
+ */
+async function handleUpdate(tui: Tui, arg: string, busy: boolean): Promise<void> {
+  if (process.env.AIH_DISABLE_UPDATE_CHECK === "1") {
+    tui.pushSystem("update checks disabled (AIH_DISABLE_UPDATE_CHECK=1)");
+    return;
+  }
+  if (busy) {
+    tui.pushSystem("finish the current turn before /update");
+    return;
+  }
+  const explicit = arg.replace(/^v/, ""); // "/update 0.9.0"
+  tui.pushSystem(`checking for updates… (current ${VERSION})`);
+  const latest = explicit || (await checkLatestVersion());
+  if (!latest) {
+    tui.pushSystem("could not reach the GitHub release API — try again later");
+    return;
+  }
+  if (!explicit && compareVersions(latest, VERSION) <= 0) {
+    tui.pushSystem(`already up to date (v${VERSION})`);
+    return;
+  }
+  const installable = detectInstallDir() !== null;
+  const ans = await tui.askConfirm(
+    `v${latest} is available (current v${VERSION}) — download & update now?`,
+    installable ? "install dir" : "show install command",
+  );
+  if (ans === "deny") {
+    markSkipped(latest);
+    tui.pushSystem(`skipped v${latest} — /update again to install, or it will nudge only for newer releases`);
+    return;
+  }
+  if (!installable) {
+    tui.pushSystem(
+      "this AIH is not a tarball install — update manually:\n" +
+        `  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latest)}`,
+    );
+    return;
+  }
+  const staging = join(os.tmpdir(), `aih-update-${latest.replace(/\./g, "-")}`);
+  try {
+    tui.pushSystem(`downloading aih-${latest}-node.tar.gz → ${staging} …`);
+    const { bytes } = await downloadTarball(latest, staging);
+    tui.pushSystem(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MiB — applying…`);
+    await applyUpdate(join(staging, tarballName(latest)), latest);
+    tui.pushSystem(`✓ updated to v${latest} — restart AIH to use it (exit & relaunch)`);
+  } catch (e) {
+    tui.pushSystem(`update failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 async function cmdChat(flags: Record<string, string | boolean>) {
@@ -2180,8 +2318,19 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       { name: "exit", hint: "quit aih (busy turn is cancelled first)", run: () => handleLine("exit") },
     ];
     const entries = commands.map((c) => ({ label: c.name, hint: c.hint }));
-    const outcome = await tui.pick("Commands", entries);
-    if (outcome.kind === "select") await commands[outcome.index].run();
+    // keepOnSelect + loop (opencode DialogProvider parity, one level deeper):
+    // selecting a command runs it; the palette stays ON THE STACK underneath so
+    // a sub-picker (switch model, connect) opens on top with a breadcrumb and
+    // Esc there pops BACK to the still-open palette. A finished sub-flow pops
+    // the frame itself (askQuestion/dismissTop) → loop ends. Esc on the bare
+    // palette resolves "cancel" → close. Previously Esc anywhere killed the
+    // whole chain and the user had to Esc-out and re-open ctrl-p.
+    for (;;) {
+      const outcome = await tui.pick("Commands", entries, { keepOnSelect: true });
+      if (outcome.kind !== "select") break; // Esc/ctrl-c on the palette itself
+      await commands[outcome.index].run();
+      if (!tui.isTop("Commands")) break; // sub-flow consumed the palette frame
+    }
   }
 
   /** Open the model picker overlay listing every configured provider/model. */
@@ -2237,6 +2386,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       `switched model to ${entry.provider}/${entry.model} (context window ${resolveContextWindow(flags)})`,
       "model",
     );
+    // Sub-flow finished → pop the kept palette frame (openPalette loop ends).
+    tui.dismissTop();
   }
 
   /**
@@ -2287,10 +2438,40 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         if (!baseUrl) return;
         const model = (await tui.askQuestion("model id (e.g. gpt-4o-mini)")).trim();
         if (!model) return;
-        const keyEnv = (await tui.askQuestion("env var name for the API key (e.g. MY_API_KEY)")).trim()
-          || "CUSTOM_API_KEY";
+        // GUARD: this prompt wants an env VAR NAME (e.g. MY_API_KEY) — pasting
+        // the key VALUE here was observed in the wild (an sk-… key landed in
+        // aih.json's apiKeyEnv and the real key was never stored). Definition:
+        // a value that can't be a var name is treated as the key itself and
+        // goes through the key prompt below instead.
+        const keyEnvRaw = (await tui.askQuestion(
+          "ENV VAR NAME for the API key (e.g. MY_API_KEY) — not the key itself; Enter = CUSTOM_API_KEY",
+        )).trim() || "CUSTOM_API_KEY";
+        let keyEnv = keyEnvRaw;
+        let keyFromNamePrompt: string | null = null;
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv)) {
+          keyFromNamePrompt = keyEnvRaw;
+          keyEnv = "CUSTOM_API_KEY";
+          tui.pushSystem(`"${keyEnvRaw.slice(0, 12)}…" is not an env var name — treating it as the key itself (env var: ${keyEnv})`);
+        }
         const id = (await tui.askQuestion("provider id (lowercase, e.g. my-provider)")).trim()
           || "custom";
+        // ASK THE KEY (the catalog path does this; the custom path never did —
+        // the key existed only in the user's clipboard and the provider could
+        // not authenticate).
+        const key = keyFromNamePrompt
+          ?? (await tui.askQuestion(
+            `API key for ${id} (Enter to skip — you'd have to set ${keyEnv} yourself)`,
+          )).trim();
+        let persistedKey = false;
+        if (key) {
+          try {
+            persistEnvKey(keyEnv, key);
+            process.env[keyEnv] = key;
+            persistedKey = true;
+          } catch (err) {
+            tui.pushError(`could not persist key to env file: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         try {
           const path = saveProvider(id, { baseUrl, model, apiKeyEnv: keyEnv });
           tui.pushSystem(`saved provider "${id}" → ${path}`, "auth");
@@ -2300,7 +2481,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         }
         try {
           await applyModel(id, model);
-          tui.pushSystem(`connected: ${id}/${model} — set ${keyEnv}=<key> (or /connect to add it)`, "auth");
+          tui.pushSystem(
+            `connected: ${id}/${model} — key ${persistedKey ? `stored in ${envFilePath()}` : `NOT set — set ${keyEnv}=<key>`}`,
+            "auth",
+          );
         } catch (err) {
           tui.pushError(err instanceof Error ? err.message : String(err));
         }
@@ -2352,6 +2536,8 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     try {
       await applyModel(provider.id, provider.defaultModel);
       tui.pushSystem(`connected to ${provider.name} — model ${provider.defaultModel}`, "auth");
+      // Sub-flow finished → pop the kept palette frame (openPalette loop ends).
+      tui.dismissTop();
     } catch (err) {
       tui.pushError(err instanceof Error ? err.message : String(err));
     }
@@ -2418,6 +2604,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       "/models",
       "/usage",
       "/compact",
+      "/update",
       "/checkpoint",
       "/restore",
       "/fork",
@@ -2683,6 +2870,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   });
   tui.pushSystem(`app intelligence harness · v${VERSION}\n`);
   tui.pushSystem(`type a message · /commands · ctrl-p palette`);
+  // Self-update nudge (opencode parity): background check, silent on failure,
+  // skipped versions are remembered; only a strictly newer release re-nudges.
+  if (process.env.AIH_DISABLE_UPDATE_CHECK !== "1" && detectInstallDir() !== null) {
+    void checkLatestVersion().then((latest) => {
+      if (!latest || compareVersions(latest, VERSION) <= 0) return;
+      if (!shouldPrompt(readState(), latest)) return;
+      tui.pushSystem(`✨ v${latest} available — /update to upgrade now (current v${VERSION})`);
+    });
+  }
   if (sessionPath && log.all().length) {
     const events = log.all();
     tui.pushSystem(`resumed session ${sessionPath} (${events.length} events)`);
@@ -3798,6 +3994,10 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     if (input.startsWith("/inject ")) {
       loop.inject(input.slice("/inject ".length));
       tui.pushSystem("context injected; lands on next turn");
+      return;
+    }
+    if (input === "/update" || input.startsWith("/update ")) {
+      void handleUpdate(tui, input === "/update" ? "" : input.slice("/update ".length).trim(), busy);
       return;
     }
     if (input === "/compact" || input.startsWith("/compact ")) {
@@ -5867,6 +6067,8 @@ async function main() {
       return cmdAgents();
     case "init":
       return cmdInit(positionals, flags);
+    case "update":
+      return cmdUpdate(positionals, flags);
     case "workflow":
       return cmdWorkflow(positionals, flags);
     case "experiment":

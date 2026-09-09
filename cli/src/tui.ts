@@ -128,6 +128,32 @@ export type PickerOutcome =
   | { kind: "select"; index: number }
   | { kind: "cancel" };
 
+/**
+ * One level of the modal overlay stack (opencode DialogProvider parity):
+ * pickers nest (palette → model picker), the top frame is active, Esc pops
+ * back to the parent, and `breadcrumb` renders the parent's title so the
+ * user always sees where they are and that Esc goes back.
+ */
+export interface OverlayFrame {
+  title: string;
+  /** parent dialog's title — rendered as "parent › title" breadcrumb */
+  breadcrumb?: string;
+  entries: PickerEntry[];
+  filtered: number[];
+  query: string;
+  sel: number;
+  /** true = read-only help dialog (no filtering, Enter just closes) */
+  help?: boolean;
+  /**
+   * Keep this frame on the stack after a SELECT (the promise still resolves):
+   * the caller runs a sub-flow (e.g. a child picker) on top, and the user's
+   * Esc in the child pops back HERE instead of out to the composer. The
+   * caller dismisses the frame with dismissTop() when the sub-flow ends.
+   */
+  keepOnSelect?: boolean;
+  resolve: (outcome: PickerOutcome) => void;
+}
+
 const CSI = "\x1b[";
 const HIDE = `${CSI}?25l`;
 const SHOW = `${CSI}?25h`;
@@ -594,16 +620,18 @@ export class Tui {
   #qbuf = "";
   #queue: string[] = [];
   #pendingExit = false;
-  #overlay: {
-    title: string;
-    entries: PickerEntry[];
-    filtered: number[];
-    query: string;
-    sel: number;
-    /** true = read-only help dialog (no filtering, Enter just closes) */
-    help?: boolean;
-    resolve: (outcome: PickerOutcome) => void;
-  } | null = null;
+  /**
+   * Modal overlay STACK (opencode DialogProvider parity): pickers can be
+   * nested (palette → model picker → provider connect). The TOP of the stack
+   * is the active dialog; Esc pops ONE level (back to the parent) instead of
+   * killing the whole chain, and each level renders its parent title as a
+   * breadcrumb so the user always sees where they are and that Esc goes back.
+   */
+  #overlayStack: OverlayFrame[] = [];
+  /** Active (top) overlay — null when the stack is empty. */
+  #ov(): OverlayFrame | null {
+    return this.#overlayStack[this.#overlayStack.length - 1] ?? null;
+  }
   /** Theme: derived from the terminal background (OSC 11), forced via AIH_THEME. */
   #dark = true;
   /** P2#9 — /vivid: concise (plain) render mode — no borders/surface/panel/chrome. */
@@ -650,8 +678,14 @@ constructor(opts: TuiOptions) {
   /** All rendered transcript lines (test/text-replay hook). */
   transcriptLines(): string[] {
     const body: string[] = [];
+    let first = true;
     for (const u of this.#units()) {
       const lines = u.kind === "item" ? this.#block(u.item) : this.#groupLines(u);
+      // opencode-style block spacing: a 1-line gap above every block after the
+      // first so consecutive messages (user answers, system rows, tool calls,
+      // assistant replies) never visually glue to the preceding block.
+      if (!first && lines.length) body.push("");
+      first = false;
       for (const r of lines) body.push(r);    }
     return body;
   }
@@ -1074,6 +1108,14 @@ constructor(opts: TuiOptions) {
   }
 
   askQuestion(question: string): Promise<string> {
+    // A text prompt cannot coexist with a modal overlay (the overlay would
+    // swallow every keystroke) — e.g. the /connect flow asks for a base URL
+    // right after the provider picker. Close the whole picker chain as
+    // cancelled; the caller's flow continues.
+    while (this.#overlayStack.length) {
+      const top = this.#overlayStack.pop()!;
+      top.resolve({ kind: "cancel" });
+    }
     this.pushSystem(`❓ ${question}`);
     this.#qbuf = "";
     this.requestPaint();
@@ -1097,19 +1139,46 @@ constructor(opts: TuiOptions) {
 
   /** True while a modal overlay picker is open. */
   overlayOpen(): boolean {
-    return this.#overlay !== null;
+    return this.#ov() !== null;
+  }
+
+  /**
+   * Test hook: the active overlay's identity (title + parent breadcrumb).
+   * The overlay box is painted as an overlay in #paint (not part of the
+   * transcript body), so a test can't read it via transcriptLines() — this
+   * exposes the state the breadcrumb rendering consumes.
+   */
+  overlayTitle(): { title: string; breadcrumb?: string } | null {
+    const ov = this.#ov();
+    if (!ov) return null;
+    return { title: ov.title, ...(ov.breadcrumb ? { breadcrumb: ov.breadcrumb } : {}) };
   }
 
   /**
    * Open a modal fuzzy-filter picker overlay (ctrl-p palette / model switcher).
    * Resolves with the chosen entry index, or "cancel" on Esc/ctrl-c.
    */
-  pick(title: string, entries: PickerEntry[]): Promise<PickerOutcome> {
-    if (this.#overlay) {
-      return Promise.resolve({ kind: "cancel" });
-    }
-    this.#overlay = {
+  /**
+   * Open a modal fuzzy-filter picker overlay (ctrl-p palette / model switcher).
+   * Resolves with the chosen entry index, or "cancel" on Esc/ctrl-c.
+   *
+   * `keepOnSelect`: the frame stays on the stack after a SELECT (the promise
+   * still resolves) so the caller can run a sub-flow — a child picker — on top
+   * of it; the user's Esc in the child pops back HERE. Dismiss with
+   * dismissTop() when the sub-flow ends.
+   */
+  pick(
+    title: string,
+    entries: PickerEntry[],
+    opts?: { keepOnSelect?: boolean },
+  ): Promise<PickerOutcome> {
+    // Stack (opencode DialogProvider parity): a picker opened on top of an
+    // existing one (palette → model picker) nests — the parent stays alive
+    // underneath and Esc pops back to it.
+    const parent = this.#ov();
+    this.#overlayStack.push({
       title,
+      ...(parent ? { breadcrumb: parent.title } : {}),
       entries,
       filtered: entries.map((_, i) => i),
       query: "",
@@ -1117,24 +1186,52 @@ constructor(opts: TuiOptions) {
         0,
         entries.findIndex((e) => e.active),
       ),
+      ...(opts?.keepOnSelect ? { keepOnSelect: true } : {}),
       resolve: () => {},
-    };
+    });
     this.requestPaint();
     return new Promise((resolve) => {
-      this.#overlay!.resolve = resolve;
+      this.#ov()!.resolve = resolve;
     });
   }
 
   #closeOverlay(outcome: PickerOutcome): void {
-    const ov = this.#overlay;
+    const ov = this.#ov();
     if (!ov) return;
-    this.#overlay = null;
+    // keepOnSelect: the frame stays for a sub-flow (child picker) to open on
+    // top; the caller dismisses it with dismissTop() once that sub-flow ends.
+    if (!(ov.keepOnSelect && outcome.kind === "select")) this.#overlayStack.pop();
     ov.resolve(outcome);
     this.requestPaint();
   }
 
+  /**
+   * True when the top frame is the given title — i.e. the caller's sub-flow
+   * did NOT leave a child on top (it was abandoned via Esc, or never opened
+   * one). openPalette uses this to decide whether to loop back to the
+   * palette (user Esc'd out of the sub-picker — pick again) or to dismiss it
+   * (sub-flow finished — close the palette).
+   */
+  isTop(title: string): boolean {
+    const ov = this.#ov();
+    return ov !== null && ov.title === title;
+  }
+
+  /**
+   * Pop the top frame after a keepOnSelect sub-flow finished. Resolving an
+   * already-resolved promise is a no-op, so this is safe to call from the
+   * caller's finally path.
+   */
+  dismissTop(): void {
+    const ov = this.#ov();
+    if (!ov) return;
+    this.#overlayStack.pop();
+    ov.resolve({ kind: "cancel" });
+    this.requestPaint();
+  }
+
   #applyOverlayFilter(): void {
-    const ov = this.#overlay!;
+    const ov = this.#ov()!;
     if (ov.help) {
       // read-only dialog: no filtering, selection stays at the top
       ov.filtered = ov.entries.map((_, i) => i);
@@ -1208,8 +1305,8 @@ constructor(opts: TuiOptions) {
 
   /** Open the read-only help dialog (keybindings / states / commands). */
   openHelp(): void {
-    if (this.#overlay) return;
-    this.#overlay = {
+    if (this.#ov()) return;
+    this.#overlayStack.push({
       title: "help",
       entries: [{ label: "help" }],
       filtered: [0],
@@ -1217,19 +1314,19 @@ constructor(opts: TuiOptions) {
       sel: 0,
       help: true,
       resolve: () => {},
-    };
+    });
     this.requestPaint();
   }
 
   #overlayMove(delta: number): void {
-    const ov = this.#overlay!;
+    const ov = this.#ov()!;
     if (!ov.filtered.length) return;
     ov.sel = Math.min(ov.filtered.length - 1, Math.max(0, ov.sel + delta));
     this.requestPaint();
   }
 
   #overlayKey(ch: string): void {
-    const ov = this.#overlay!;
+    const ov = this.#ov()!;
     switch (ch) {
       case "\x1b": // bare Esc (raw mode delivers it as a lone byte here)
       case "\x03":
@@ -1351,8 +1448,8 @@ constructor(opts: TuiOptions) {
     }
     if (!t) return;
     if (this.#confirm) return; // a paste must never answer y/a/n
-    if (this.#overlay) {
-      this.#overlay.query += t;
+    if (this.#ov()) {
+      this.#ov()!.query += t;
       this.#applyOverlayFilter();
       this.requestPaint();
       return;
@@ -1385,7 +1482,7 @@ constructor(opts: TuiOptions) {
     // (default ctrl-p) and help-byte (default ?) both live here. Overlay /
     // question / confirm states take precedence so a remap never hijacks a
     // modal prompt's own keys.
-    if (!this.#overlay && !this.#question && !this.#confirm) {
+    if (!this.#ov() && !this.#question && !this.#confirm) {
       const action = this.#keybinds[ch];
       if (action === "palette") {
         this.#opts.onPalette?.();
@@ -1403,7 +1500,7 @@ constructor(opts: TuiOptions) {
         }
       }
     }
-    if (this.#overlay) {
+    if (this.#ov()) {
       if (ch === "\x1b" || this.#held) {
         this.#overlaySeq(ch);
         return;
@@ -1901,7 +1998,7 @@ constructor(opts: TuiOptions) {
   }
 
   #clickAt(row: number): void {
-    if (this.#overlay) return; // modal is open: never toggle transcript items beneath it
+    if (this.#ov()) return; // modal is open: never toggle transcript items beneath it
     if (!this.#bodyUnitIdx.length) return;
     const view = this.#viewHeight();
     if (row < 1 || row > view) return;
@@ -1933,7 +2030,7 @@ constructor(opts: TuiOptions) {
    * Falls back to the LAST collapsible unit when nothing is focused.
    */
   #toggleFocus(): void {
-    if (this.#overlay || this.#question || this.#confirm) return;
+    if (this.#ov() || this.#question || this.#confirm) return;
     const units = this.#units();
     if (!units.length) return;
     let i = this.#focusUnit;
@@ -2043,8 +2140,12 @@ constructor(opts: TuiOptions) {
 
   #contentLines(): number {
     let n = 0;
+    let first = true;
     for (const u of this.#units()) {
-      n += u.kind === "item" ? this.#block(u.item).length : this.#groupLines(u).length;
+      const len = u.kind === "item" ? this.#block(u.item).length : this.#groupLines(u).length;
+      if (!first && len > 0) n += 1; // block gap
+      first = false;
+      n += len;
     }
     return n;
   }
@@ -2528,14 +2629,10 @@ constructor(opts: TuiOptions) {
     const limit = Math.max(1, this.#bodyCols() - 4);
     if (item.role === "assistant") {
       const lines = this.#markdown(item.text, limit);
-      // opencode-style block spacing: a 1-line gap above each message block
-      // (except the very first item) makes consecutive turns visually
-      // separate — on Windows the small line-height made them look glued.
-      const first = this.#items[0] === item;
-      const row = (s: string): string => `   ${s}`;
-      const out = lines.map(row);
-      if (!first && lines.length) out.unshift("");
-      return out;
+      // Block spacing (the 1-line gap above this block) is applied uniformly
+      // in transcriptLines() for every block after the first — no per-role
+      // unshift here, which would double-space assistant rows.
+      return lines.map((s) => `   ${s}`);
     }
     // Banner (ASCII-art logo) is pre-laid-out: whitespace is significant,
     // so it bypasses #wrap's word-join (which folds runs of spaces into one)
@@ -2578,6 +2675,19 @@ constructor(opts: TuiOptions) {
         const rows = this.#toolRow(item);
         const t = item.tool;
         const bc = this.#bodyCols(); // keep 1-cell right margin like #toolRow
+        // Visual block: a dim separator between the header (blue name +
+        // gray args) and the content area (output / diff / error / todos).
+        // No border, no background — just a thin rule that groups the
+        // content visually under its tool name.
+        const hasContent = !!(t && (
+          (t.ok === false && t.error) ||
+          (typeof t.output === "string" && t.output.trim()) ||
+          (t.ok && t.diff && t.diff.length) ||
+          (t.ok && t.todos && t.todos.length)
+        ));
+        if (hasContent) {
+          rows.push(this.#clip(dim(`   ${"─".repeat(Math.max(1, bc - 4))}`), bc - 1));
+        }
         if (t && t.ok === false && t.error) {
           for (const line of this.#wrap(t.error, bc - 1)) rows.push(this.#clip(`   ${red(line)}`, bc - 1));
         }
@@ -3031,7 +3141,7 @@ constructor(opts: TuiOptions) {
   }
 
   #paletteBox(leftW: number): { lines: string[]; width: number } {
-    const ov = this.#overlay!;
+    const ov = this.#ov()!;
     // W is the total display width including both border columns; every row is
     // clipped/padded to exactly W so left/right borders always line up.
     const W = Math.max(40, Math.min(64, leftW - 4));
@@ -3069,7 +3179,12 @@ constructor(opts: TuiOptions) {
       return { lines: box, width: W };
     }
     box.push(cyan(`╭─${"─".repeat(W - 3)}╮`));
-    const titleInner = ` ${bold(ov.title)}`;
+    // Breadcrumb (opencode dialog nesting): when this picker sits on top of a
+    // parent (palette → model), show "parent › title" so the user sees both
+    // that Esc goes BACK to the parent and where they are in the chain.
+    const titleInner = ov.breadcrumb
+      ? ` ${dim(ov.breadcrumb)} ${dim("›")} ${bold(ov.title)}`
+      : ` ${bold(ov.title)}`;
     box.push(
       `${cyan("│")}${titleInner}${" ".repeat(Math.max(1, W - 2 - cols(titleInner)))}${cyan("│")}`,
     );
@@ -3100,7 +3215,10 @@ constructor(opts: TuiOptions) {
         box.push(`${cyan("│")} ${cl}${" ".repeat(Math.max(1, W - 4 - cols(cl)))}${cyan("│")}`);
       }
     }
-    const footer = dim("↑↓ select · enter confirm · esc close · type to filter");
+    // Footer: Esc semantics depend on nesting — with a parent underneath it's
+    // "back" (pops this level), at the top it's "close".
+    const escHint = ov.breadcrumb ? "esc back" : "esc close";
+    const footer = dim(`↑↓ select · enter confirm · ${escHint} · type to filter`);
     box.push(cyan(`├─${"─".repeat(W - 3)}┤`));
     const fcl = this.#clip(footer, W - 4);
     box.push(`${cyan("│")} ${fcl}${" ".repeat(Math.max(1, W - 4 - cols(fcl)))}${cyan("│")}`);
@@ -3124,8 +3242,16 @@ constructor(opts: TuiOptions) {
     const units = this.#units();
     const body: string[] = [];
     this.#bodyUnitIdx = [];
+    let first = true;
     units.forEach((u, ui) => {
       const lines = u.kind === "item" ? this.#block(u.item) : this.#groupLines(u);
+      // Block gap (see transcriptLines): map the spacer row to the PREVIOUS
+      // unit so a click on it lands on the preceding block, never a dead row.
+      if (!first && lines.length) {
+        body.push("");
+        this.#bodyUnitIdx.push(ui - 1);
+      }
+      first = false;
       for (const r of lines) {
         body.push(r);
         this.#bodyUnitIdx.push(ui);
@@ -3163,7 +3289,7 @@ constructor(opts: TuiOptions) {
       rows.push(row(clipped));
     }
 
-    if (this.#overlay) {
+    if (this.#ov()) {
       // centered modal: horizontally centered over the full window width,
       // vertically over the body area; right panel border stays put.
       const { lines: box, width: bw } = this.#paletteBox(leftW);

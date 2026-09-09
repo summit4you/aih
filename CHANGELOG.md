@@ -9,6 +9,16 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **自动更新（opencode `upgrade` parity）**（`cli/src/update.ts`）：
+  检查 GitHub `releases/latest` → 与已装版本比较 → 有新版本时 TUI 顶部提示
+  `✨ vN available — /update`（后台检查、失败静默、跳过版本被记住，只有更新的
+  release 才再提醒，opencode `skipped_version` 语义）。`/update`（TUI）与
+  `aih update [version]`（CLI）：先**下载到本地 staging**（`/tmp/aih-update-*`）再
+  应用——解压、`aih --version` 验证、原子 swap（旧安装在新安装被证明可用前绝不删除）。
+  只自动更新 tarball 安装布局（`<dir>/app/aih`）；dev checkout / npm 安装则打印
+  官方安装命令（opencode `method=unknown` 语义）。`--check` 只报告、`--yes` 跳过确认
+  （非 TTY 安全）。`AIH_DISABLE_UPDATE_CHECK=1` 关闭检查。smoke 覆盖版本比较、
+  tarball 命名、skip-state 语义、install-dir 探测。
 - **anti-amnesia：确定性 worktree 快照折叠进摘要**（`cli/src/compaction.ts`）：
   compact 时把确定性产物（git HEAD/worktree 状态、关键文件哈希、文件清单）折叠为
   幂等摘要片段，跨 compact 保持一致，agent 恢复时无需重读即可对齐真实工作区状态。
@@ -30,6 +40,20 @@ the versions listed here (`scripts/package` derives the version from
   kind。映射表导出 `SYS_KIND_SGR` 供测试/复用。**工具行同步对齐**：`#toolRow` 与
   折叠组头（原青色 `accent`）的工具名统一改 `38;5;75` 蓝（与 qwen tool 行同色），
   失败仍红、参数仍 muted 灰。
+- **overlay 栈（opencode DialogProvider parity）**（`cli/src/tui.ts`）：
+  嵌套 picker（ctrl-p 命令面板 → 模型选择 → provider 连接）从"单槽、Esc 全关"
+  改为**栈**——Esc 只弹出一级回到父级（不再需要二次 Esc 重进）；子级标题栏渲染
+  `父级 › 当前` 面包屑、footer 提示 `esc back`（顶层仍 `esc close`）；
+  `askQuestion` 打开前自动把整个 picker 链 cancel 掉（文本输入与 modal 互斥）。
+  新增 `OverlayFrame` 导出类型 + `overlayTitle()` 测试钩子；smoke 覆盖嵌套/弹栈/面包屑全链路。
+- **工具内容视觉分隔线**（`cli/src/tui.ts`）：有内容的工具行（output / diff / error /
+  todos）在 header（蓝名 + 灰参）与内容区之间插入一条 `dim` 的 `───` 细线，形成
+  header → 分隔 → 内容 三段式视觉块感；无内容的纯参数行不受影响。不加边框、不加
+  背景，保持轻量方案。
+- **消息块间距统一**（`cli/src/tui.ts`）：`transcriptLines()` / `#paint()` /
+  `#contentLines()` 三处统一在每两个消息块之间插入 1 行空行（首个块除外），
+  消除 user / system / tool / assistant 各 role 紧贴上一条消息的"粘连"观感。
+  原先仅 assistant 有间距，现所有 role 一致。
 
 ### Fixed
 - **diff 行换行而非截断**（`cli/src/tui.ts`）：diff 内容在宽度受限时按行 wrap 输出，

@@ -51,6 +51,26 @@ npm test            # smoke tests (core / mcp / cli)
 npm run eval        # full handoff gate (doctor + bootstrap + check + test)
 ```
 
+## Updating
+
+AIH checks the [GitHub releases](https://github.com/summit4you/aih/releases) page in the
+background at startup (silent on failure, never blocks). When a newer release exists the
+TUI shows a nudge: `✨ vN available — /update to upgrade now`.
+
+```sh
+/update              # in the TUI: check → confirm → download to local staging → apply
+/update 0.9.0        # pin a specific version
+aih update --check   # report current vs latest only
+aih update --yes     # non-interactive (skips the confirm prompt)
+```
+
+The update is downloaded to a local staging dir **first**, extracted, verified
+(`aih --version`), and only then swapped in atomically — the previous install is never
+removed before the new one is proven good. Skipping a version is remembered (per version;
+a newer release re-triggers the nudge). In-place update applies to the tarball install
+layout (`~/.local/share/aih/app`); source checkouts and npm installs print the official
+install command instead. Disable all of it with `AIH_DISABLE_UPDATE_CHECK=1`.
+
 ```sh
 # Run aih directly to enter the interactive terminal (opencode-style TUI, needs TTY)
 aih

@@ -651,6 +651,39 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     console.log("ok: CC slash-recognition — pasted '// code' is a message, only known heads are commands");
   }
 
+  // Self-update (opencode upgrade parity) — pure logic: version compare,
+  // tarball naming, skip-state semantics, install-dir detection.
+  {
+    const u = await import("./update.js");
+    assert(u.compareVersions("0.8.0", "0.8.0") === 0, "compareVersions: equal");
+    assert(u.compareVersions("0.9.0", "0.8.0") > 0, "compareVersions: 0.9.0 > 0.8.0");
+    assert(u.compareVersions("0.8.1", "0.9.0") < 0, "compareVersions: 0.8.1 < 0.9.0");
+    assert(u.compareVersions("1.0.0", "0.99.9") > 0, "compareVersions: major beats minor");
+    assert(u.compareVersions("v0.8.0", "0.8.0") === 0, "compareVersions: leading v ignored");
+    assert(u.tarballName("0.8.0") === "aih-0.8.0-node.tar.gz", "tarballName convention");
+    assert(u.tarballName("v0.9.1") === "aih-0.9.1-node.tar.gz", "tarballName strips v");
+    assert(u.tarballUrl("0.8.0").includes("/releases/download/v0.8.0/aih-0.8.0-node.tar.gz"), "tarballUrl shape");
+    // skip-state: skipped version is not re-nudged; a NEWER one is.
+    assert(u.shouldPrompt({}, "0.9.0") === true, "no state → prompt");
+    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, "0.9.0") === false, "skipped same version → silent");
+    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, "0.8.5") === false, "skipped newer than candidate → silent");
+    assert(u.shouldPrompt({ skippedVersion: "0.8.5" }, "0.9.0") === true, "candidate newer than skipped → prompt again");
+    // state round-trip via AIH_UPDATE_STATE_PATH
+    const stateFile = join(process.cwd(), `.smoke-update-state-${Date.now()}.json`);
+    process.env.AIH_UPDATE_STATE_PATH = stateFile;
+    u.markSkipped("0.9.0");
+    assert(u.readState().skippedVersion === "0.9.0", "markSkipped persists");
+    u.markSkipped("0.8.0"); // older — must not downgrade the remembered skip
+    assert(u.readState().skippedVersion === "0.9.0", "markSkipped never downgrades");
+    rmSync(stateFile, { force: true });
+    delete process.env.AIH_UPDATE_STATE_PATH;
+    // install-dir detection: only the tarball layout (<dir>/app/aih) qualifies
+    assert(u.detectInstallDir("/home/u/.local/share/aih/app/aih") === null, "detectInstallDir: missing layout → null");
+    assert(u.detectInstallDir("/home/u/aih") === null, "detectInstallDir: not under app/ → null");
+    assert(u.detectInstallDir("/home/u/bin/aih") === null, "detectInstallDir: bin/aih is not the app dir → null");
+    console.log("ok: self-update — version compare, tarball naming, skip-state, install-dir detection");
+  }
+
   // CC#59 — credential scope: sensitive headers ride only to the provider's
   // own host. A host override (proxy / mirror / typo'd endpoint) must drop
   // authorization-class headers while keeping innocuous ones.
@@ -4469,6 +4502,88 @@ await srv.connect(new StdioServerTransport());
     // non-TTY: paint is a pass-through — names render plain, no SGR.
     assert(toolLines.some((l) => l.includes("run_cmd")), "Q-R7: tool name rendered (plain in non-TTY)");
     assert(toolLines.some((l) => l.includes("run_cmd failed")), "Q-R7: failed tool name rendered (plain in non-TTY)");
+  }
+
+  // Q-R7 — overlay STACK (opencode DialogProvider parity): a picker opened on
+  // top of another nests; Esc pops ONE level (back to the parent) instead of
+  // killing the chain; the child renders a "parent › title" breadcrumb and an
+  // "esc back" footer hint.
+  {
+    const { Tui } = await import("./tui.js");
+    const nav = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+    const parent = nav.pick("Commands", [
+      { label: "switch model", hint: "change provider/model" },
+      { label: "compact context", hint: "/compact" },
+    ]);
+    const child = nav.pick("Switch model", [
+      { label: "p/m1", active: true },
+      { label: "p/m2" },
+    ]);
+    assert(nav.overlayOpen(), "Q-R7: nested overlay open");
+    const childOv = nav.overlayTitle();
+    assert(childOv?.title === "Switch model" && childOv?.breadcrumb === "Commands", "Q-R7: child carries 'parent › title' breadcrumb state");
+    // Double-Esc pops the child → parent picker resolves cancelled, parent is back on top.
+    nav.feed("\x1b\x1b");
+    await new Promise((r) => setTimeout(r, 20));
+    assert((await child).kind === "cancel", "Q-R7: Esc pops the child (cancel)");
+    assert(nav.overlayOpen(), "Q-R7: parent picker still open after child Esc");
+    const parentOv = nav.overlayTitle();
+    assert(parentOv?.title === "Commands" && !parentOv?.breadcrumb, "Q-R7: back at parent (no breadcrumb)");
+    // Double-Esc again closes the parent.
+    nav.feed("\x1b\x1b");
+    await new Promise((r) => setTimeout(r, 20));
+    assert((await parent).kind === "cancel", "Q-R7: second Esc closes the parent");
+    assert(!nav.overlayOpen(), "Q-R7: stack empty after both Escs");
+  }
+  // Q-R7 — keepOnSelect (the real ctrl-p flow): palette SELECT leaves the
+  // palette on the stack; the child picker opens on top; Esc in the child
+  // pops back to the palette (still open, no breadcrumb); Esc again exits.
+  {
+    const { Tui } = await import("./tui.js");
+    const pal = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+    const paletteP = pal.pick("Commands", [
+      { label: "switch model", hint: "change provider/model" },
+      { label: "compact context", hint: "/compact" },
+    ], { keepOnSelect: true });
+    // select "switch model" (index 0): Enter on the first row
+    pal.feed("\r");
+    const sel = (await Promise.race([
+      paletteP,
+      new Promise<{ kind: string }>((r) => setTimeout(() => r({ kind: "timeout" }), 400)),
+    ])) as { kind: string; index?: number };
+    assert(sel.kind === "select" && sel.index === 0, "Q-R7: palette select resolves");
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7: palette stays on stack after keepOnSelect select");
+    // caller opens the child sub-picker on top
+    const childP = pal.pick("Switch model", [{ label: "p/m1" }, { label: "p/m2" }]);
+    assert(pal.overlayTitle()?.breadcrumb === "Commands", "Q-R7: child on top of kept palette has breadcrumb");
+    // Esc in the child → back to the palette, NOT out to the composer
+    pal.feed("\x1b\x1b");
+    await new Promise((r) => setTimeout(r, 20));
+    assert((await childP).kind === "cancel", "Q-R7: child Esc cancels child");
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7: back AT the palette (kept), not out");
+    // user can now pick again in the palette (selection row still at 0)
+    pal.feed("\r");
+    await new Promise((r) => setTimeout(r, 20));
+    assert(pal.overlayOpen() && pal.isTop("Commands"), "Q-R7: palette re-selectable after child Esc (frame kept)");
+    // caller (openPalette) dismisses the kept frame once the sub-flow ends
+    pal.dismissTop();
+    assert(!pal.overlayOpen(), "Q-R7: caller dismissTop() closes the kept palette");
   }
 }
 
