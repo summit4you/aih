@@ -8,6 +8,29 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **anti-amnesia：确定性 worktree 快照折叠进摘要**（`cli/src/compaction.ts`）：
+  compact 时把确定性产物（git HEAD/worktree 状态、关键文件哈希、文件清单）折叠为
+  幂等摘要片段，跨 compact 保持一致，agent 恢复时无需重读即可对齐真实工作区状态。
+- **ANSI-Shadow 渐变启动 logo**（`cli/src/index.ts` + `cli/src/ui.ts` + `cli/src/tui.ts`）：
+  手绘（比例失调）logo 替换为标准 figlet **ANSI Shadow** 字模（qwen-code /
+  MiMo-Code 启动 logo 同款字体），A 顶部保留前导空格呈收窄居中形态；`gradientText()`
+  零依赖 24-bit RGB 逐字符渐变（cyan → blue → magenta），TTY 才输出 SGR、非 TTY
+  透传（SGR 隔离不破坏）。banner 行绕过 `#wrap` 的空格折叠——ascii art 空格有语义，
+  `#wrap` 的 `split(/\s+/)` 会把多空格折成单空格导致字形错乱，现逐行原样输出仅 clip
+  超宽。smoke 断言同步更新。
+- **TUI 侧栏布局精修**（`cli/src/tui.ts`）：sidebar 42 → 34 列（右侧面板过宽），
+  CONTEXT 用量进度条延伸到面板右缘（保持对称边距），恢复输入框/用户消息 `┃` 边框 +
+  所有消息族右边距离开侧栏；面板对称边距 + diff 右缘对齐。
+
+### Fixed
+- **diff 行换行而非截断**（`cli/src/tui.ts`）：diff 内容在宽度受限时按行 wrap 输出，
+  不再把超宽行截断丢信息（opencode/mimo-code parity）。
+- **Windows temp 目录授权只粘一次**（`cli/src/gate.ts`）：大小写/分隔符不敏感的路径
+  匹配，临时目录授权一次后永久生效，不再每次重复弹确认。
+- **MCP badge 计数错误**（`cli/src/tui.ts`）：statusBadge 统计了**全部**工具却标注
+  "MCP"——现在只计数 MCP 后端工具。
+
 ## [0.8.0] - 2026-09-07
 
 ### Added
