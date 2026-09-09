@@ -2638,16 +2638,43 @@ constructor(opts: TuiOptions) {
     const avail = Math.max(8, bodyCols - 2);
     const leftW = Math.max(4, Math.floor(avail / 2));
     const rightW = Math.max(4, avail - leftW);
+    // Long lines WRAP to extra rows instead of clipping (opencode/mimo-code
+    // `diff` wrapMode="char"): the {no} -/+ prefix + line number sits on the
+    // first row, wrapped continuations keep the tinted bg and only the content.
+    // Each pair produces max(wrapsLeft, wrapsRight) rows; the shorter side is
+    // padded with blank tinted rows so left/right stay row-aligned.
     const cell = (bg: string, text: string, w: number): string =>
       `${bg}${this.#clip(text, w)}${RESET}`;
-    const rows = this.#diffPairs(t.diff).map((p) => {
-      const noL = p.del?.a ? String(p.del.a).padStart(gutter - 1) : " ".repeat(gutter - 1);
-      const noR = p.add?.b ? String(p.add.b).padStart(gutter - 1) : " ".repeat(gutter - 1);
-      return (
-        `${cell(p.del ? delBg : surf, `${noL} - ${p.del?.s ?? ""}`, leftW)} ` +
-        `${cell(p.add ? addBg : surf, `${noR} + ${p.add?.s ?? ""}`, rightW)}`
-      );
-    });
+    const wsLimit = (pre: string, w: number): number => Math.max(1, w - cols(pre));
+    const rows: string[] = [];
+    for (const p of this.#diffPairs(t.diff)) {
+      const delLine = p.del ? `${String(p.del.a).padStart(gutter - 1)} - ${p.del.s ?? ""}` : null;
+      const addLine = p.add ? `${String(p.add.b).padStart(gutter - 1)} + ${p.add.s ?? ""}` : null;
+      const delPre = delLine ? delLine.slice(0, gutter - 1 + 3) : "";
+      const addPre = addLine ? addLine.slice(0, gutter - 1 + 3) : "";
+      const delContent = delLine ? delLine.slice(delPre.length) : "";
+      const addContent = addLine ? addLine.slice(addPre.length) : "";
+      const delWpre = delLine ? cols(delPre) : 0;
+      const addWpre = addLine ? cols(addPre) : 0;
+      const delWraps = delLine
+        ? wrapStyled(delContent, wsLimit(delPre, leftW)).map((s, i) =>
+            i === 0 ? delPre + s : " ".repeat(delWpre) + s,
+          )
+        : [""];
+      const addWraps = addLine
+        ? wrapStyled(addContent, wsLimit(addPre, rightW)).map((s, i) =>
+            i === 0 ? addPre + s : " ".repeat(addWpre) + s,
+          )
+        : [""];
+      const n = Math.max(delWraps.length, addWraps.length);
+      const delBgC = p.del ? delBg : surf;
+      const addBgC = p.add ? addBg : surf;
+      for (let k = 0; k < n; k += 1) {
+        const l = p.del ? cell(delBgC, delWraps[k] ?? "", leftW) : cell(delBgC, "", leftW);
+        const r = p.add ? cell(addBgC, addWraps[k] ?? "", rightW) : cell(addBgC, "", rightW);
+        rows.push(`${l} ${r}`);
+      }
+    }
     if (t.truncated) {
       rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols - 1));
     }
@@ -2662,15 +2689,21 @@ constructor(opts: TuiOptions) {
     const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
     const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
     // Single-column, borderless (test: "tool rows carry no background box").
-    // Clip to bodyCols-1 = the input box width (#boxLine = ┃+2pad+content+1m),
-    // so the right edge aligns with the composer.
+    // Long lines WRAP to extra rows instead of clipping.
     const cell = (bg: string, text: string): string => `${bg}${this.#clip(text, bodyCols - 1)}${RESET}`;
-    const rows = t.diff.map((l) => {
+    const rows: string[] = [];
+    for (const l of t.diff) {
       const no = l.t === "del" ? l.a : l.b;
       const mark = l.t === "del" ? "-" : "+";
       const bg = l.t === "del" ? delBg : addBg;
-      return cell(bg, `${typeof no === "number" ? `${no} ` : ""}${mark} ${l.s}`);
-    });
+      const prefix = `${typeof no === "number" ? `${no} ` : ""}${mark} `;
+      const content = `${prefix}${l.s}`;
+      const cw = Math.max(1, bodyCols - 1 - cols(prefix));
+      const wraps = wrapStyled(l.s, cw).map((s, i) =>
+        i === 0 ? content : " ".repeat(cols(prefix)) + s,
+      );
+      for (const w of wraps) rows.push(cell(bg, w));
+    }
     if (t.truncated) {
       rows.push(this.#clip(dim(`… ${t.truncated} more line(s)`), bodyCols - 1));
     }
