@@ -2291,7 +2291,10 @@ constructor(opts: TuiOptions) {
 
   #panelSeg(content: string | undefined, pw: number): string {
     const bg = this.#surface();
-    const s = `  ${this.#clip(content ?? "", Math.max(1, pw - 2))}`;
+    // Symmetric margins: 2 left + (pw-4) content + 2 right = pw total.
+    // (Was pw-2: left=2, right=0 → content hugged the right edge, making the
+    // left margin look larger than the right. Now centered.)
+    const s = `  ${this.#clip(content ?? "", Math.max(1, pw - 4))}  `;
     return bg + s.split(RESET).join(RESET + bg) + RESET;
   }
 
@@ -2628,9 +2631,13 @@ constructor(opts: TuiOptions) {
     let maxNo = 0;
     for (const l of t.diff) maxNo = Math.max(maxNo, l.a ?? 0, l.b ?? 0);
     const gutter = String(Math.min(maxNo, 99999)).length + 1;
-    const half = bodyCols - 2 - 2 * gutter;
-    const leftW = Math.max(4, Math.floor(half / 2));
-    const rightW = Math.max(4, half - leftW);
+    // Diff rows are borderless (test: "tool rows carry no left border").
+    // Right edge must align with the input box: #boxLine(content, bodyCols)
+    // = ┃(1)+2pad+(bodyCols-4) = bodyCols-1 wide. So diff row = bodyCols-1:
+    // leftW+1(space)+rightW = bodyCols-1, i.e. leftW+rightW = bodyCols-2.
+    const avail = Math.max(8, bodyCols - 2);
+    const leftW = Math.max(4, Math.floor(avail / 2));
+    const rightW = Math.max(4, avail - leftW);
     const cell = (bg: string, text: string, w: number): string =>
       `${bg}${this.#clip(text, w)}${RESET}`;
     const rows = this.#diffPairs(t.diff).map((p) => {
@@ -2654,6 +2661,9 @@ constructor(opts: TuiOptions) {
     const bodyCols = this.#bodyCols();
     const delBg = this.#dark ? DEL_BG : DEL_BG_LIGHT;
     const addBg = this.#dark ? ADD_BG : ADD_BG_LIGHT;
+    // Single-column, borderless (test: "tool rows carry no background box").
+    // Clip to bodyCols-1 = the input box width (#boxLine = ┃+2pad+content+1m),
+    // so the right edge aligns with the composer.
     const cell = (bg: string, text: string): string => `${bg}${this.#clip(text, bodyCols - 1)}${RESET}`;
     const rows = t.diff.map((l) => {
       const no = l.t === "del" ? l.a : l.b;
