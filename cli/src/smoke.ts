@@ -4375,6 +4375,41 @@ await srv.connect(new StdioServerTransport());
   assert(tui.transcriptLines().some((l) => l.includes("APPENDED")), "pushDelta after cache invalidates and re-renders");
 }
 
+// --- Banner logo: qwen-code parity gradient rendering + non-TTY fallback ---
+{
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  // The startup logo (standard figlet ANSI Shadow glyphs — same font family
+  // qwen-code / MiMo-Code use for their startup logos).
+  const logo = [
+    " █████╗ ██╗██╗  ██╗",
+    "██╔══██╗██║██║  ██║",
+    "███████║██║███████║",
+    "██╔══██║██║██╔══██║",
+    "██║  ██║██║██║  ██║",
+    "╚═╝  ╚═╝╚═╝╚═╝  ╚═╝",
+  ].join("\n");
+  tui.push({ role: "banner", text: logo });
+  const lines = tui.transcriptLines();
+  // In a non-TTY test run gradientText falls back to plain text: no SGR at all.
+  assert(!lines.some((l) => l.includes("\x1b[")), "banner non-TTY: no ANSI escape sequences");
+  assert(lines.some((l) => l.includes("█████╗")), "banner renders the AIH block-art logo (A glyph)");
+  assert(lines.some((l) => l.includes("██╔══██╗")), "banner renders full 6-line art (A body)");
+  // Pure-function check: gradientText needs two+ colors and a TTY; without a
+  // TTY it must return the input verbatim (never corrupt the art).
+  const { gradientText } = await import("./ui.js");
+  assert(gradientText("AIH", ["#00e5ff", "#2196f3", "#9c27b0"]) === "AIH", "banner gradient: non-TTY pass-through");
+  assert(gradientText("AIH", ["#00e5ff"]) === "AIH", "banner gradient: single color pass-through");
+}
+
 // --- Wheel delivered as arrow keys (mouse tracking silently lost) ------------
 {
   // When ?1000/?1006 get cleared mid-session, the terminal translates the

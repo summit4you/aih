@@ -2665,7 +2665,19 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   for (const w of kbWarnings) tui.pushSystem(`keybind warning: ${w}`);
   tui.push({
     role: "banner",
-    text: ["█▀▀▀ ▀█▀ █ █", "█▄▄█  █  ███", "█  █ ▄█▄ █ █"].join("\n"),
+    // Standard figlet "ANSI Shadow" glyphs (the same font family qwen-code /
+    // MiMo-Code render their startup logos in), hardcoded so no runtime
+    // dependency is needed. This is the verbatim pyfiglet output for "AIH":
+    // every row is 19 cols wide, and A's tapered top keeps its leading space
+    // so the A reads as centered, not flush-left.
+    text: [
+      " █████╗ ██╗██╗  ██╗",
+      "██╔══██╗██║██║  ██║",
+      "███████║██║███████║",
+      "██╔══██║██║██╔══██║",
+      "██║  ██║██║██║  ██║",
+      "╚═╝  ╚═╝╚═╝╚═╝  ╚═╝",
+    ].join("\n"),
   });
   tui.pushSystem(`app intelligence harness · v${VERSION}\n`);
   tui.pushSystem(`type a message · /commands · ctrl-p palette`);

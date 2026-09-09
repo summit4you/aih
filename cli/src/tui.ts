@@ -1,4 +1,4 @@
-import { accent, bold, blue, cyan, danger, dim, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
+import { accent, bold, blue, cyan, danger, dim, gradientText, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
 import type { KeybindAction } from "./keybinds.js";
@@ -2512,10 +2512,24 @@ constructor(opts: TuiOptions) {
       if (!first && lines.length) out.unshift("");
       return out;
     }
+    // Banner (ASCII-art logo) is pre-laid-out: whitespace is significant,
+    // so it bypasses #wrap's word-join (which folds runs of spaces into one)
+    // and emits each art line verbatim, clipped only when wider than the body.
+    if (item.role === "banner") {
+      const limit = Math.max(1, this.#bodyCols() - 4);
+      const bc = this.#bodyCols();
+      return (item.text ?? "")
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map((line) => {
+          const styled = bold(gradientText(line.trimEnd(), ["#00e5ff", "#2196f3", "#9c27b0"]));
+          return this.#clip(`   ${styled}`, bc - 1);
+        });
+    }
     const body = item.text ? this.#wrap(item.text, limit) : [""];
     switch (item.role) {
-      case "banner":
-        return body.map((line) => bold(cyan(line)));
+      // NOTE: "banner" is handled above (pre-laid-out ASCII art with
+      // significant whitespace — #wrap's space-folding would corrupt it).
       case "user": {
         const rows = [this.#userRow("")];
         for (const line of body) rows.push(this.#userRow(line));
