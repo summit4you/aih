@@ -4446,6 +4446,30 @@ await srv.connect(new StdioServerTransport());
   assert(sys.some((l) => l.includes("boom")), "Q-R7: error row rendered");
   assert(sys.some((l) => l.includes("plain info")), "Q-R7: info row rendered");
   assert(!sys.some((l) => l.includes("\x1b[")), "Q-R7: non-TTY renders plain (no SGR)");
+
+  // Q-R7 — tool rows: the tool NAME is blue (38;5;75, qwen tool palette),
+  // including the collapsed-group header; failures stay red.
+  const toolTui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  toolTui.push({ role: "tool", text: "run_cmd", tool: { name: "run_cmd", args: "ls -la", callId: "c1", ok: true } });
+  toolTui.push({ role: "tool", text: "run_cmd", tool: { name: "run_cmd", args: "ls -la", callId: "c2", ok: true } });
+  toolTui.push({ role: "tool", text: "run_cmd", tool: { name: "run_cmd", args: "rm -rf /", callId: "c3", ok: false, error: "denied" } });
+  const toolLines = toolTui.transcriptLines();
+  if (process.stderr.isTTY) {
+    assert(toolLines.some((l) => l.includes("\x1b[38;5;75mrun_cmd\x1b[0m")), "Q-R7: tool name blue (incl. collapsed header)");
+    assert(toolLines.some((l) => l.includes("\x1b[31mrun_cmd failed\x1b[0m")), "Q-R7: failed tool stays red");
+  } else {
+    // non-TTY: paint is a pass-through — names render plain, no SGR.
+    assert(toolLines.some((l) => l.includes("run_cmd")), "Q-R7: tool name rendered (plain in non-TTY)");
+    assert(toolLines.some((l) => l.includes("run_cmd failed")), "Q-R7: failed tool name rendered (plain in non-TTY)");
+  }
 }
 
 // --- Wheel delivered as arrow keys (mouse tracking silently lost) ------------

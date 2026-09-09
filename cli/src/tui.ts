@@ -2224,7 +2224,7 @@ constructor(opts: TuiOptions) {
     const t = g.items[0].tool!;
     const icon = TOOL_ICONS[t.name] ?? "⚙";
     if (!this.#groupOpen.get(g.start)) {
-      return [this.#clip(`${icon} ${accent(t.name)} ×${g.items.length}${muted("   enter to expand")}`, this.#bodyCols())];
+      return [this.#clip(`${icon} ${paint(t.name, "38;5;75")} ×${g.items.length}${muted("   enter to expand")}`, this.#bodyCols())];
     }
     const rows = g.items.flatMap((it) => this.#toolRow(it));
     rows.push(this.#clip(muted("   enter to collapse"), this.#bodyCols()));
@@ -2610,7 +2610,9 @@ constructor(opts: TuiOptions) {
     const bodyCols = this.#bodyCols();
     if (!t) return [this.#clip(item.text, bodyCols - 1)];
     const icon = t.ok === undefined ? warn("▶") : t.ok ? success("✓") : danger("✗");
-    const name = t.ok === false ? danger(`${t.name} failed`) : t.name;
+    // Q-R7 — tool name in the same blue qwen-code uses for tool rows
+    // (terminal.ts `tool` → 38;5;75); arguments stay muted gray.
+    const name = t.ok === false ? danger(`${t.name} failed`) : paint(t.name, "38;5;75");
     const argText = (t.args ?? "").replace(/\s*\n+\s*/g, " ").trim();
     // All tool rows are plain lines (no background, no border); the argument
     // text wraps onto extra lines instead of being clipped. Right margin: rows

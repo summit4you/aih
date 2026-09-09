@@ -27,7 +27,9 @@ the versions listed here (`scripts/package` derives the version from
   model/memory=青 `36`、auth=绿 `32`、error=红 `31`、shell=灰 `38;5;244`、
   thought=dim `2`、info=默认 dim。`pushSystem(text, kind?)` 向后兼容（默认 info）；
   `pushError` 映射 error 红。gate.ts 全部权限裁决 + index.ts 的 model/auth 流已标注
-  kind。映射表导出 `SYS_KIND_SGR` 供测试/复用。
+  kind。映射表导出 `SYS_KIND_SGR` 供测试/复用。**工具行同步对齐**：`#toolRow` 与
+  折叠组头（原青色 `accent`）的工具名统一改 `38;5;75` 蓝（与 qwen tool 行同色），
+  失败仍红、参数仍 muted 灰。
 
 ### Fixed
 - **diff 行换行而非截断**（`cli/src/tui.ts`）：diff 内容在宽度受限时按行 wrap 输出，
