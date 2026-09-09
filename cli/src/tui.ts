@@ -1,4 +1,4 @@
-import { accent, bold, blue, cyan, danger, dim, gradientText, green, italic, magenta, muted, red, success, underline, warn, yellow } from "./ui.js";
+import { accent, bold, blue, cyan, danger, dim, gradientText, green, italic, magenta, muted, paint, red, success, underline, warn, yellow } from "./ui.js";
 import type { DiffLine } from "./diff.js";
 import { capDiff } from "./diff.js";
 import type { KeybindAction } from "./keybinds.js";
@@ -23,10 +23,35 @@ export interface ToolView {
   todos?: TodoItem[];
 }
 
+export type SysKind =
+  | "tool" //      tool status:      blue 38;5;75
+  | "permission" // permission event: yellow 33
+  | "model" //     model/mode change: cyan 36
+  | "memory" //    memory/context:    cyan 36
+  | "auth" //      auth success:      green 32
+  | "shell" //     shell output:      gray 38;5;244
+  | "thought" //   thought trace:     dim 2
+  | "error" //     error:             red 31
+  | "info"; //     default info:      dim 2
+
+/** qwen-code terminal.ts parity — semantic SGR per system row kind (Q-R7). */
+export const SYS_KIND_SGR: Record<SysKind, string> = {
+  tool: "38;5;75",
+  permission: "33",
+  model: "36",
+  memory: "36",
+  auth: "32",
+  shell: "38;5;244",
+  thought: "2",
+  error: "31",
+  info: "2",
+};
+
 export interface TuiItem {
   role: "user" | "assistant" | "tool" | "system" | "footer" | "banner";
   text: string;
   red?: boolean;
+  sysKind?: SysKind;
   tool?: ToolView;
 }
 
@@ -958,8 +983,8 @@ constructor(opts: TuiOptions) {
     this.#panelSeq += 1;
   }
 
-  pushSystem(text: string): void {
-    this.push({ role: "system", text });
+  pushSystem(text: string, kind: SysKind = "info"): void {
+    this.push({ role: "system", text, sysKind: kind });
   }
 
   /** Restore up-arrow recall from a resumed session (chronological order). */
@@ -1058,7 +1083,7 @@ constructor(opts: TuiOptions) {
   }
 
   pushError(text: string): void {
-    this.push({ role: "system", text, red: true });
+    this.push({ role: "system", text, red: true, sysKind: "error" });
   }
 
   clearItems(): void {
@@ -2536,8 +2561,15 @@ constructor(opts: TuiOptions) {
         rows.push(this.#userRow(""));
         return rows;
       }
-      case "system":
-        return body.map((line) => (item.red ? red(`  ${line}`) : dim(`  ${line}`)));
+      case "system": {
+        // qwen-code terminal.ts parity — semantic SGR palette per system
+        // row kind (Q-R7). Default/unknown kinds stay dim (old behavior).
+        const code =
+          item.red || item.sysKind === "error"
+            ? SYS_KIND_SGR.error
+            : SYS_KIND_SGR[item.sysKind ?? "info"];
+        return body.map((line) => (code === "2" ? dim(`  ${line}`) : paint(`  ${line}`, code)));
+      }
       case "footer":
         return body.map((line, i) =>
           i === 0 ? cyan("▣") + dim(line.slice(1)) : dim(`  ${line}`),

@@ -22,6 +22,12 @@ the versions listed here (`scripts/package` derives the version from
 - **TUI 侧栏布局精修**（`cli/src/tui.ts`）：sidebar 42 → 34 列（右侧面板过宽），
   CONTEXT 用量进度条延伸到面板右缘（保持对称边距），恢复输入框/用户消息 `┃` 边框 +
   所有消息族右边距离开侧栏；面板对称边距 + diff 右缘对齐。
+- **system 行语义色板（Q-R7，qwen-code terminal.ts parity）**（`cli/src/tui.ts`）：
+  system 行从 dim/red 二态升级为语义色板——tool=蓝 `38;5;75`、permission=黄 `33`、
+  model/memory=青 `36`、auth=绿 `32`、error=红 `31`、shell=灰 `38;5;244`、
+  thought=dim `2`、info=默认 dim。`pushSystem(text, kind?)` 向后兼容（默认 info）；
+  `pushError` 映射 error 红。gate.ts 全部权限裁决 + index.ts 的 model/auth 流已标注
+  kind。映射表导出 `SYS_KIND_SGR` 供测试/复用。
 
 ### Fixed
 - **diff 行换行而非截断**（`cli/src/tui.ts`）：diff 内容在宽度受限时按行 wrap 输出，

@@ -154,7 +154,7 @@ export class SessionGate implements ApprovalGate {
       }
     }
     const note = `${detail} (${saved})`;
-    if (this.#tui) this.#tui.pushSystem(`[gate] ${note}`);
+    if (this.#tui) this.#tui.pushSystem(`[gate] ${note}`, "permission");
     return { ok: true, note };
   }
 
@@ -188,7 +188,7 @@ export class SessionGate implements ApprovalGate {
         const violation = policyViolation(cmd, this.#execPolicy);
         if (violation) {
           const msg = `[exec-policy] blocked ${req.tool}: command matches disabled category (${describePolicy(violation)})`;
-          if (this.#tui) this.#tui.pushSystem(msg);
+          if (this.#tui) this.#tui.pushSystem(msg, "permission");
           else process.stderr.write(`${msg}\n`);
           this.lastDenySource = "human";
           return false;
@@ -202,7 +202,7 @@ export class SessionGate implements ApprovalGate {
       // see "denied by .aih/config.json" instead of an unexplained veto.
       const winner = this.#ruleset.explain(req);
       if (winner?.source && this.#tui) {
-        this.#tui.pushSystem(`denied by ${winner.source} (${winner.tool} ${winner.pattern ?? "*"})`);
+        this.#tui.pushSystem(`denied by ${winner.source} (${winner.tool} ${winner.pattern ?? "*"})`, "permission");
       } else if (winner?.source) {
         process.stderr.write(`[gate] denied by ${winner.source} (${winner.tool} ${winner.pattern ?? "*"})\n`);
       }
@@ -248,7 +248,7 @@ export class SessionGate implements ApprovalGate {
             this.#guardianBreaker.recordPass();
             if (risk === "low" || guardian.trust) {
               const why = guardian.trust && risk !== "low" ? ` — ${risk} risk, trust mode` : " — low risk";
-              if (this.#tui) this.#tui.pushSystem(`[guardian] ✓ ${req.tool}${why}, auto-approved`);
+              if (this.#tui) this.#tui.pushSystem(`[guardian] ✓ ${req.tool}${why}, auto-approved`, "permission");
               else process.stderr.write(`[guardian] ✓ ${req.tool}${why}, auto-approved\n`);
               return true;
             }
@@ -270,7 +270,7 @@ export class SessionGate implements ApprovalGate {
             const rationale = r.assessment?.rationale ? ` — ${r.assessment.rationale}` : "";
             const notice = `[guardian] ✗ denied ${req.tool}${rationale}\n${denialNoticeTail}\n${GUARDIAN_CIRCUMVENTION_NOTICE}`;
             guardian.inject?.(notice);
-            if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}${rationale}`);
+            if (this.#tui) this.#tui.pushSystem(`[guardian] ✗ denied ${req.tool}${rationale}`, "permission");
             else process.stderr.write(`[guardian] ✗ denied ${req.tool}${rationale}\n`);
             if (interrupt) guardian.interrupt?.("guardian circuit breaker: consecutive denials reached threshold");
             // C (2026-09-05, user-confirmed) — one-key grant on deny: pressing
@@ -287,7 +287,7 @@ export class SessionGate implements ApprovalGate {
               ).askGrantScope?.(req.tool, deriveScope(req));
               if (granted === true) {
                 const line = `granted: ${this.#remember(req)}`;
-                if (this.#tui) this.#tui.pushSystem(line);
+                if (this.#tui) this.#tui.pushSystem(line, "permission");
                 else process.stderr.write(`${line}\n`);
                 // Close the loop for the model: the denial notice told it to
                 // clarify with the user; the user just DID (pressed [g]). Tell
@@ -317,7 +317,7 @@ export class SessionGate implements ApprovalGate {
             if (guardian.failClosed) {
               const interrupt = this.#guardianBreaker.recordDenial();
               guardian.inject?.(`[guardian] ${r.decision} (${r.meta ?? ""}) — fail-closed deny for ${req.tool}.`);
-              if (this.#tui) this.#tui.pushSystem(`[guardian] ⛔ ${req.tool} — ${r.decision}, fail-closed deny`);
+              if (this.#tui) this.#tui.pushSystem(`[guardian] ⛔ ${req.tool} — ${r.decision}, fail-closed deny`, "permission");
               if (interrupt) guardian.interrupt?.("guardian circuit breaker: consecutive denials reached threshold");
               return false;
             }
@@ -332,7 +332,7 @@ export class SessionGate implements ApprovalGate {
     // asks are refused outright (no prompt to spoof, no "yes" in text to count).
     if (req.source === "injected") {
       const note = `${req.tool} needs approval — injected input (serve/steering) cannot approve; run it from the local TTY`;
-      if (this.#tui) this.#tui.pushSystem(`[gate] ${note}`);
+      if (this.#tui) this.#tui.pushSystem(`[gate] ${note}`, "permission");
       return false;
     }
     const detail = `${req.tool} ${JSON.stringify(req.args) ?? ""}`.slice(0, 120);
@@ -355,21 +355,21 @@ export class SessionGate implements ApprovalGate {
           : detail;
       const choice = await (this.#tui as unknown as { askRunOrCopy(c: string, s: string): Promise<"run" | "copy" | "no"> }).askRunOrCopy(command, scope);
       if (choice === "run") {
-        this.#tui.pushSystem("▶ approved — running");
+        this.#tui.pushSystem("▶ approved — running", "permission");
         return true;
       }
       if (choice === "copy") {
         const res = copyToClipboard(command);
         if (res.ok) {
-          this.#tui.pushSystem(`⧉ copied to clipboard (${res.via}): ${command}`);
+          this.#tui.pushSystem(`⧉ copied to clipboard (${res.via}): ${command}`, "permission");
         } else {
           // No clipboard available — degrade to printing so the user can paste
           // it manually (the spec's fallback path).
-          this.#tui.pushSystem(`no clipboard — command to copy:\n  ${command}`);
+          this.#tui.pushSystem(`no clipboard — command to copy:\n  ${command}`, "permission");
         }
         return false; // copy never runs the command
       }
-      this.#tui.pushSystem("denied");
+      this.#tui.pushSystem("denied", "permission");
       this.lastDenySource = "human";
       return false; // "no"
     }
@@ -382,7 +382,7 @@ export class SessionGate implements ApprovalGate {
     }
     if (answer === "always") {
       const line = `remembered: ${this.#remember(req)}`;
-      if (this.#tui) this.#tui.pushSystem(line);
+      if (this.#tui) this.#tui.pushSystem(line, "permission");
       else process.stderr.write(`${line}\n`);
     }
     this.lastDenySource = answer === "deny" ? "human" : undefined;

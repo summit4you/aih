@@ -2235,6 +2235,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     await applyModel(entry.provider === "(default)" ? undefined : entry.provider, entry.model);
     tui.pushSystem(
       `switched model to ${entry.provider}/${entry.model} (context window ${resolveContextWindow(flags)})`,
+      "model",
     );
   }
 
@@ -2292,14 +2293,14 @@ async function cmdChat(flags: Record<string, string | boolean>) {
           || "custom";
         try {
           const path = saveProvider(id, { baseUrl, model, apiKeyEnv: keyEnv });
-          tui.pushSystem(`saved provider "${id}" → ${path}`);
+          tui.pushSystem(`saved provider "${id}" → ${path}`, "auth");
         } catch (err) {
           tui.pushError(err instanceof Error ? err.message : String(err));
           return;
         }
         try {
           await applyModel(id, model);
-          tui.pushSystem(`connected: ${id}/${model} — set ${keyEnv}=<key> (or /connect to add it)`);
+          tui.pushSystem(`connected: ${id}/${model} — set ${keyEnv}=<key> (or /connect to add it)`, "auth");
         } catch (err) {
           tui.pushError(err instanceof Error ? err.message : String(err));
         }
@@ -2342,6 +2343,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       });
       tui.pushSystem(
         `saved provider "${provider.id}" → ${path}\nkey: ${persistedKey ? `stored in ${envFilePath()}` : (hasKey || key ? "in environment" : "NOT set — set " + keyEnv + " to use it")}`,
+        "auth",
       );
     } catch (err) {
       tui.pushError(err instanceof Error ? err.message : String(err));
@@ -2349,7 +2351,7 @@ async function cmdChat(flags: Record<string, string | boolean>) {
     }
     try {
       await applyModel(provider.id, provider.defaultModel);
-      tui.pushSystem(`connected to ${provider.name} — model ${provider.defaultModel}`);
+      tui.pushSystem(`connected to ${provider.name} — model ${provider.defaultModel}`, "auth");
     } catch (err) {
       tui.pushError(err instanceof Error ? err.message : String(err));
     }

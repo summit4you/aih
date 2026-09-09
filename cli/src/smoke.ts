@@ -4410,6 +4410,44 @@ await srv.connect(new StdioServerTransport());
   assert(gradientText("AIH", ["#00e5ff"]) === "AIH", "banner gradient: single color pass-through");
 }
 
+// --- Q-R7: system-row semantic SGR palette (qwen-code terminal.ts parity) ----
+{
+  const { Tui, SYS_KIND_SGR } = await import("./tui.js");
+  // Every SysKind maps to an SGR code; tool/permission/auth have distinct,
+  // non-dim colors (the point of the palette).
+  assert(SYS_KIND_SGR.tool === "38;5;75", "Q-R7: tool rows are blue");
+  assert(SYS_KIND_SGR.permission === "33", "Q-R7: permission rows are yellow");
+  assert(SYS_KIND_SGR.model === "36" && SYS_KIND_SGR.memory === "36", "Q-R7: model/memory rows are cyan");
+  assert(SYS_KIND_SGR.auth === "32", "Q-R7: auth rows are green");
+  assert(SYS_KIND_SGR.error === "31", "Q-R7: error rows are red");
+  assert(SYS_KIND_SGR.info === "2" && SYS_KIND_SGR.thought === "2", "Q-R7: info/thought rows are dim");
+  // In a non-TTY run paint() is a pass-through: every kind renders the same
+  // plain text, and pushSystem still accepts the second arg (2-arity call).
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  tui.pushSystem("switched model to p/m", "model");
+  tui.pushSystem("[gate] denied by .aih/config.json", "permission");
+  tui.pushSystem("connected to provider — model m", "auth");
+  tui.pushSystem("tool finished ok", "tool");
+  tui.pushError("boom");
+  tui.pushSystem("plain info");
+  const sys = tui.transcriptLines();
+  assert(sys.some((l) => l.includes("switched model to p/m")), "Q-R7: model row rendered");
+  assert(sys.some((l) => l.includes("[gate] denied by .aih/config.json")), "Q-R7: permission row rendered");
+  assert(sys.some((l) => l.includes("connected to provider — model m")), "Q-R7: auth row rendered");
+  assert(sys.some((l) => l.includes("tool finished ok")), "Q-R7: tool row rendered");
+  assert(sys.some((l) => l.includes("boom")), "Q-R7: error row rendered");
+  assert(sys.some((l) => l.includes("plain info")), "Q-R7: info row rendered");
+  assert(!sys.some((l) => l.includes("\x1b[")), "Q-R7: non-TTY renders plain (no SGR)");
+}
+
 // --- Wheel delivered as arrow keys (mouse tracking silently lost) ------------
 {
   // When ?1000/?1006 get cleared mid-session, the terminal translates the
