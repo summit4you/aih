@@ -8,6 +8,16 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Fixed
+- **TUI 面板 todo 在压缩/全完成后消失**（用户报告："压缩之后好像原来面板的 todo 就没有了"）：
+  侧栏 todo 段原来只从内存转录（`#items`）里最后一个 `todo` 工具结果取数，且
+  `todos.some(status !== "completed")` 为假时整段隐藏——agent 完成全部条目后面板直接
+  消失，压缩后续跑（agent 重新调用 `todo` 工具或转录重放）也会覆盖/丢失列表。
+  现在：① 面板**全完成时仍显示**（灰色 ✓ 行，`TODO n/n`）；② 新增 host `todos()`
+  回调读**持久化 `.aih/todos.json`**（权威源），优先于转录派生列表，压缩/重放/
+  工具重调都不再丢面板（`cli/src/tui.ts` + `cli/src/index.ts`）。
+  冒烟新增 3 组断言：全完成可见 / host 回调优先 / null 回退转录。
+
 ## [0.8.1] - 2026-09-10
 
 ### Added

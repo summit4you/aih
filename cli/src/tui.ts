@@ -93,6 +93,14 @@ export interface TuiOptions {
     /** P#41: prompt-cache hit rate 0..1 (absent when unobservable) */
     cacheRate?: number;
   };
+  /**
+   * Authoritative todo list for the side panel (persisted `.aih/todos.json`).
+   * Preferred over the last `todo` tool result in the transcript: after a
+   * compaction the agent may re-invoke the `todo` tool (or the transcript
+   * may be replayed) and the panel must not lose the list. null/absent →
+   * fall back to the transcript-derived list.
+   */
+  todos?(): TodoItem[] | null;
   completions?(): string[];
   onTab?(): void;
   /** open the command palette (ctrl-p) */
@@ -2480,6 +2488,15 @@ constructor(opts: TuiOptions) {
   }
 
   #panelTodos(): TodoItem[] | null {
+    // Prefer the host's authoritative list (persisted .aih/todos.json) — it
+    // survives compaction and transcript replay. Fall back to the last `todo`
+    // tool result in the transcript (mock / no-host cases).
+    try {
+      const host = this.#opts.todos?.();
+      if (host && host.length) return host;
+    } catch {
+      /* host callback absent/failed — transcript fallback below */
+    }
     for (let i = this.#items.length - 1; i >= 0; i -= 1) {
       const t = this.#items[i].tool;
       if (t && Array.isArray(t.todos) && t.todos.length) return t.todos;
@@ -2668,7 +2685,10 @@ constructor(opts: TuiOptions) {
       if (pct >= 80) lines.push(warn("▲ compact soon (auto ≥80%)"));
     }
     const todos = this.#panelTodos();
-    if (todos && todos.some((t) => t.status !== "completed")) {
+    // Show the list even when fully completed (grayed ✓ rows) — the user
+    // expects the panel to reflect the finished state, not vanish after the
+    // last item is done (observed: panel todos disappeared once all completed).
+    if (todos && todos.length) {
       if (lines.length) {
         lines.push("");
         lines.push(dim("─".repeat(Math.min(pw - 2, 24))));

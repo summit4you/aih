@@ -2692,6 +2692,30 @@ async function cmdChat(flags: Record<string, string | boolean>) {
         return { used: usedTokens, limit: 0, trend: [] };
       }
     },
+    // Panel todo source: the persisted .aih/todos.json (authoritative,
+    // survives compaction + transcript replay). Absent/empty → null → the
+    // TUI falls back to the last `todo` tool result in the transcript.
+    todos: () => {
+      try {
+        const p = join(process.cwd(), ".aih", "todos.json");
+        if (!existsSync(p)) return null;
+        const d = JSON.parse(readFileSync(p, "utf8")) as { todos?: unknown };
+        if (!Array.isArray(d.todos) || !d.todos.length) return null;
+        return d.todos
+          .filter(
+            (t): t is { content: string; status: string } =>
+              !!t &&
+              typeof t === "object" &&
+              typeof (t as { content?: unknown }).content === "string",
+          )
+          .map((t) => ({
+            content: t.content,
+            status: typeof t.status === "string" ? t.status : "pending",
+          }));
+      } catch {
+        return null;
+      }
+    },
   });
   void echoEvents;
   gate.attachTui(tui);

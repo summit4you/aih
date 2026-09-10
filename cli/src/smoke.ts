@@ -4012,6 +4012,58 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // Panel todos (2026-09-10 user report: "压缩之后面板的 todo 没了"):
+  //  (1) the panel must show the list even when ALL items are completed —
+  //      before the fix `todos.some(status !== "completed")` hid it entirely;
+  //  (2) the host `todos()` callback (persisted .aih/todos.json) is the
+  //      authoritative source and must beat the transcript-derived list, so a
+  //      compaction + agent re-invoking the `todo` tool (or a replayed
+  //      transcript) cannot wipe the panel.
+  const { Tui } = await import("./tui.js");
+  const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const allDone = [
+    { content: "step one", status: "completed" },
+    { content: "step two", status: "completed" },
+  ];
+  const mixed = [
+    { content: "step one", status: "completed" },
+    { content: "step two", status: "in_progress" },
+  ];
+  // (1) fully-completed list still renders (transcript source, no host cb)
+  const tuiDone = new Tui({
+    placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+  });
+  tuiDone.pushTool("todo", { todos: allDone }, "c1");
+  tuiDone.resolveTool("c1", true, { todos: allDone });
+  const donePanel = tuiDone.panelLinesForTest(30).map(strip);
+  assert(donePanel.some((l) => l.startsWith("TODO 2/2")), `panel shows fully-completed todos (got ${JSON.stringify(donePanel)})`);
+  assert(donePanel.some((l) => l.includes("step one")), "panel lists completed items");
+  // (2) host todos() wins over the (stale) transcript list
+  const tuiHost = new Tui({
+    placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    todos: () => mixed,
+  });
+  tuiHost.pushTool("todo", { todos: allDone }, "c2");
+  tuiHost.resolveTool("c2", true, { todos: allDone }); // stale "all done" in transcript
+  const hostPanel = tuiHost.panelLinesForTest(30).map(strip);
+  assert(hostPanel.some((l) => l.startsWith("TODO 1/2")), `host todos() beats transcript (got ${JSON.stringify(hostPanel)})`);
+  assert(hostPanel.some((l) => l.includes("step two")), "host list items render");
+  // (3) host todos() returning null falls back to the transcript list
+  const tuiFb = new Tui({
+    placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    todos: () => null,
+  });
+  tuiFb.pushTool("todo", { todos: mixed }, "c3");
+  tuiFb.resolveTool("c3", true, { todos: mixed });
+  const fbPanel = tuiFb.panelLinesForTest(30).map(strip);
+  assert(fbPanel.some((l) => l.startsWith("TODO 1/2")), `null host cb falls back to transcript (got ${JSON.stringify(fbPanel)})`);
+  console.log("ok: panel todos survive all-completed + host-callback priority");
+}
+
+{
   // opencode/mimo-code parity: the side panel is a FIXED-width sidebar (42 cols,
   // both repos SIDEBAR_WIDTH=42), appears only when width>120 (wide guard), and
   // carries a footer with the current path + brand version. The composer caps at
