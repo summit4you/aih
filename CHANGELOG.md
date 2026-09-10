@@ -11,6 +11,19 @@ the versions listed here (`scripts/package` derives the version from
 ## [0.8.1] - 2026-09-10
 
 ### Added
+- **自更新支持 GitHub 国内镜像（离线 / GitHub 不可达时下载更新包）**（`cli/src/update.ts`）：
+  用户报告"离线更新时有时会联不上 github.com 导致无法正常下载更新包"。新增
+  `AIH_UPDATE_MIRROR` 环境变量（GitHub 下载镜像前缀，如 `https://ghfast.top` /
+  `https://ghproxy.com`）：`checkLatestVersion`（releases API）与
+  `downloadTarball`（tarball 下载）的 URL 统一经 `applyMirror()` 重写为
+  `<mirror>/https://github.com/...` 与 `<mirror>/https://api.github.com/...`。
+  纯 URL 重写、叠加在现有原生 fetch 之上——**未设置时行为与之前逐字节一致**
+  （无回归风险）；只重写 github.com / api.github.com / raw.githubusercontent.com，
+  其它主机（如 OpenAI base URL）不动；scheme-less 值按未设置处理。
+  下载失败且未配镜像时，错误信息提示设置 `AIH_UPDATE_MIRROR`。
+  按用户决策"不用 socks 代理，用 github.com 的国内镜像"实现（非代理）。
+  冒烟新增 7 组断言：未设置透传 / 尾斜杠归一 / 下载 URL 重写 / API URL 重写 /
+  非 GitHub 不动 / scheme-less 拒绝。
 - **同版本 release 重传检测（`--clobber` 刷新也能触发更新）**（`cli/src/update.ts` + `cli/src/index.ts`）：
   自动更新原来只按版本号判断（`compareVersions > 0`），同一 tag 下重新上传 tarball
   （`gh release upload --clobber`，资产时间变化、版本号不变）会被误判为
@@ -24,6 +37,16 @@ the versions listed here (`scripts/package` derives the version from
   同版本刷新显示 "vX re-uploaded (same version, newer tarball)"。
 
 ### Fixed
+- **Windows 上 `aih update` 解压失败（`can't create '...\.bin\node-which': Invalid argument`）**（`scripts/package`）：
+  分发包（node tarball）里 `node_modules/@aih/*` 用**符号链接**指向 `../../lib/*`，
+  外加 npm 生成的 `.bin/*` 链接桩。Windows 自带的 `tar.exe`（libarchive）在
+  未开启 Developer Mode / 非管理员时**无法创建符号链接**，解压到第一个链接
+  （`.bin/node-which`，字母序最靠前）就抛 `EINVAL` 中止。改为与离线
+  `.ps1` 打包器（`scripts/offline-package` 第 424–434 行，"No symlinks: the
+  staged tree ships real copies"）**一致的方案**：`node_modules/@aih/*` 用
+  **真实拷贝**（`cp -a`，非 `ln -s`），并移除 `.bin/*` 链接桩（其指向的包如
+  `which` 是真实目录、被 cross-spawn 运行时 require，保留）。符号链接数
+  4 → 0，解压后 `node aih --version` 与真实子命令均验证通过。
 - **TUI 面板 todo 在压缩/全完成后消失**（用户报告："压缩之后好像原来面板的 todo 就没有了"）：
   侧栏 todo 段原来只从内存转录（`#items`）里最后一个 `todo` 工具结果取数，且
   `todos.some(status !== "completed")` 为假时整段隐藏——agent 完成全部条目后面板直接

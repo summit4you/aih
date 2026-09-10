@@ -52,10 +52,25 @@ cat > "$STAGE/package.json" <<EOF
 EOF
 (cd "$STAGE" && npm install --omit=dev --no-audit --no-fund >/dev/null)
 
+# node_modules/@aih/* — REAL COPIES, not symlinks (scripts/offline-package's
+# .ps1 builder does the same, line 424-434). Windows' built-in tar.exe
+# (libarchive) cannot create symlinks without Developer Mode / admin, so a
+# symlinked payload aborts extraction with EINVAL (observed on
+# node_modules/.bin/node-which, the first entry alphabetically). Real copies
+# need no special rights and resolve identically — the launcher's
+# createRequire(node_modules/@aih/cli/package.json) and every `import
+# "@aih/core"` walk up to the same package.json either way.
 mkdir -p "$STAGE/node_modules/@aih"
 for ws in core cli mcp-server; do
-  ln -s "../../lib/$ws" "$STAGE/node_modules/@aih/$ws"
+  cp -a "$STAGE/lib/$ws" "$STAGE/node_modules/@aih/$ws"
 done
+# Prune the bin-link stubs npm creates (node_modules/.bin/*): they are the ONLY
+# symlink entries in the payload and the EINVAL trigger on Windows. The packages
+# they point at (e.g. `which`, a real dir required by cross-spawn at runtime)
+# are real directories — kept. Removing the .bin stubs is safe: nothing on the
+# runtime path invokes a bin-link (the launcher + dist resolve via node_modules
+# package dirs, not .bin shims).
+rm -rf "$STAGE/node_modules/.bin"
 
 echo "==> writing launcher"
 cat > "$STAGE/aih" <<'LAUNCHER'

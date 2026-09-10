@@ -27,6 +27,38 @@ const DL = `https://github.com/${GITHUB_REPO}/releases/download`;
 const CHECK_TIMEOUT_MS = 8000;
 const DOWNLOAD_TIMEOUT_MS = 120000;
 
+// ---- GitHub mirror (offline / GitHub-unreachable) ----------------------------
+// Opt-in via AIH_UPDATE_MIRROR, a GitHub download MIRROR prefix (国内镜像),
+// e.g. "https://ghfast.top" or "https://ghproxy.com". Both the tarball
+// DOWNLOAD and the releases-API CHECK are rewritten to go through it:
+//   <mirror>/https://github.com/...
+//   <mirror>/https://api.github.com/...
+// This is a CDN that can reach GitHub on the user's behalf — no proxy, no
+// socks, no extra binary. It is a pure URL rewrite layered over the existing
+// native-fetch path, so with AIH_UPDATE_MIRROR unset the behavior is
+// byte-identical to before (no regression risk to the normal path).
+//
+// (User decision: "不用socks代理，是用github.com的国内镜像" — mirror, not proxy.)
+
+/** Normalize a mirror prefix: trim, strip a trailing slash, require an
+ *  absolute http(s) URL. Empty string when unset/invalid (→ no mirroring). */
+export function mirrorPrefix(): string {
+  const raw = (process.env.AIH_UPDATE_MIRROR ?? "").trim();
+  if (!raw) return "";
+  if (!/^https?:\/\/.+/i.test(raw)) return ""; // not an absolute http(s) URL
+  return raw.replace(/\/+$/, "");
+}
+
+/** Rewrite an absolute github.com / api.github.com / raw.githubusercontent.com
+ *  URL to go through the configured mirror (if any). Non-GitHub URLs and an
+ *  unset mirror pass through unchanged. */
+export function applyMirror(url: string): string {
+  const prefix = mirrorPrefix();
+  if (!prefix) return url;
+  if (!/^(https?:\/\/)(github\.com|api\.github\.com|raw\.githubusercontent\.com)(\/|$)/i.test(url)) return url;
+  return `${prefix}/${url}`;
+}
+
 /** Latest release info from the GitHub releases API. */
 export interface LatestRelease {
   /** Release tag without the leading "v" (e.g. "0.8.0"). */
@@ -43,7 +75,7 @@ export async function checkLatestVersion(
   fetchImpl: typeof fetch = fetch,
 ): Promise<LatestRelease | null> {
   try {
-    const res = await fetchImpl(`${API}/latest`, {
+    const res = await fetchImpl(applyMirror(`${API}/latest`), {
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       headers: { "user-agent": "aih-update-check", accept: "application/json" },
     });
@@ -260,9 +292,16 @@ function run(cmd: string, args: string[], timeoutMs: number): Promise<{ code: nu
 export async function downloadTarball(version: string, destDir: string): Promise<DownloadResult> {
   fs.mkdirSync(destDir, { recursive: true });
   const dest = path.join(destDir, tarballName(version));
-  const url = tarballUrl(version);
+  const url = applyMirror(tarballUrl(version)); // 国内镜像 (AIH_UPDATE_MIRROR)
   const res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status}`);
+  if (!res.ok || !res.body) {
+    throw new Error(
+      `download failed: HTTP ${res.status}` +
+        (mirrorPrefix()
+          ? ` (via mirror ${mirrorPrefix()})`
+          : " — if github.com is unreachable from here, set AIH_UPDATE_MIRROR to a GitHub mirror, e.g. AIH_UPDATE_MIRROR=https://ghfast.top"),
+    );
+  }
   const buf = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(dest, buf);
   return { tarball: dest, bytes: buf.length };

@@ -663,6 +663,42 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.tarballName("0.8.0") === "aih-0.8.0-node.tar.gz", "tarballName convention");
     assert(u.tarballName("v0.9.1") === "aih-0.9.1-node.tar.gz", "tarballName strips v");
     assert(u.tarballUrl("0.8.0").includes("/releases/download/v0.8.0/aih-0.8.0-node.tar.gz"), "tarballUrl shape");
+    // AIH_UPDATE_MIRROR — 国内镜像 URL 重写 (offline / GitHub-unreachable).
+    // Pure URL rewrite: unset → byte-identical passthrough; set → both the
+    // download URL and the releases-API URL route through <mirror>/<github url>.
+    {
+      const saved = process.env.AIH_UPDATE_MIRROR;
+      const unset = () => (saved === undefined ? delete process.env.AIH_UPDATE_MIRROR : (process.env.AIH_UPDATE_MIRROR = saved));
+      try {
+        // unset → passthrough (no regression to the normal path)
+        unset();
+        assert(u.mirrorPrefix() === "", "mirror: unset → empty prefix");
+        assert(u.applyMirror("https://github.com/x/y") === "https://github.com/x/y", "mirror: unset → URL unchanged");
+        // set → prefix normalized (trailing slash stripped)
+        process.env.AIH_UPDATE_MIRROR = "https://ghfast.top/";
+        assert(u.mirrorPrefix() === "https://ghfast.top", "mirror: trailing slash stripped");
+        assert(
+          u.applyMirror("https://github.com/summit4you/aih/releases/download/v0.8.1/aih-0.8.1-node.tar.gz") ===
+            "https://ghfast.top/https://github.com/summit4you/aih/releases/download/v0.8.1/aih-0.8.1-node.tar.gz",
+          "mirror: download URL rewritten",
+        );
+        assert(
+          u.applyMirror("https://api.github.com/repos/summit4you/aih/releases/latest") ===
+            "https://ghfast.top/https://api.github.com/repos/summit4you/aih/releases/latest",
+          "mirror: API URL rewritten",
+        );
+        // non-GitHub host → untouched (we must not rewrite arbitrary URLs)
+        assert(
+          u.applyMirror("https://api.openai.com/v1/models") === "https://api.openai.com/v1/models",
+          "mirror: non-GitHub URL untouched",
+        );
+        // invalid (scheme-less) → treated as unset
+        process.env.AIH_UPDATE_MIRROR = "ghfast.top";
+        assert(u.mirrorPrefix() === "", "mirror: scheme-less value rejected");
+      } finally {
+        unset();
+      }
+    }
     // checkLatestVersion: the tarball ASSET's updated_at (re-upload timestamp)
     // wins over the release's published_at — a --clobber re-upload refreshes
     // the asset but NOT the release publish time.
