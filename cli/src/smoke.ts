@@ -663,6 +663,25 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.tarballName("0.8.0") === "aih-0.8.0-node.tar.gz", "tarballName convention");
     assert(u.tarballName("v0.9.1") === "aih-0.9.1-node.tar.gz", "tarballName strips v");
     assert(u.tarballUrl("0.8.0").includes("/releases/download/v0.8.0/aih-0.8.0-node.tar.gz"), "tarballUrl shape");
+    // checkLatestVersion: the tarball ASSET's updated_at (re-upload timestamp)
+    // wins over the release's published_at — a --clobber re-upload refreshes
+    // the asset but NOT the release publish time.
+    {
+      const fakeFetch = (async () => ({
+        ok: true,
+        json: async () => ({
+          tag_name: "v0.8.0",
+          published_at: "2026-09-07T02:41:15Z", // release create time (stale)
+          assets: [
+            { name: "aih-0.8.0-node.tar.gz", updated_at: "2026-09-10T05:21:09Z" }, // re-upload
+            { name: "aih-0.8.0-offline.sh", updated_at: "2026-09-10T05:21:10Z" },
+          ],
+        }),
+      })) as unknown as typeof fetch;
+      const r = await u.checkLatestVersion(fakeFetch);
+      assert(r?.version === "0.8.0", "checkLatestVersion: version parsed");
+      assert(r?.publishedAt === "2026-09-10T05:21:09Z", "checkLatestVersion: tarball asset updated_at wins over release published_at");
+    }
     // skip-state: skipped version is not re-nudged; a NEWER one is.
     assert(u.shouldPrompt({}, { version: "0.9.0", publishedAt: "2026-01-01" }) === true, "no state → prompt");
     assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, { version: "0.9.0", publishedAt: "2026-01-01" }) === false, "skipped same version → silent");

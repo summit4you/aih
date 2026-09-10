@@ -31,10 +31,10 @@ const DOWNLOAD_TIMEOUT_MS = 120000;
 export interface LatestRelease {
   /** Release tag without the leading "v" (e.g. "0.8.0"). */
   version: string;
-  /** GitHub `published_at` (ISO-8601). Same version may be REUPLOADED to the
-   *  same tag (e.g. `gh release upload --clobber`), which bumps this timestamp
-   *  without changing the version — the tarball is newer even though the
-   *  version number is not. */
+  /** When the TARBALL asset was last uploaded (ISO-8601). The release's own
+   *  `published_at` does NOT change when assets are re-uploaded (--clobber),
+   *  so we read the asset's `updated_at` instead — same-version re-uploads of
+   *  the tarball bump THIS timestamp, making the refresh detectable. */
   publishedAt: string;
 }
 
@@ -48,10 +48,18 @@ export async function checkLatestVersion(
       headers: { "user-agent": "aih-update-check", accept: "application/json" },
     });
     if (!res.ok) return null;
-    const j = (await res.json()) as { tag_name?: string; published_at?: string };
+    const j = (await res.json()) as {
+      tag_name?: string;
+      published_at?: string;
+      assets?: { name?: string; updated_at?: string }[];
+    };
     const version = (j.tag_name ?? "").replace(/^v/, "");
     if (!version) return null;
-    return { version, publishedAt: j.published_at ?? "" };
+    // Asset-level timestamp: the tarball's last upload wins over the release's
+    // published_at (which is stale after a --clobber asset re-upload).
+    const tarball = (j.assets ?? []).find((a) => a.name === tarballName(version));
+    const publishedAt = tarball?.updated_at || j.published_at || "";
+    return { version, publishedAt };
   } catch {
     return null;
   }

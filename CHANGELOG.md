@@ -11,11 +11,13 @@ the versions listed here (`scripts/package` derives the version from
 ### Added
 - **同版本 release 重传检测（`--clobber` 刷新也能触发更新）**（`cli/src/update.ts` + `cli/src/index.ts`）：
   自动更新原来只按版本号判断（`compareVersions > 0`），同一 tag 下重新上传 tarball
-  （`gh release upload --clobber`，`published_at` 变化、版本号不变）会被误判为
-  "already up to date"。现在 `checkLatestVersion` 额外取 `published_at`，state 记录
+  （`gh release upload --clobber`，资产时间变化、版本号不变）会被误判为
+  "already up to date"。现在 `checkLatestVersion` 额外读取 **tarball 资产的
+  `updated_at`**（release 自身的 `published_at` 在重传时不会变化，资产时间戳才是
+  可靠的刷新信号），state 记录
   `appliedVersion`/`appliedAt` 基线（首次见到某版本时静默基线，`baselineAppliedAt`；
   更新成功后 `markApplied` 推进）。判断逻辑：版本严格更新 **或** 同版本但
-  `published_at` 晚于基线（`isSameVersionRefresh`）→ 提示更新；启动检查、`/update`、
+  资产时间戳晚于基线（`isSameVersionRefresh`）→ 提示更新；启动检查、`/update`、
   `aih update` 三条路径统一。skip 语义不变（明确跳过的精确版本仍静默）。启动横幅对
   同版本刷新显示 "vX re-uploaded (same version, newer tarball)"。
 
