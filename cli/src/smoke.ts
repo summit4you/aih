@@ -7802,7 +7802,9 @@ console.log("══════════════════════�
 {
   const {
     findProjectRuleFiles,
+    findGlobalRuleFiles,
     collectRulesSync,
+    readRuleFile,
     renderRules,
   } = await import("./rules.js");
   const {
@@ -7843,6 +7845,132 @@ console.log("══════════════════════�
   assert(sp.includes("Prompt-cache prefix stability"), "CC-R#3: system prompt carries the prefix-stability rules");
   rmSync(ruleDir, { recursive: true, force: true });
   rmSync(fallbackDir, { recursive: true, force: true });
+
+  // ---- global AGENTS.md (AIH's own global dir via AIH_HOME) ----
+  {
+    const gHome = mkdtempSync(join(tmpdir(), "aih-ghome-"));
+    const gAih = join(gHome, ".aih-global");
+    mkdirSync(gAih, { recursive: true });
+    const gAgents = join(gAih, "AGENTS.md");
+    writeFileSync(gAgents, "# Global\nAlways lint.\n");
+    const saved = process.env.AIH_HOME;
+    process.env.AIH_HOME = gAih;
+    try {
+      const g = findGlobalRuleFiles();
+      assert(
+        g.some((p) => p === gAgents),
+        "rules: AIH_HOME/AGENTS.md is found as a global rule",
+      );
+    } finally {
+      if (saved === undefined) delete process.env.AIH_HOME;
+      else process.env.AIH_HOME = saved;
+    }
+    rmSync(gHome, { recursive: true, force: true });
+  }
+
+  // ---- instructions entries via a global config (no trust gate): glob dir
+  //      fix / ~ expansion / URL warning ----
+  {
+    const instrHome = mkdtempSync(join(tmpdir(), "aih-instr-"));
+    const cfgDir = join(instrHome, "cfg");
+    const cfgFile = join(cfgDir, "config.json");
+    const docs = join(instrHome, "docs");
+    mkdirSync(cfgDir, { recursive: true });
+    mkdirSync(docs, { recursive: true });
+    writeFileSync(join(docs, "one.md"), "# One\nrule-one\n");
+    writeFileSync(join(docs, "two.md"), "# Two\nrule-two\n");
+    // A file at a HIGHER dir that the OLD glob bug (stray dirname) would match:
+    // "docs/*.md" previously resolved dir = dirname(join(base,"docs")) = instrHome's
+    // parent's docs — walk could reach sibling content it must not.
+    const strayParent = mkdtempSync(join(tmpdir(), "aih-instr-stray-"));
+    const strayDocs = join(strayParent, "docs");
+    mkdirSync(strayDocs, { recursive: true });
+    writeFileSync(join(strayDocs, "stray.md"), "# stray\nshould-not-match\n");
+    // Note: with the fixed literal-dir logic, base = cfgDir (the config file's
+    // dirname), so "docs/*.md" → cfgDir/docs. We put the real docs under
+    // instrHome/docs and point instructions there via ../../docs? No — use an
+    // absolute-ish relative that stays inside cfgDir to prove the dir fix.
+    // Simpler: instructions use "../docs/*.md" — base = cfgDir → cfgDir/../docs
+    // = instrHome/docs, and the stray at strayParent/docs must NOT match.
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({ instructions: ["../docs/*.md", "https://example.com/rules.md", "~/myrules.md"] }),
+    );
+    const savedEnv = {
+      AIH_HOME: process.env.AIH_HOME,
+      HOME: process.env.HOME,
+      AIH_TRUST_ALL_PROJECTS: process.env.AIH_TRUST_ALL_PROJECTS,
+    };
+    process.env.AIH_HOME = cfgDir;
+    process.env.AIH_TRUST_ALL_PROJECTS = "1";
+    // ~/myrules.md must resolve under HOME
+    const home = mkdtempSync(join(tmpdir(), "aih-home-"));
+    writeFileSync(join(home, "myrules.md"), "# Home rules\nhome-rule\n");
+    process.env.HOME = home;
+    const saveCwd = process.cwd();
+    process.chdir(instrHome);
+    try {
+      const blocks = collectRulesSync(instrHome);
+      const contents = blocks.map((b) => b.content).join("\n");
+      assert(contents.includes("rule-one") && contents.includes("rule-two"), "instr: ../docs/*.md glob collects docs files");
+      assert(!contents.includes("should-not-match"), "instr: glob literal-dir fix — stray sibling docs not matched");
+      assert(contents.includes("home-rule"), "instr: ~/ entry expands via HOME");
+    } finally {
+      process.chdir(saveCwd);
+      if (savedEnv.AIH_HOME === undefined) delete process.env.AIH_HOME;
+      else process.env.AIH_HOME = savedEnv.AIH_HOME;
+      if (savedEnv.HOME === undefined) delete process.env.HOME;
+      else process.env.HOME = savedEnv.HOME;
+      if (savedEnv.AIH_TRUST_ALL_PROJECTS === undefined) delete process.env.AIH_TRUST_ALL_PROJECTS;
+      else process.env.AIH_TRUST_ALL_PROJECTS = savedEnv.AIH_TRUST_ALL_PROJECTS;
+    }
+    rmSync(instrHome, { recursive: true, force: true });
+    rmSync(strayParent, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // truncation marker in readRuleFile
+  {
+    const big = mkdtempSync(join(tmpdir(), "aih-big-"));
+    const bigF = join(big, "big.md");
+    writeFileSync(bigF, "x".repeat(6100));
+    const cut = readRuleFile(bigF, 6000);
+    assert(cut.includes("[truncated at 6000 chars"), "rules: over-budget file carries a truncation marker");
+    assert(cut.length > 6000, "rules: marker makes the output longer than the cap (not a silent cut)");
+    rmSync(big, { recursive: true, force: true });
+  }
+
+  // URL entry: warning to stderr (not silent) — collectRulesSync always
+  // exercises the URL path through the config above; assert the warning fires.
+  {
+    const prevErr = process.stderr.write.bind(process.stderr);
+    let warned = false as boolean;
+    process.stderr.write = ((s: string) => {
+      if (String(s).includes("remote URL")) warned = true;
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const cfgHome = join(tmpdir(), "aih-url-warn");
+      rmSync(cfgHome, { recursive: true, force: true });
+      mkdirSync(cfgHome, { recursive: true });
+      writeFileSync(
+        join(cfgHome, "config.json"),
+        JSON.stringify({ instructions: ["https://example.com/x.md"] }),
+      );
+      const saved = process.env.AIH_HOME;
+      process.env.AIH_HOME = cfgHome;
+      try {
+        collectRulesSync(cfgHome);
+      } finally {
+        if (saved === undefined) delete process.env.AIH_HOME;
+        else process.env.AIH_HOME = saved;
+      }
+      rmSync(cfgHome, { recursive: true, force: true });
+      assert(warned === true, "rules: URL instruction entry warns on stderr (not silent)");
+    } finally {
+      process.stderr.write = prevErr;
+    }
+  }
 
   // ---- POLICIES ----
   assert(wildcardMatch("company-*", "company-us"), "policies: '*' wildcard matches");

@@ -9,7 +9,8 @@
  *
  * Precedence (first match wins within a category, mirroring opencode):
  *   1. Project rules: walking up from cwd — AGENTS.md, else CLAUDE.md.
- *   2. Global rules:  ~/.aih/AGENTS.md (AIH's own global dir) →
+ *   2. Global rules:  <XDG user dir>/AGENTS.md (AIH's own global dir, legacy
+ *                     ~/.aih/AGENTS.md also honored) →
  *                     ~/.claude/CLAUDE.md (Claude Code compat).
  *   3. Config `instructions` entries (paths / globs / remote URLs) from any
  *      trusted config layer.
@@ -24,8 +25,9 @@ import {
   readdirSync,
   statSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { loadLayers } from "./config.js";
+import { userAihDirs } from "./paths.js";
 
 /** True when a directory path carries the given file. */
 function hasFile(dir: string, name: string): boolean {
@@ -53,11 +55,21 @@ export function findProjectRuleFiles(fromDir = process.cwd()): string[] {
 }
 
 /**
- * Global rule files: AIH's own global AGENTS.md first, then Claude Code
- * ~/.claude/CLAUDE.md (compat, unless disabled).
+ * Global rule files: AIH's own global AGENTS.md (XDG-resolved user dir +
+ * legacy ~/.aih, both checked) first, then Claude Code ~/.claude/CLAUDE.md
+ * (compat, unless disabled). Mirrors opencode's global.config/AGENTS.md.
  */
 export function findGlobalRuleFiles(): string[] {
   const out: string[] = [];
+  // AIH's own global AGENTS.md — userAihDirs() returns [primary, legacy] with
+  // the XDG-resolved dir first, so a setup that keeps data in ~/.aih keeps
+  // working. Disable with AIH_DISABLE_AIH_PROMPT=1.
+  if (process.env.AIH_DISABLE_AIH_PROMPT !== "1") {
+    for (const d of userAihDirs()) {
+      const p = join(d, "AGENTS.md");
+      if (existsSync(p) && !out.includes(p)) out.push(p);
+    }
+  }
   if (process.env.AIH_DISABLE_CLAUDE_CODE !== "1") {
     // ~/.claude/CLAUDE.md — Claude Code compatibility fallback.
     const home = process.env.HOME;
@@ -76,25 +88,48 @@ function readInstructionsEntry(
   entry: string,
   baseDir: string,
 ): string[] {
-  // Remote URL: fetch with a short timeout, best-effort.
+  // Remote URL: the sync loader cannot fetch (no sync fetch in plain Node).
+  // Fail LOUD instead of silently dropping the entry — a user configuring a
+  // remote rules URL must know it is not active in this build. (opencode
+  // fetches URLs asynchronously; AIH's session startup is synchronous, so
+  // remote rules are intentionally unsupported until an async load path.)
   if (/^https?:\/\//.test(entry)) {
-    // No synchronous fetch in plain Node — log and skip (async path is in
-    // loadRuleFilesAsync). Kept here for symmetry; the async loader handles URLs.
+    process.stderr.write(
+      `[aih] warning: instructions entry "${entry}" is a remote URL — ` +
+        `remote rules are not loaded in this build (use a local file or glob path)\n`,
+    );
     return [];
   }
+  // ~ expansion (opencode parity): "~/rules.md" → $HOME/rules.md. Runs
+  // BEFORE the glob/path resolution so "~/*.md" globs walk $HOME.
+  let e = entry;
+  if (e.startsWith("~")) {
+    const home = process.env.HOME;
+    if (!home) {
+      process.stderr.write(
+        `[aih] warning: instructions entry "${entry}" starts with ~ but HOME is unset — skipped\n`,
+      );
+      return [];
+    }
+    e = e === "~" ? home : join(home, e.slice(2));
+  }
   // Glob pattern?
-  if (entry.includes("*") || entry.includes("?")) {
+  if (e.includes("*") || e.includes("?")) {
     const globToRegex = (p: string): RegExp => {
       const esc = p.replace(/[.+^${}()|[\]\\]/g, "\\$&");
       const rx = esc.replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
       return new RegExp(`^${rx}$`);
     };
-    const rx = globToRegex(entry);
+    const rx = globToRegex(e);
     const base = resolve(baseDir);
-    const dir = dirname(join(base, entry.split("/").slice(0, -1).join("/") || "."));
+    // Search root = the glob's literal directory prefix (no glob chars), so
+    // "docs/*.md" walks docs/ only, "*.md" walks base/ only. (A stray dirname
+    // here walked one level too high: "*.md" scanned the config dir's PARENT.)
+    const literalDir = e.split("/").slice(0, -1).join("/") || ".";
+    const dir = join(base, literalDir);
     return walkFiles(dir).filter((f) => rx.test(relativePath(base, f)));
   }
-  const p = isAbsolute(entry) ? entry : resolve(baseDir, entry);
+  const p = isAbsolute(e) ? e : resolve(baseDir, e);
   return existsSync(p) && statSync(p).isFile() ? [p] : [];
 }
 
@@ -114,8 +149,15 @@ function walkFiles(dir: string, maxFiles = 2000): string[] {
   return out;
 }
 
+/**
+ * Glob-relative path of a walked file under `base`, normalized for `..`
+ * escapes. A pure prefix-slice breaks when the glob's literal dir walks
+ * OUTSIDE base ("../docs/*.md" → dir above base) — path.relative gives the
+ * correct "../docs/one.md" form in both cases.
+ */
 function relativePath(base: string, p: string): string {
-  return p.startsWith(base) ? p.slice(base.length).replace(/^[/\\]/, "") : p;
+  const rel = relative(base, p);
+  return rel;
 }
 
 /** Load `instructions` entries from all trusted config layers (sync subset:
@@ -133,11 +175,15 @@ function loadInstructionsFromConfigSync(): string[] {
   return out;
 }
 
-/** Read a rule file, trimming and honoring the 6000-char system-prompt budget. */
+/** Read a rule file, trimming and honoring the 6000-char system-prompt budget.
+ *  A file over the cap is cut WITH an explicit truncation marker so a silently
+ *  truncated rule can never masquerade as complete (a mid-sentence cut can
+ *  produce contradictory instructions the agent cannot diagnose). */
 export function readRuleFile(path: string, maxChars = 6000): string {
   try {
-    const content = readFileSync(path, "utf8");
-    return content.trim().slice(0, maxChars);
+    const content = readFileSync(path, "utf8").trim();
+    if (content.length <= maxChars) return content;
+    return `${content.slice(0, maxChars)}\n[truncated at ${maxChars} chars — rest of ${path} was not loaded]`;
   } catch {
     return "";
   }
