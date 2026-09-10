@@ -4338,6 +4338,17 @@ await srv.connect(new StdioServerTransport());
     ).stdout.trim();
   assert(probe({ AIH_AMBIGUOUS_WIDE: "1" }) === "2 1 1", "AIH_AMBIGUOUS_WIDE=1 keeps EAW=A narrow (emoji still 2)");
   assert(probe({ AIH_AMBIGUOUS_WIDE: "2" }) === "2 2 2", "AIH_AMBIGUOUS_WIDE=2 forces EAW=A wide");
+  // DSR ambiguous-width probe classifier: ─ written at col 1, DSR reports the
+  // cursor column AFTER it. col 2 → width 1 (narrow), col 3 → width 2 (wide).
+  const dsrProbe = (expr: string) =>
+    spawnSync(
+      process.execPath,
+      ["-e", `import(${JSON.stringify(tuiUrl)}).then((m) => console.log(${expr}))`],
+      { encoding: "utf8" },
+    ).stdout.trim();
+  assert(dsrProbe("m.ambiguousWidthFromDsrCol(2)") === "narrow", "DSR probe: col 2 (width 1) → narrow");
+  assert(dsrProbe("m.ambiguousWidthFromDsrCol(3)") === "wide", "DSR probe: col 3 (width 2) → wide");
+  assert(dsrProbe("m.ambiguousWidthFromDsrCol(1)") === "narrow", "DSR probe: col 1 (degenerate) → narrow");
   const tui = new Tui({
     placeholder: ">",
     meta: () => ({ agent: "t", model: "m", provider: "p" }),

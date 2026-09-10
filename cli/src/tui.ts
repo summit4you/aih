@@ -254,8 +254,8 @@ const WIDTH_OVERRIDES: Record<number, number> = {
 };
 const segmenter = new Intl.Segmenter();
 
-// swOpts derives from an env var that is fixed for the life of the process —
-// memoize it so the per-cluster hot path never re-reads env / re-allocates.
+// swOpts derives from an env var OR the runtime DSR probe (see
+// probeAmbiguousWidth). Memoize so the per-cluster hot path never re-reads.
 let _swOpts: { ambiguousIsNarrow: boolean } | null = null;
 function swOpts(): { ambiguousIsNarrow: boolean } {
   if (_swOpts === null) {
@@ -264,6 +264,104 @@ function swOpts(): { ambiguousIsNarrow: boolean } {
       : { ambiguousIsNarrow: true };
   }
   return _swOpts;
+}
+
+/**
+ * Runtime probe: measure how THIS terminal actually renders an ambiguous-width
+ * character (box-drawing ─, ·, █░, etc.) by writing it at a KNOWN position
+ * (col 1 after home), querying the cursor column via DSR (ESC[6n), and
+ * computing the delta.
+ *
+ * Why: the standard string-width algorithm counts EAW=A (ambiguous) as 1 cell,
+ * but many terminals (especially inside tmux, or with CJK fonts) render them
+ * as 2 cells. If AIH's width model undercounts, progress bars and text lines
+ * in the sidebar overflow their allocated panel width → wrap → the left margin
+ * looks oversized and the bar looks truncated. The DSR probe measures the
+ * ACTUAL terminal behaviour, so no env var is needed.
+ *
+ * Protocol (single round-trip):
+ *   write:  ESC[H  ─  ESC[6n  ESC[H  ESC[2K
+ *   read:   ESC[1;(1+width)A
+ *   width = col - 1  →  1 = narrow (default), 2 = wide
+ *
+ * Falls back to the env var / narrow default if the terminal doesn't respond
+ * within 200ms (non-interactive, DSR-disabled, etc.).
+ *
+ * MUST be called BEFORE the first paint (i.e. before tui.start() or as the
+ * first thing in an async init). Safe in canonical mode — DSR responses are
+ * not line-buffered by the terminal driver.
+ */
+/**
+ * DSR probe state. Started by start() (raw mode already on); the MAIN stdin
+ * data handler routes the DSR response (ESC[1;colA) to #probe.resolve, so no
+ * second listener races the main one. #paint gates on #probe.promise so the
+ * first frame uses the correct width model.
+ */
+interface ProbeState {
+  promise: Promise<"narrow" | "wide">;
+  resolve: (r: "narrow" | "wide") => void;
+  done: boolean;
+}
+let _probe: ProbeState | null = null;
+
+/**
+ * Begin the ambiguous-width probe. MUST be called after setRawMode(true) and
+ * before the main stdin "data" handler is attached (or the handler must route
+ * DSR responses to the returned state — see start()). No-ops (resolves
+ * "narrow") when the width is env-forced, non-TTY, or under test.
+ */
+function beginProbe(): ProbeState | null {
+  const env = process.env.AIH_AMBIGUOUS_WIDE;
+  if (env === "2") { _swOpts = { ambiguousIsNarrow: false }; return null; }
+  if (env === "1") { _swOpts = { ambiguousIsNarrow: true }; return null; }
+  if (!process.stdout.isTTY || process.env.NODE_ENV === "test") return null;
+
+  let resolveFn: (r: "narrow" | "wide") => void = () => {};
+  const promise = new Promise<"narrow" | "wide">((res) => { resolveFn = res; });
+  const state: ProbeState = { promise, resolve: resolveFn, done: false };
+  // Timeout: terminal didn't answer → keep the narrow default.
+  setTimeout(() => {
+    if (state.done) return;
+    state.done = true;
+    if (_probe === state) _probe = null; // clear only if still the active probe
+    resolveFn("narrow");
+  }, 200).unref?.();
+  // Home → write ─ at col 1 → query position → home → clear line.
+  process.stdout.write("\x1b[H\u2500\x1b[6n\x1b[H\x1b[2K");
+  _probe = state; // feedProbe() reads this to route the DSR response
+  return state;
+}
+
+/** Route a DSR response (ESC[row;colA) to the in-flight probe, if any. */
+/**
+ * Pure classifier: given the DSR-reported cursor column AFTER writing ─ at
+ * col 1, decide the terminal's ambiguous-width behaviour. width = col - 1
+ * (1 = narrow, 2 = wide). Exported for smoke-test coverage.
+ */
+export function ambiguousWidthFromDsrCol(col: number): "narrow" | "wide" {
+  return col - 1 >= 2 ? "wide" : "narrow";
+}
+
+function feedProbe(chunk: string): boolean {
+  const p = _probe;
+  if (!p || p.done) return false;
+  // The probe homed the cursor to row 1 before writing ─, so the DSR response
+  // is always ESC[1;colA. Anchor on row=1 so a user keystroke that happens to
+  // look like a DSR (rare) is not swallowed.
+  const m = /\x1b\[1;(\d+)A/.exec(chunk);
+  if (!m) return false;
+  p.done = true;
+  _probe = null;
+  const result = ambiguousWidthFromDsrCol(parseInt(m[1], 10));
+  _swOpts = { ambiguousIsNarrow: result === "narrow" };
+  // The width model changed → any cluster widths cached under the old model
+  // (e.g. a width() call before the DSR response, or a prior Tui in-process)
+  // are now wrong. Invalidate so the first paint recomputes with the correct
+  // model. (clusterWidthCache is declared below via function hoisting order —
+  // it is a module-level const, reachable here.)
+  clusterWidthCache.clear();
+  p.resolve(result);
+  return true;
 }
 
 // Cache cluster widths: the same grapheme clusters repeat across the whole TUI,
@@ -589,6 +687,8 @@ export class Tui {
   #rows = 24;
   #cols = 80;
   #running = false;
+  /** Ambiguous-width probe promise (null = none in flight / already resolved). #paint gates on it. */
+  #probePromise: Promise<"narrow" | "wide"> | null = null;
   #frame = 0;
   #busySince = 0;
   #arrowTimes: number[] = [];
@@ -705,7 +805,16 @@ constructor(opts: TuiOptions) {
     else if (forced !== "dark") process.stdout.write("\x1b]11;?\x07");
     process.stdin.setRawMode(true);
     process.stdin.resume();
-    process.stdin.on("data", (data: Buffer) => this.#feed(data.toString("utf8")));
+    // Ambiguous-width probe: measure how THIS terminal renders box-drawing /
+    // bar chars (narrow vs 2-cell) so the sidebar bar/text are sized right.
+    // The DSR response is routed through the main data handler below (feedProbe).
+    const probe = beginProbe();
+    if (probe) this.#probePromise = probe.promise;
+    process.stdin.on("data", (data: Buffer) => {
+      const s = data.toString("utf8");
+      if (feedProbe(s)) return; // DSR response consumed by the probe
+      this.#feed(s);
+    });
     process.stdout.on("resize", () => {
       this.#clearNext = true;
       // Legacy conhost (Win10/11 without Windows Terminal) crashes on
@@ -787,7 +896,13 @@ constructor(opts: TuiOptions) {
       );
     }
     this.#timer = setInterval(this.#tick, 120);
-    this.#paint();
+    // First paint waits for the ambiguous-width probe to resolve (≤200ms) so
+    // the sidebar bar/text are sized with the correct width model from frame 1.
+    if (this.#probePromise) {
+      this.#probePromise.then(() => { this.#probePromise = null; this.#paint(); });
+    } else {
+      this.#paint();
+    }
   }
 
   stop(): void {

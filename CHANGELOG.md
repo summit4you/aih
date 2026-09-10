@@ -9,6 +9,13 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Added
+- **歧义宽度终端自动探测（DSR probe）**（`cli/src/tui.ts`）：启动时（raw mode 下、
+  首帧 paint 前）向终端写一个盒线字符 `─` 并用 DSR（`ESC[6n`）量回光标列，直接测出
+  本终端把 EAW=A（歧义宽度）字符渲染成 1 格还是 2 格，据此校准 `width()` 模型。
+  解决 tmux / CJK 字体下侧栏进度条与文字因宽度低估而回行、左 margin 偏大的问题——
+  不再依赖 `AIH_AMBIGUOUS_WIDE` 环境变量（仍可用 `=1`/`=2` 强制覆盖）。终端 200ms 内
+  不响应则回退窄默认；宽度模型翻转时失效 `clusterWidthCache` 以免旧值污染首帧。
+  smoke 覆盖 DSR 列→宽度分类器。
 - **自动更新（opencode `upgrade` parity）**（`cli/src/update.ts`）：
   检查 GitHub `releases/latest` → 与已装版本比较 → 有新版本时 TUI 顶部提示
   `✨ vN available — /update`（后台检查、失败静默、跳过版本被记住，只有更新的
