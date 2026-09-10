@@ -8,6 +8,18 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Fixed
+- **首次输入 `o`/`O` 被吞**（`cli/src/tui.ts`）：`o` 在空 composer 时作为 toggle
+  快捷键（conhost 键盘路径，`3c0e3ef` 引入）。但它在**空 transcript**（新启动无任何
+  tool 块）时也会触发 `#toggleFocus`——内部因无 unit 而 no-op，键被消费却无效果，
+  表现为「首次输入 o 无法输入」。现在仅当存在可 toggle 的 unit（group 或带输出的
+  tool item）时才走 toggle，否则 `o` 正常进入 composer。smoke 回归断言覆盖。
+- **DSR probe 响应格式错误**（`cli/src/tui.ts`，`cfd9c48` 引入）：`feedProbe` 正则
+  以 `A` 结尾匹配 CPR，但终端对 DSR 的响应（Cursor Position Report）以 **`R`** 结尾
+  （`ESC[row;colR`）——真实终端上 probe 永远匹配不到、宽度探测静默失效。改为
+  `ESC[<row>;<col>R`（接受任意行号，只用列）。真实路径验证：`ESC[1;3R` 正确触发
+  `width(─)` 从 1 → 2。
+
 ### Added
 - **歧义宽度终端自动探测（DSR probe）**（`cli/src/tui.ts`）：启动时（raw mode 下、
   首帧 paint 前）向终端写一个盒线字符 `─` 并用 DSR（`ESC[6n`）量回光标列，直接测出

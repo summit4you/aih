@@ -345,14 +345,14 @@ export function ambiguousWidthFromDsrCol(col: number): "narrow" | "wide" {
 function feedProbe(chunk: string): boolean {
   const p = _probe;
   if (!p || p.done) return false;
-  // The probe homed the cursor to row 1 before writing ─, so the DSR response
-  // is always ESC[1;colA. Anchor on row=1 so a user keystroke that happens to
-  // look like a DSR (rare) is not swallowed.
-  const m = /\x1b\[1;(\d+)A/.exec(chunk);
+  // CPR (Cursor Position Report): ESC[row;colR — the terminal's reply to our
+  // DSR query. We homed to row 1 before writing ─, so row should be 1, but
+  // some wrappers (tmux) may translate; accept any row and use only the col.
+  const m = /\x1b\[(\d+);(\d+)R/.exec(chunk);
   if (!m) return false;
   p.done = true;
   _probe = null;
-  const result = ambiguousWidthFromDsrCol(parseInt(m[1], 10));
+  const result = ambiguousWidthFromDsrCol(parseInt(m[2], 10));
   _swOpts = { ambiguousIsNarrow: result === "narrow" };
   // The width model changed → any cluster widths cached under the old model
   // (e.g. a width() call before the DSR response, or a prior Tui in-process)
@@ -1806,7 +1806,11 @@ constructor(opts: TuiOptions) {
       case "O": {
         // A — `o` on an empty composer toggles the focused tool block too
         // (mnemonic "open"; keyboard-only path for legacy Windows conhost).
-        if (!this.#edit.trim()) {
+        // ONLY when a toggleable unit exists — otherwise fall through to
+        // normal input so the first keystroke is never eaten (reported bug:
+        // typing "o" on a fresh transcript vanished; nothing to toggle in an
+        // empty transcript, so `o` must land in the composer).
+        if (!this.#edit.trim() && this.#hasToggleable()) {
           this.#toggleFocus();
           this.requestPaint();
         } else {
@@ -2176,6 +2180,21 @@ constructor(opts: TuiOptions) {
     this.#focusUnit = i;
     this.#follow();
     this.requestPaint();
+  }
+
+  /**
+   * True when a transcript unit is focus-toggleable (a group, or a tool item
+   * with a string output). The `o`/`O` key on an empty composer drives
+   * #toggleFocus; if nothing is toggleable it must fall through to normal
+   * input instead of silently eating the keystroke (reported bug: first key
+   * typed was 'o' and vanished on a fresh transcript).
+   */
+  #hasToggleable(): boolean {
+    for (const u of this.#units()) {
+      if (u.kind === "group") return true;
+      if (u.kind === "item" && u.item.tool && typeof u.item.tool.output === "string") return true;
+    }
+    return false;
   }
 
   #follow(): void {

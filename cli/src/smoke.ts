@@ -4724,6 +4724,26 @@ await srv.connect(new StdioServerTransport());
 
 // --- A: keyboard expand/collapse (Enter/o on empty composer) ------------------
 {
+  // Regression: 'o' as the very first keystroke (empty transcript — nothing
+  // to toggle) must land in the composer. Reported bug: the `o` toggle
+  // shortcut ate the first typed key on a fresh session because it fired
+  // even when no toggleable unit existed (#toggleFocus no-ops → key eaten).
+  {
+    const { Tui } = await import("./tui.js");
+    let submitted: string | null = null;
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: (l) => { submitted = l; },
+    });
+    tui.feed("o");
+    tui.feed("\r");
+    assert(submitted === "o", `first 'o' on empty transcript lands in composer (got ${JSON.stringify(submitted)})`);
+  }
   const { Tui } = await import("./tui.js");
   const tui = new Tui({
     placeholder: ">",
