@@ -692,6 +692,15 @@ export class Tui {
   #held = "";
   #histCursor = -1;
   #scrollTop = 0;
+  /**
+   * Scroll pinning: true = glued to the bottom (new content auto-follows).
+   * The user can scroll up to browse history while a task streams new
+   * messages; as long as they are NOT at the bottom, we stay unpinned and
+   * keep their viewport anchored (sticky scroll) instead of yanking them to
+   * the bottom on every new message. Scroll/paging back down to the bottom,
+   * End, or the follow key re-pins.
+   */
+  #pinned = true;
   #rows = 24;
   #cols = 80;
   #running = false;
@@ -1013,9 +1022,10 @@ constructor(opts: TuiOptions) {
     this.#batching = true;
   }
 
-  /** End a bulk insert: follow + paint once. */
+  /** End a bulk insert: follow (re-pin) + paint once. */
   endBatch(): void {
     this.#batching = false;
+    this.#pinned = true; // session replay always ends at the latest position
     this.#follow();
     this.requestPaint();
   }
@@ -1024,8 +1034,7 @@ constructor(opts: TuiOptions) {
     this.#items.push(item);
     this.#panelSeq += 1;
     if (!this.#batching) {
-      this.#follow();
-      this.requestPaint();
+      this.#notifyNewContent();
     }
   }
 
@@ -1037,8 +1046,7 @@ constructor(opts: TuiOptions) {
     });
     this.#panelSeq += 1;
     if (!this.#batching) {
-      this.#follow();
-      this.requestPaint();
+      this.#notifyNewContent();
     }
   }
 
@@ -1123,8 +1131,7 @@ constructor(opts: TuiOptions) {
       this.#invalidateItem(last);
     } else this.#items.push({ role: "assistant", text });
     if (!this.#batching) {
-      this.#follow();
-      this.requestPaint();
+      this.#notifyNewContent();
     }
   }
 
@@ -1985,10 +1992,12 @@ constructor(opts: TuiOptions) {
       case "H":
       case "OH":
         this.#scrollTop = 0;
+        this.#pinned = false; // at the top, browsing history — not at the bottom
         this.requestPaint();
         break;
       case "F":
       case "OF":
+        this.#pinned = true;
         this.#follow();
         this.requestPaint();
         break;
@@ -2106,6 +2115,9 @@ constructor(opts: TuiOptions) {
   #scrollBy(delta: number): void {
     const maxTop = Math.max(0, this.#contentLines() - this.#viewHeight());
     this.#scrollTop = Math.min(maxTop, Math.max(0, this.#scrollTop + delta));
+    // Scrolling to the bottom (or past it) re-pins to follow mode; anywhere
+    // above the bottom parks the user in history-browsing mode (sticky).
+    this.#pinned = this.#scrollTop >= maxTop;
     this.requestPaint();
   }
 
@@ -2171,12 +2183,33 @@ constructor(opts: TuiOptions) {
       this.#invalidateItem(it);
     }
     this.#focusUnit = i;
-    this.#follow();
+    // Respect an unpinned (history-browsing) viewport: expanding/collapsing
+    // a block changes the content height, but a user reading history should
+    // not be yanked to the bottom. Only pinned mode follows.
+    if (this.#pinned) this.#follow();
     this.requestPaint();
   }
 
   #follow(): void {
     this.#scrollTop = Math.max(0, this.#contentLines() - this.#viewHeight());
+  }
+
+  /**
+   * New content arrived below the viewport (a message was pushed, a tool
+   * row resolved, a stream delta appended). Pinned → follow the bottom as
+   * before. Unpinned (user browsing history while a task runs) → do NOTHING:
+   * scrollTop is an offset from the TOP of the document, so unchanged it keeps
+   * the exact rows the user is reading on the same screen rows while new
+   * messages accumulate below the viewport (sticky scroll). The user stays in
+   * control; scrolling to the bottom / End re-pins via #scrollBy / the F key.
+   */
+  #notifyNewContent(): void {
+    if (this.#pinned) {
+      this.#follow();
+      this.requestPaint();
+    } else {
+      this.requestPaint();
+    }
   }
 
   /**
@@ -2576,6 +2609,11 @@ constructor(opts: TuiOptions) {
   frameForTest(): string[] {
     const strip = (s: string): string => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b[()][0-9A-Z]/g, "");
     return this.#lastLines.map(strip);
+  }
+
+  /** Test hook — scroll pinning state for sticky-scroll smoke assertions. */
+  scrollStateForTest(): { scrollTop: number; pinned: boolean; contentLines: number } {
+    return { scrollTop: this.#scrollTop, pinned: this.#pinned, contentLines: this.#contentLines() };
   }
 
   /** Test hook — mirrors #inputLayout so smoke can assert the opencode/mimo-code

@@ -3523,6 +3523,83 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // Sticky scroll (pin-to-content): while a task streams new messages, the
+  // user browsing history must NOT be yanked to the bottom. Scroll up →
+  // unpinned; new pushes keep the viewport anchored; scroll to bottom / End
+  // re-pins. Regression: before pinned state existed, every push()/pushDelta()
+  // called follow() and snapped scrollTop to the bottom, so browsing history
+  // during an active task was impossible.
+  const { Tui } = await import("./tui.js");
+  const tui = new Tui({
+    placeholder: ">",
+    meta: () => ({ agent: "t", model: "m", provider: "p" }),
+    cwd: "/tmp",
+    statusLeft: "x",
+    statusRight: "y",
+    busy: () => false,
+    onLine: () => {},
+  });
+  const H = 30, W = 140;
+  Object.defineProperty(process.stdout, "rows", { value: H, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: W, configurable: true });
+  (process.stdin as any).isTTY = true;
+  (process.stdin as any).setRawMode = () => {};
+  (process.stdin as any).resume = () => {};
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as any;
+  tui.start();
+  await new Promise((r) => setTimeout(r, 30));
+
+  // Build a long history so the viewport can scroll.
+  tui.beginBatch();
+  for (let i = 0; i < 12; i++) {
+    tui.push({ role: "user", text: `user message ${i}` });
+    tui.push({ role: "assistant", text: `assistant reply ${i} — padded out so the block wraps over several terminal lines `.repeat(2) });
+  }
+  tui.endBatch();
+  const bottom = tui.scrollStateForTest();
+  assert(bottom.pinned === true, "after batch replay, viewport is pinned at the bottom");
+  const bottomTop = bottom.scrollTop;
+
+  // Scroll up: PgUp leaves pinning; the user is now browsing history.
+  tui.feed("\x1b[5~"); // PgUp
+  const up = tui.scrollStateForTest();
+  assert(up.pinned === false, "PgUp unpins the viewport (browsing history)");
+  assert(up.scrollTop < bottomTop, `PgUp moved up (${up.scrollTop} < ${bottomTop})`);
+
+  // New content arrives mid-task: must NOT yank the user to the bottom.
+  tui.pushTool("run_cmd", { command: "echo hi" }, "call-1");
+  tui.pushDelta("streaming assistant output while the user browses history… ");
+  tui.push({ role: "assistant", text: "and a completed reply" });
+  const mid = tui.scrollStateForTest();
+  assert(mid.pinned === false, "new content while browsing does not re-pin");
+  assert(mid.scrollTop === up.scrollTop, `viewport stays anchored while new content arrives (${up.scrollTop} → ${mid.scrollTop})`);
+
+  // PgDn toward the bottom stays unpinned until it actually hits maxTop.
+  tui.feed("\x1b[6~"); // PgDn
+  const nearBottom = tui.scrollStateForTest();
+  assert(nearBottom.pinned === false || nearBottom.scrollTop >= mid.scrollTop, "PgDn moves down and stays unpinned until the very bottom");
+  // One more PgDn should land at/near the bottom and re-pin.
+  tui.feed("\x1b[6~");
+  const atBottom = tui.scrollStateForTest();
+  assert(atBottom.pinned === true, "PgDn to the bottom re-pins");
+  assert(atBottom.scrollTop >= nearBottom.scrollTop, "re-pinned at the (new) bottom");
+
+  // End key re-pins immediately from anywhere.
+  tui.feed("\x1b[5~"); // PgUp again → unpinned
+  const up2 = tui.scrollStateForTest();
+  assert(up2.pinned === false, "PgUp again unpins");
+  tui.feed("\x1b[F"); // End
+  const end = tui.scrollStateForTest();
+  assert(end.pinned === true, "End key re-pins");
+  assert(end.scrollTop === tui.scrollStateForTest().scrollTop || end.scrollTop >= up2.scrollTop, "End lands at the bottom");
+
+  tui.stop();
+  process.stdout.write = origWrite;
+  console.log("ok: sticky scroll — browsing history is not yanked by new messages; End/bottom re-pins");
+}
+
+{
   // Bare-Esc residue in a question prompt — after a lone Esc the escape
   // machine holds "\x1b" and used to eat the user's NEXT keypress as the
   // double-Esc detector's timing sample: backspace looked dead, Tab looked

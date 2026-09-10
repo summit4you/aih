@@ -9,6 +9,13 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Fixed
+- **任务执行中滚动浏览历史会被新消息顶回底部（缺 pinned 状态，`#follow()` 无条件钉底）**
+  （`cli/src/tui.ts`）：新增 `#pinned` 滚动驻留状态——默认跟随底部；用户滚动离开
+  底部（PgUp/PgDn/Home/滚轮）进入「浏览历史」模式，此后任何新消息（push/pushTool/
+  pushDelta/流式输出）只刷新而不改 scrollTop，用户正在读的旧内容稳定驻留屏幕原位
+  （sticky scroll），不再被顶走。滚动回底部（或 End/`F` 键）自动恢复跟随。会话回放
+  （endBatch）始终 re-pin 到底。新增 smoke 断言（`scrollStateForTest` 覆盖：批量回放
+  后 pinned、PgUp 解除、新内容不抢视野、PgDn 到最底 re-pin、End 立即 re-pin）。
 - **26 个字母中只有 `o`/`O` 在空输入框无法输入（根因：toggle 快捷键与字母冲突）**
   （`cli/src/tui.ts`，`3c0e3ef` 引入，`d23aed3`/`7c9596b` 曾多次打补丁未根治）：
   `o`/`O` 在空 composer 时被定义为「展开/折叠工具块」快捷键（conhost 无鼠标键盘
