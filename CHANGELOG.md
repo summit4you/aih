@@ -9,11 +9,18 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Fixed
-- **首次输入 `o`/`O` 被吞**（`cli/src/tui.ts`）：`o` 在空 composer 时作为 toggle
-  快捷键（conhost 键盘路径，`3c0e3ef` 引入）。但它在**空 transcript**（新启动无任何
-  tool 块）时也会触发 `#toggleFocus`——内部因无 unit 而 no-op，键被消费却无效果，
-  表现为「首次输入 o 无法输入」。现在仅当存在可 toggle 的 unit（group 或带输出的
-  tool item）时才走 toggle，否则 `o` 正常进入 composer。smoke 回归断言覆盖。
+- **重启后首次输入 `o`/`O` 被吞（根因：DSR probe chunk 丢弃竞态）**（`cli/src/tui.ts`，
+  `cfd9c48` 引入）：启动时 probe 写 `ESC[6n` 查询光标位置，终端回复 CPR
+  （`ESC[row;colR`）。`feedProbe` 匹配到 CPR 后整个 chunk `return true`，但**用户启动后
+  立刻输入时，终端的 CPR 响应和首个按键会合并成同一 stdin chunk**——按键（如 `o`）被
+  连带丢弃。表现为「每次重启后首次输入 o 都不行」，与 toggle 快捷键无关。修复：
+  `feedProbe` 改为**剥掉 CPR 序列、保留 chunk 其余字节**继续走正常输入路径
+  （返回剩余串，空/null 区分）。真实路径复现（mock TTY + `start()` + 同 chunk
+  `ESC[1;3Ro`）：修复前 `o` 丢失，修复后存活。smoke 回归断言覆盖（走真实 stdin 路径）。
+- **`o`/`O` 空 composer toggle 在空 transcript 吞键**（`cli/src/tui.ts`，`3c0e3ef`
+  引入）：`o` 在空 composer 时作为 toggle 快捷键，但空 transcript（无任何 tool 块）时
+  `#toggleFocus` no-op，键被消费却无效果。现在仅当存在可 toggle 的 unit（group 或
+  带输出的 tool item）时才走 toggle，否则 `o` 正常进入 composer。smoke 回归断言覆盖。
 - **DSR probe 响应格式错误**（`cli/src/tui.ts`，`cfd9c48` 引入）：`feedProbe` 正则
   以 `A` 结尾匹配 CPR，但终端对 DSR 的响应（Cursor Position Report）以 **`R`** 结尾
   （`ESC[row;colR`）——真实终端上 probe 永远匹配不到、宽度探测静默失效。改为

@@ -342,14 +342,21 @@ export function ambiguousWidthFromDsrCol(col: number): "narrow" | "wide" {
   return col - 1 >= 2 ? "wide" : "narrow";
 }
 
-function feedProbe(chunk: string): boolean {
+/**
+ * Consume a CPR (Cursor Position Report) from a stdin chunk and resolve the
+ * width probe. Returns the chunk WITH the CPR removed (may be empty), so any
+ * bytes around it — e.g. a keystroke the terminal batched with the CPR reply
+ * (reported bug: the first 'o' typed during the probe window was eaten) —
+ * still reach the normal input path. Returns null when no CPR is present.
+ */
+function feedProbe(chunk: string): string | null {
   const p = _probe;
-  if (!p || p.done) return false;
+  if (!p || p.done) return null;
   // CPR (Cursor Position Report): ESC[row;colR — the terminal's reply to our
   // DSR query. We homed to row 1 before writing ─, so row should be 1, but
   // some wrappers (tmux) may translate; accept any row and use only the col.
   const m = /\x1b\[(\d+);(\d+)R/.exec(chunk);
-  if (!m) return false;
+  if (!m) return null;
   p.done = true;
   _probe = null;
   const result = ambiguousWidthFromDsrCol(parseInt(m[2], 10));
@@ -361,7 +368,8 @@ function feedProbe(chunk: string): boolean {
   // it is a module-level const, reachable here.)
   clusterWidthCache.clear();
   p.resolve(result);
-  return true;
+  // Strip the CPR; keep whatever else was in this chunk (typed keys).
+  return chunk.replace(/\x1b\[\d+;\d+R/g, "");
 }
 
 // Cache cluster widths: the same grapheme clusters repeat across the whole TUI,
@@ -812,8 +820,12 @@ constructor(opts: TuiOptions) {
     if (probe) this.#probePromise = probe.promise;
     process.stdin.on("data", (data: Buffer) => {
       const s = data.toString("utf8");
-      if (feedProbe(s)) return; // DSR response consumed by the probe
-      this.#feed(s);
+      const rest = feedProbe(s);
+      if (rest === null) {
+        this.#feed(s); // no CPR in this chunk — normal input
+      } else if (rest) {
+        this.#feed(rest); // CPR consumed; remaining bytes are user keys
+      }
     });
     process.stdout.on("resize", () => {
       this.#clearNext = true;

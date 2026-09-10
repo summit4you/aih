@@ -4744,6 +4744,51 @@ await srv.connect(new StdioServerTransport());
     tui.feed("\r");
     assert(submitted === "o", `first 'o' on empty transcript lands in composer (got ${JSON.stringify(submitted)})`);
   }
+  // Regression: the DSR probe must never swallow a keystroke batched in the
+  // same stdin chunk as the CPR reply. Start() sends DSR; a terminal can
+  // deliver CPR + the user's first key in ONE chunk; feedProbe used to return
+  // early after matching the CPR and DROP the rest of the chunk (the 'o').
+  // Must go through the REAL start() stdin path (feed() skips feedProbe).
+  {
+    const { Tui } = await import("./tui.js");
+    let submitted: string | null = null;
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: (l) => { submitted = l; },
+    });
+    const listeners: Array<(d: Buffer) => void> = [];
+    const origOn = (process.stdin as any).on.bind(process.stdin);
+    (process.stdin as any).on = (ev: string, fn: (d: Buffer) => void) => {
+      if (ev === "data") { listeners.push(fn); return process.stdin; }
+      return origOn(ev, fn);
+    };
+    const origOff = (process.stdin as any).removeListener.bind(process.stdin);
+    (process.stdin as any).removeListener = (ev: string, fn: (d: Buffer) => void) => {
+      if (ev === "data") { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); }
+      return origOff(ev, fn);
+    };
+    (process.stdin as any).isTTY = true;
+    (process.stdin as any).setRawMode = () => {};
+    (process.stdin as any).resume = () => {};
+    (process.stdout as any).isTTY = true;
+    Object.defineProperty(process.stdout, "rows", { value: 30, configurable: true });
+    Object.defineProperty(process.stdout, "columns", { value: 140, configurable: true });
+    const emit = (s: string) => { for (const fn of [...listeners]) fn(Buffer.from(s)); };
+    tui.start();
+    // CPR (ESC[1;3R) + the user's first key 'o' in the same chunk
+    emit("\x1b[1;3Ro");
+    await new Promise((r) => setTimeout(r, 30));
+    tui.feed("\r");
+    await new Promise((r) => setTimeout(r, 10));
+    tui.stop();
+    (process.stdout as any).isTTY = false;
+    assert(submitted === "o", `CPR+key same chunk keeps 'o' (got ${JSON.stringify(submitted)})`);
+  }
   const { Tui } = await import("./tui.js");
   const tui = new Tui({
     placeholder: ">",
