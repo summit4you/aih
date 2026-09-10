@@ -8,7 +8,22 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+### Added
+- **同版本 release 重传检测（`--clobber` 刷新也能触发更新）**（`cli/src/update.ts` + `cli/src/index.ts`）：
+  自动更新原来只按版本号判断（`compareVersions > 0`），同一 tag 下重新上传 tarball
+  （`gh release upload --clobber`，`published_at` 变化、版本号不变）会被误判为
+  "already up to date"。现在 `checkLatestVersion` 额外取 `published_at`，state 记录
+  `appliedVersion`/`appliedAt` 基线（首次见到某版本时静默基线，`baselineAppliedAt`；
+  更新成功后 `markApplied` 推进）。判断逻辑：版本严格更新 **或** 同版本但
+  `published_at` 晚于基线（`isSameVersionRefresh`）→ 提示更新；启动检查、`/update`、
+  `aih update` 三条路径统一。skip 语义不变（明确跳过的精确版本仍静默）。启动横幅对
+  同版本刷新显示 "vX re-uploaded (same version, newer tarball)"。
+
 ### Fixed
+- **浏览历史时按 End 无法回到底部（VT 终端序列 `ESC[4~` 未处理）**（`cli/src/tui.ts`）：
+  End 只处理了 `ESC[F`/`ESC[OF`，而大多数真实终端（xterm、GNOME Terminal、Windows
+  Terminal、tmux）按 End 发 `ESC[4~`。补上 `4~`（End）与 `1~`（Home，与 `ESC[H`/`ESC[OH`
+  等价）。sticky 模式下按 End 现在能正确 re-pin 回底部。
 - **任务执行中滚动浏览历史会被新消息顶回底部（缺 pinned 状态，`#follow()` 无条件钉底）**
   （`cli/src/tui.ts`）：新增 `#pinned` 滚动驻留状态——默认跟随底部；用户滚动离开
   底部（PgUp/PgDn/Home/滚轮）进入「浏览历史」模式，此后任何新消息（push/pushTool/

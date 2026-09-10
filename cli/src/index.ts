@@ -175,6 +175,9 @@ import {
   readState,
   shouldPrompt,
   markSkipped,
+  markApplied,
+  baselineAppliedAt,
+  isSameVersionRefresh,
   tarballName,
 } from "./update.js";
 import { loopUsageBreakdown, formatLoopBreakdown } from "./loops.js";
@@ -1751,56 +1754,71 @@ async function cmdUpdate(positionals: string[], flags: Record<string, string | b
   const checkOnly = bool(flags, "check", "c");
   const yes = bool(flags, "yes", "y");
 
-  const latest = target || (await checkLatestVersion());
-  if (!latest) {
-    console.error("error: could not reach the GitHub release API (network?)");
-    process.exit(1);
+  // Explicit target (string) or the latest release from the API (which may
+  // carry a published_at for same-version re-upload detection).
+  let latestVersion: string;
+  let latestPublishedAt = "";
+  if (!target) {
+    const latest = await checkLatestVersion();
+    if (!latest) {
+      console.error("error: could not reach the GitHub release API (network?)");
+      process.exit(1);
+    }
+    latestVersion = latest.version;
+    latestPublishedAt = latest.publishedAt;
+    baselineAppliedAt(latestVersion, latestPublishedAt); // remember first sighting
+  } else {
+    latestVersion = target;
   }
   if (checkOnly) {
-    const cmp = compareVersions(latest, VERSION);
+    const cmp = compareVersions(latestVersion, VERSION);
     console.log(`current:  v${VERSION}`);
-    console.log(`latest:   v${latest}`);
+    console.log(`latest:   v${latestVersion}`);
     console.log(cmp > 0 ? "status:   update available" : cmp === 0 ? "status:   up to date" : "status:   local is newer");
     return;
   }
-  if (!target && compareVersions(latest, VERSION) <= 0) {
+  // No explicit target: same-version re-upload (newer published_at than applied)
+  // is a real update too, not just a strictly newer version.
+  const sameVersionRefresh = !target && isSameVersionRefresh(readState(), { version: latestVersion, publishedAt: latestPublishedAt }, VERSION);
+  if (!target && compareVersions(latestVersion, VERSION) <= 0 && !sameVersionRefresh) {
     console.log(`already up to date (v${VERSION})`);
     return;
   }
   if (detectInstallDir() === null) {
     console.error("error: not a tarball install (expected <dir>/app/aih) — install with:");
-    console.error(`  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latest)}`);
+    console.error(`  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latestVersion)}`);
     process.exit(1);
   }
   if (!yes && process.stdin.isTTY) {
     const { createInterface } = await import("node:readline");
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const ans = await new Promise<string>((r) =>
-      rl.question(`update v${VERSION} → v${latest}? [y/N] `, (a) => {
+      rl.question(`update v${VERSION} → v${latestVersion}? [y/N] `, (a) => {
         rl.close();
         r(a.trim().toLowerCase());
       }),
     );
     if (ans !== "y" && ans !== "yes") {
-      markSkipped(latest);
-      console.log(`skipped v${latest} (remembered; /update or aih update to install)`);
+      markSkipped(latestVersion);
+      console.log(`skipped v${latestVersion} (remembered; /update or aih update to install)`);
       return;
     }
   } else if (!yes && !process.stdin.isTTY) {
     console.error("error: non-interactive update requires --yes");
     process.exit(1);
   }
-  const staging = join(os.tmpdir(), `aih-update-${latest.replace(/\./g, "-")}`);
-  process.stdout.write(`downloading aih-${latest}-node.tar.gz → ${staging} …\n`);
-  const { bytes } = await downloadTarball(latest, staging);
+  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}`);
+  process.stdout.write(`downloading aih-${latestVersion}-node.tar.gz → ${staging} …\n`);
+  const { bytes } = await downloadTarball(latestVersion, staging);
   process.stdout.write(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MiB — applying…\n`);
   try {
-    await applyUpdate(join(staging, tarballName(latest)), latest);
+    await applyUpdate(join(staging, tarballName(latestVersion)), latestVersion);
+    if (latestPublishedAt) markApplied(latestVersion, latestPublishedAt); // record AFTER success
   } catch (e) {
     console.error(`update failed: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  console.log(`✓ updated to v${latest} — restart AIH to use it`);
+  console.log(`✓ updated to v${latestVersion} — restart AIH to use it`);
 }
 
 async function cmdWorkflow(
@@ -1948,39 +1966,50 @@ async function handleUpdate(tui: Tui, arg: string, busy: boolean): Promise<void>
   }
   const explicit = arg.replace(/^v/, ""); // "/update 0.9.0"
   tui.pushSystem(`checking for updates… (current ${VERSION})`);
-  const latest = explicit || (await checkLatestVersion());
-  if (!latest) {
-    tui.pushSystem("could not reach the GitHub release API — try again later");
-    return;
+  let latestVersion: string;
+  let latestPublishedAt = "";
+  if (explicit) {
+    latestVersion = explicit;
+  } else {
+    const latest = await checkLatestVersion();
+    if (!latest) {
+      tui.pushSystem("could not reach the GitHub release API — try again later");
+      return;
+    }
+    latestVersion = latest.version;
+    latestPublishedAt = latest.publishedAt;
+    baselineAppliedAt(latestVersion, latestPublishedAt); // remember first sighting
   }
-  if (!explicit && compareVersions(latest, VERSION) <= 0) {
+  const sameVersionRefresh = !explicit && isSameVersionRefresh(readState(), { version: latestVersion, publishedAt: latestPublishedAt }, VERSION);
+  if (!explicit && compareVersions(latestVersion, VERSION) <= 0 && !sameVersionRefresh) {
     tui.pushSystem(`already up to date (v${VERSION})`);
     return;
   }
   const installable = detectInstallDir() !== null;
   const ans = await tui.askConfirm(
-    `v${latest} is available (current v${VERSION}) — download & update now?`,
+    `v${latestVersion} is available (current v${VERSION}) — download & update now?`,
     installable ? "install dir" : "show install command",
   );
   if (ans === "deny") {
-    markSkipped(latest);
-    tui.pushSystem(`skipped v${latest} — /update again to install, or it will nudge only for newer releases`);
+    markSkipped(latestVersion);
+    tui.pushSystem(`skipped v${latestVersion} — /update again to install, or it will nudge only for newer releases`);
     return;
   }
   if (!installable) {
     tui.pushSystem(
       "this AIH is not a tarball install — update manually:\n" +
-        `  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latest)}`,
+        `  curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --binary ${tarballName(latestVersion)}`,
     );
     return;
   }
-  const staging = join(os.tmpdir(), `aih-update-${latest.replace(/\./g, "-")}`);
+  const staging = join(os.tmpdir(), `aih-update-${latestVersion.replace(/\./g, "-")}`);
   try {
-    tui.pushSystem(`downloading aih-${latest}-node.tar.gz → ${staging} …`);
-    const { bytes } = await downloadTarball(latest, staging);
+    tui.pushSystem(`downloading aih-${latestVersion}-node.tar.gz → ${staging} …`);
+    const { bytes } = await downloadTarball(latestVersion, staging);
     tui.pushSystem(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MiB — applying…`);
-    await applyUpdate(join(staging, tarballName(latest)), latest);
-    tui.pushSystem(`✓ updated to v${latest} — restart AIH to use it (exit & relaunch)`);
+    await applyUpdate(join(staging, tarballName(latestVersion)), latestVersion);
+    if (latestPublishedAt) markApplied(latestVersion, latestPublishedAt); // record AFTER success
+    tui.pushSystem(`✓ updated to v${latestVersion} — restart AIH to use it (exit & relaunch)`);
   } catch (e) {
     tui.pushSystem(`update failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -2874,9 +2903,17 @@ async function cmdChat(flags: Record<string, string | boolean>) {
   // skipped versions are remembered; only a strictly newer release re-nudges.
   if (process.env.AIH_DISABLE_UPDATE_CHECK !== "1" && detectInstallDir() !== null) {
     void checkLatestVersion().then((latest) => {
-      if (!latest || compareVersions(latest, VERSION) <= 0) return;
+      if (!latest) return;
+      const cmp = compareVersions(latest.version, VERSION);
+      // Strictly older remote → nothing to do. Same-version: only a re-upload
+      // (newer published_at than applied/baselined) is an update. First
+      // sighting is silently baselined → no nag.
+      if (cmp < 0) return;
+      baselineAppliedAt(latest.version, latest.publishedAt);
+      if (cmp === 0 && !isSameVersionRefresh(readState(), latest, VERSION)) return;
       if (!shouldPrompt(readState(), latest)) return;
-      tui.pushSystem(`✨ v${latest} available — /update to upgrade now (current v${VERSION})`);
+      const what = cmp > 0 ? `✨ v${latest.version} available` : `✨ v${latest.version} re-uploaded (same version, newer tarball)`;
+      tui.pushSystem(`${what} — /update to upgrade now (current v${VERSION})`);
     });
   }
   if (sessionPath && log.all().length) {

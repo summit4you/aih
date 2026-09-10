@@ -1991,12 +1991,14 @@ constructor(opts: TuiOptions) {
         break;
       case "H":
       case "OH":
+      case "1~": // VT Home (most terminals send ESC[1~, not ESC[H)
         this.#scrollTop = 0;
         this.#pinned = false; // at the top, browsing history — not at the bottom
         this.requestPaint();
         break;
       case "F":
       case "OF":
+      case "4~": // VT End (most terminals send ESC[4~, not ESC[F)
         this.#pinned = true;
         this.#follow();
         this.requestPaint();

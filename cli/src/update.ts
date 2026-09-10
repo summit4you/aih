@@ -27,18 +27,31 @@ const DL = `https://github.com/${GITHUB_REPO}/releases/download`;
 const CHECK_TIMEOUT_MS = 8000;
 const DOWNLOAD_TIMEOUT_MS = 120000;
 
-/** Latest release tag without the leading "v" (e.g. "0.8.0"), or null on failure. */
+/** Latest release info from the GitHub releases API. */
+export interface LatestRelease {
+  /** Release tag without the leading "v" (e.g. "0.8.0"). */
+  version: string;
+  /** GitHub `published_at` (ISO-8601). Same version may be REUPLOADED to the
+   *  same tag (e.g. `gh release upload --clobber`), which bumps this timestamp
+   *  without changing the version — the tarball is newer even though the
+   *  version number is not. */
+  publishedAt: string;
+}
+
+/** Latest release info, or null on failure (network / non-2xx / no tag). */
 export async function checkLatestVersion(
   fetchImpl: typeof fetch = fetch,
-): Promise<string | null> {
+): Promise<LatestRelease | null> {
   try {
     const res = await fetchImpl(`${API}/latest`, {
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       headers: { "user-agent": "aih-update-check", accept: "application/json" },
     });
     if (!res.ok) return null;
-    const j = (await res.json()) as { tag_name?: string };
-    return (j.tag_name ?? "").replace(/^v/, "") || null;
+    const j = (await res.json()) as { tag_name?: string; published_at?: string };
+    const version = (j.tag_name ?? "").replace(/^v/, "");
+    if (!version) return null;
+    return { version, publishedAt: j.published_at ?? "" };
   } catch {
     return null;
   }
@@ -69,6 +82,11 @@ export function tarballUrl(version: string): string {
 export interface UpdateState {
   skippedVersion?: string;
   lastCheckAt?: string;
+  /** The release timestamp we last APPLIED (or silently baselined, see
+   *  #baselineAppliedAt). Compare a same-version release's `published_at`
+   *  against this to detect a re-uploaded tarball. */
+  appliedVersion?: string;
+  appliedAt?: string;
 }
 
 export function statePath(): string {
@@ -95,13 +113,79 @@ export function writeState(s: UpdateState): void {
 }
 
 /**
- * Should we still nudge about `latest`? False when the user already skipped
- * this exact version OR a newer one; true for a strictly newer release.
+ * Is this a same-version RE-UPLOAD (tarball refreshed under the same tag)?
+ * True only when the version equals the one running AND the remote publish
+ * time is newer than what we applied/baselined. Callers use this (plus a
+ * strict version compare) to decide "update available" — a fresh tarball
+ * with an unchanged version is still a real update.
  */
-export function shouldPrompt(state: UpdateState, latest: string): boolean {
+export function isSameVersionRefresh(
+  state: UpdateState,
+  latest: LatestRelease,
+  currentVersion: string,
+): boolean {
+  if (compareVersions(latest.version, currentVersion) !== 0) return false;
+  const applied = state.appliedAt;
+  // No baseline yet: first sighting was already silently baselined by the
+  // caller (baselineAppliedAt), which dropped us here only when newer.
+  return applied !== undefined && latest.publishedAt > applied;
+}
+
+/**
+ * Should we nudge about `latest`? Opencode kv semantics: false when the user
+ * already skipped this exact version; true for a strictly newer release;
+ * true on first sighting (nothing skipped yet). Same-version re-upload
+ * filtering is the caller's job via isSameVersionRefresh().
+ */
+export function shouldPrompt(state: UpdateState, latest: LatestRelease): boolean {
   const skipped = state.skippedVersion;
   if (!skipped) return true;
-  return compareVersions(latest, skipped) > 0;
+  if (compareVersions(latest.version, skipped) === 0) return false; // explicitly skipped this exact version
+  if (compareVersions(latest.version, skipped) > 0) return true; // strictly newer than skipped → nudge
+  return false; // older/equal than a skipped version → silent
+}
+
+/**
+ * Record a release as applied: after a successful update, or as a silent
+ * BASELINE the first time we see a version (so a later same-version re-upload
+ * can be detected). Never moves the applied marker backwards.
+ */
+export function markApplied(version: string, publishedAt: string): void {
+  if (!publishedAt) return;
+  const s = readState();
+  const newer =
+    !s.appliedVersion || compareVersions(version, s.appliedVersion) > 0 ||
+    (compareVersions(version, s.appliedVersion) === 0 && publishedAt > (s.appliedAt ?? ""));
+  if (newer) {
+    s.appliedVersion = version;
+    s.appliedAt = publishedAt;
+    writeState(s);
+  }
+}
+
+/**
+ * Silent BASELINE for a version that has no applied marker yet (first
+ * sighting). This is what makes same-version re-upload detection possible:
+ * the first time we see vX we remember its published_at; if the same vX is
+ * later re-uploaded (newer published_at), shouldPrompt() sees the delta.
+ * Never moves the applied marker backwards (a lower/older version does not
+ * overwrite a newer applied marker).
+ */
+export function baselineAppliedAt(version: string, publishedAt: string): void {
+  if (!publishedAt) return;
+  const s = readState();
+  if (!s.appliedVersion) {
+    markApplied(version, publishedAt); // first sighting of ANY version
+    return;
+  }
+  const cmp = compareVersions(version, s.appliedVersion);
+  if (cmp > 0) {
+    markApplied(version, publishedAt); // strictly newer → base it
+    return;
+  }
+  if (cmp === 0 && !s.appliedAt) {
+    markApplied(version, publishedAt); // same version, no marker yet → base it
+  }
 }
 
 export function markSkipped(version: string): void {
@@ -235,13 +319,22 @@ export async function applyUpdate(
 /** One-shot check for CLI `aih update --check`. */
 export async function checkUpdate(currentVersion: string): Promise<{
   current: string;
-  latest: string | null;
+  latest: LatestRelease | null;
   updateAvailable: boolean;
   skipped: boolean;
+  sameVersionRefresh: boolean;
 }> {
   const latest = await checkLatestVersion();
-  if (!latest) return { current: currentVersion, latest: null, updateAvailable: false, skipped: false };
-  const updateAvailable = compareVersions(latest, currentVersion) > 0;
+  if (!latest) return { current: currentVersion, latest: null, updateAvailable: false, skipped: false, sameVersionRefresh: false };
+  baselineAppliedAt(latest.version, latest.publishedAt);
+  const cmp = compareVersions(latest.version, currentVersion);
+  const updateAvailable = cmp > 0 || isSameVersionRefresh(readState(), latest, currentVersion);
   const skipped = updateAvailable && !shouldPrompt(readState(), latest);
-  return { current: currentVersion, latest, updateAvailable, skipped };
+  return {
+    current: currentVersion,
+    latest,
+    updateAvailable,
+    skipped,
+    sameVersionRefresh: cmp === 0 && updateAvailable,
+  };
 }

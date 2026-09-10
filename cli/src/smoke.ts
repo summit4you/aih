@@ -664,17 +664,36 @@ function aihClean(args: string[], env: Record<string, string> = {}, cwd?: string
     assert(u.tarballName("v0.9.1") === "aih-0.9.1-node.tar.gz", "tarballName strips v");
     assert(u.tarballUrl("0.8.0").includes("/releases/download/v0.8.0/aih-0.8.0-node.tar.gz"), "tarballUrl shape");
     // skip-state: skipped version is not re-nudged; a NEWER one is.
-    assert(u.shouldPrompt({}, "0.9.0") === true, "no state → prompt");
-    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, "0.9.0") === false, "skipped same version → silent");
-    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, "0.8.5") === false, "skipped newer than candidate → silent");
-    assert(u.shouldPrompt({ skippedVersion: "0.8.5" }, "0.9.0") === true, "candidate newer than skipped → prompt again");
-    // state round-trip via AIH_UPDATE_STATE_PATH
+    assert(u.shouldPrompt({}, { version: "0.9.0", publishedAt: "2026-01-01" }) === true, "no state → prompt");
+    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, { version: "0.9.0", publishedAt: "2026-01-01" }) === false, "skipped same version → silent");
+    assert(u.shouldPrompt({ skippedVersion: "0.9.0" }, { version: "0.8.5", publishedAt: "2026-01-01" }) === false, "skipped newer than candidate → silent");
+    assert(u.shouldPrompt({ skippedVersion: "0.8.5" }, { version: "0.9.0", publishedAt: "2026-01-01" }) === true, "candidate newer than skipped → prompt again");
+    // Same-version re-upload: version unchanged but published_at newer than the
+    // applied baseline → a real update (--clobber re-upload).
+    assert(u.isSameVersionRefresh({ appliedVersion: "0.8.0", appliedAt: "2026-01-01" }, { version: "0.8.0", publishedAt: "2026-02-01" }, "0.8.0") === true, "same version, newer published_at → refresh");
+    assert(u.isSameVersionRefresh({ appliedVersion: "0.8.0", appliedAt: "2026-02-01" }, { version: "0.8.0", publishedAt: "2026-01-01" }, "0.8.0") === false, "same version, older published_at → no refresh");
+    assert(u.isSameVersionRefresh({ appliedVersion: "0.8.0", appliedAt: "2026-01-01" }, { version: "0.9.0", publishedAt: "2026-02-01" }, "0.8.0") === false, "newer version is not a same-version refresh");
+    assert(u.isSameVersionRefresh({ appliedVersion: "0.8.0", appliedAt: "2026-01-01", skippedVersion: "0.8.0" }, { version: "0.8.0", publishedAt: "2026-02-01" }, "0.8.0") === true, "refresh detection ignores skip (caller combines with shouldPrompt)");
+    // Older-than-applied version never prompts even if re-uploaded.
+    assert(u.shouldPrompt({ appliedVersion: "0.9.0", appliedAt: "2026-01-01" }, { version: "0.8.0", publishedAt: "2026-06-01" }) === true, "no skip recorded → prompt path open (version gating is the caller's job)");
+    // state round-trip via AIH_UPDATE_STATE_PATH (baseline markers included)
     const stateFile = join(process.cwd(), `.smoke-update-state-${Date.now()}.json`);
     process.env.AIH_UPDATE_STATE_PATH = stateFile;
     u.markSkipped("0.9.0");
     assert(u.readState().skippedVersion === "0.9.0", "markSkipped persists");
     u.markSkipped("0.8.0"); // older — must not downgrade the remembered skip
     assert(u.readState().skippedVersion === "0.9.0", "markSkipped never downgrades");
+    // baselineAppliedAt: first sighting records silently; a same-version later
+    // re-upload is then detected by shouldPrompt (real state file, guarded by
+    // AIH_UPDATE_STATE_PATH so we never touch the user's actual state).
+    u.baselineAppliedAt("0.8.0", "2026-01-01");
+    assert(u.readState().appliedVersion === "0.8.0" && u.readState().appliedAt === "2026-01-01", "baselineAppliedAt: first sighting sets marker");
+    u.baselineAppliedAt("0.8.0", "2026-03-01"); // same version, no marker → keeps NEWER
+    assert(u.readState().appliedAt === "2026-01-01", "baselineAppliedAt: same version does not advance marker");
+    u.markApplied("0.8.0", "2026-03-01"); // real apply after an update
+    assert(u.readState().appliedAt === "2026-03-01", "markApplied advances the applied marker");
+    u.markApplied("0.7.0", "2026-05-01"); // older version — never moves backwards
+    assert(u.readState().appliedVersion === "0.8.0", "markApplied never downgrades the version marker");
     rmSync(stateFile, { force: true });
     delete process.env.AIH_UPDATE_STATE_PATH;
     // install-dir detection: only the tarball layout (<dir>/app/aih) qualifies
@@ -3585,14 +3604,28 @@ await srv.connect(new StdioServerTransport());
   assert(atBottom.pinned === true, "PgDn to the bottom re-pins");
   assert(atBottom.scrollTop >= nearBottom.scrollTop, "re-pinned at the (new) bottom");
 
-  // End key re-pins immediately from anywhere.
+  // End key re-pins immediately from anywhere (both CSI F and VT 4~ forms).
   tui.feed("\x1b[5~"); // PgUp again → unpinned
   const up2 = tui.scrollStateForTest();
   assert(up2.pinned === false, "PgUp again unpins");
-  tui.feed("\x1b[F"); // End
+  tui.feed("\x1b[F"); // End (CSI form)
   const end = tui.scrollStateForTest();
   assert(end.pinned === true, "End key re-pins");
-  assert(end.scrollTop === tui.scrollStateForTest().scrollTop || end.scrollTop >= up2.scrollTop, "End lands at the bottom");
+  assert(end.scrollTop > up2.scrollTop, "End moves to the bottom");
+  // VT End (ESC[4~) — the form most terminals (xterm, GNOME Terminal,
+  // Windows Terminal, tmux) actually send; regression: before this fix only
+  // ESC[F/ESC[OF were handled, so End appeared dead while browsing history.
+  tui.feed("\x1b[5~"); // PgUp again → unpinned
+  assert(tui.scrollStateForTest().pinned === false, "PgUp unpins before VT-End test");
+  tui.feed("\x1b[4~"); // End (VT form)
+  const vtEnd = tui.scrollStateForTest();
+  assert(vtEnd.pinned === true, "VT End (ESC[4~) re-pins");
+  assert(vtEnd.scrollTop >= end.scrollTop, "VT End lands at the (new) bottom");
+  // VT Home (ESC[1~) — mirrors the ESC[H/ESC[OH forms.
+  tui.feed("\x1b[1~"); // Home (VT form)
+  const vtHome = tui.scrollStateForTest();
+  assert(vtHome.scrollTop === 0, "VT Home (ESC[1~) jumps to the top");
+  assert(vtHome.pinned === false, "VT Home unpins (at top, browsing history)");
 
   tui.stop();
   process.stdout.write = origWrite;
