@@ -8,6 +8,8 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-10
+
 ### Added
 - **同版本 release 重传检测（`--clobber` 刷新也能触发更新）**（`cli/src/update.ts` + `cli/src/index.ts`）：
   自动更新原来只按版本号判断（`compareVersions > 0`），同一 tag 下重新上传 tarball
@@ -110,6 +112,17 @@ the versions listed here (`scripts/package` derives the version from
   匹配，临时目录授权一次后永久生效，不再每次重复弹确认。
 - **MCP badge 计数错误**（`cli/src/tui.ts`）：statusBadge 统计了**全部**工具却标注
   "MCP"——现在只计数 MCP 后端工具。
+- **rules 加载 5 项 opencode-parity 缺口**（`cli/src/rules.ts`，`42dff13`）：
+  ① 全局 `AGENTS.md` 此前只写进 docblock 从未实现——现在实装，读取 XDG 解析的用户
+  目录（`AIH_HOME`/`$XDG_DATA_HOME/aih`/`~/.local/share/aih`）+ legacy `~/.aih` 的
+  `AGENTS.md`，`AIH_DISABLE_AIH_PROMPT=1` 关闭（与 opencode 全局 `AGENTS.md` 语义
+  对齐）；② `instructions` 里的远程 URL 此前静默丢弃——现在打 stderr warning 明确
+  告知未加载（同步加载无法 fetch，不静默吞输入）；③ `readRuleFile` 6000 字符截断
+  无标记——现在追加 `[truncated at N chars]` 显式标记，半截规则不再伪装完整；
+  ④ glob 目录计算缺陷（`docs/*.md` 会多扫一层父目录）——改为按 glob 的字面目录
+  前缀行走，`relativePath` 换 `path.relative` 使 `../` 越级 glob 正确匹配；⑤
+  `instructions` 条目支持 `~/` 展开（opencode parity）。smoke 新增 6 断言（全局
+  AGENTS.md、glob 字面目、stray 兄弟不误配、`~` 展开、截断标记、URL warning）。
 
 ## [0.8.0] - 2026-09-07
 
