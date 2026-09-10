@@ -746,7 +746,7 @@ export class Tui {
   #plain = false;
   /**
    * Keyboard focus for expand/collapse (A). Mouse click also works (Win10+
-   * conhost supports ?1000/?1006 SGR mouse). Enter/o on a focused unit is the
+   * conhost supports ?1000/?1006 SGR mouse). Enter on a focused unit is the
    * keyboard path. Default = the most recently rendered tool unit.
    */
   #focusUnit = -1;
@@ -889,7 +889,7 @@ constructor(opts: TuiOptions) {
     if (legacyWin) {
       this.pushSystem(
         "conhost detected — for full mouse/paste/alt-screen, use Windows Terminal (Microsoft Store). " +
-        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse · right-click = paste"
+        "Keyboard: PgUp/PgDn = scroll · Enter = expand/collapse · right-click = paste"
       );
     } else if (process.platform === "win32") {
       // Windows Terminal: mouse tracking (?1000/?1006) forwards the wheel as
@@ -897,14 +897,14 @@ constructor(opts: TuiOptions) {
       // break the first flick). The wheel scrolls the transcript natively.
       this.pushSystem(
         "Windows Terminal: mouse wheel scrolls the conversation (SGR mouse tracking). " +
-        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
+        "Keyboard: PgUp/PgDn = scroll · Enter = expand/collapse"
       );
     } else if (process.platform === "linux") {
       // ?1007 enabled: VTE terminals that translate the wheel into arrow keys
       // (GNOME Terminal, xfce4-terminal, Konsole) now forward it to aih.
       this.pushSystem(
         "Mouse wheel scrolls the conversation (alternate scroll enabled). " +
-        "Keyboard: PgUp/PgDn = scroll · Enter/o = expand/collapse"
+        "Keyboard: PgUp/PgDn = scroll · Enter = expand/collapse"
       );
     }
     this.#timer = setInterval(this.#tick, 120);
@@ -1814,25 +1814,6 @@ constructor(opts: TuiOptions) {
           this.requestPaint();
         }
         return;
-      case "o":
-      case "O": {
-        // A — `o` on an empty composer toggles the focused tool block too
-        // (mnemonic "open"; keyboard-only path for legacy Windows conhost).
-        // ONLY when a toggleable unit exists — otherwise fall through to
-        // normal input so the first keystroke is never eaten (reported bug:
-        // typing "o" on a fresh transcript vanished; nothing to toggle in an
-        // empty transcript, so `o` must land in the composer).
-        if (!this.#edit.trim() && this.#hasToggleable()) {
-          this.#toggleFocus();
-          this.requestPaint();
-        } else {
-          this.#edit =
-            this.#edit.slice(0, this.#cursor) + ch + this.#edit.slice(this.#cursor);
-          this.#cursor += 1;
-          this.requestPaint();
-        }
-        return;
-      }
       case "\t": {
         const ghost = this.#ghost();
         if (ghost) {
@@ -2153,7 +2134,7 @@ constructor(opts: TuiOptions) {
   }
 
   /**
-   * A — keyboard expand/collapse for the focused unit (Enter/o on an empty
+   * A — keyboard expand/collapse for the focused unit (Enter on an empty
    * composer). On legacy Windows console there are no mouse events at all, so
    * this is the only way to expand a tool output / group there.
    * - groups: toggle the open flag.
@@ -2192,21 +2173,6 @@ constructor(opts: TuiOptions) {
     this.#focusUnit = i;
     this.#follow();
     this.requestPaint();
-  }
-
-  /**
-   * True when a transcript unit is focus-toggleable (a group, or a tool item
-   * with a string output). The `o`/`O` key on an empty composer drives
-   * #toggleFocus; if nothing is toggleable it must fall through to normal
-   * input instead of silently eating the keystroke (reported bug: first key
-   * typed was 'o' and vanished on a fresh transcript).
-   */
-  #hasToggleable(): boolean {
-    for (const u of this.#units()) {
-      if (u.kind === "group") return true;
-      if (u.kind === "item" && u.item.tool && typeof u.item.tool.output === "string") return true;
-    }
-    return false;
   }
 
   #follow(): void {

@@ -9,23 +9,21 @@ the versions listed here (`scripts/package` derives the version from
 ## [Unreleased]
 
 ### Fixed
-- **重启后首次输入 `o`/`O` 被吞（根因：DSR probe chunk 丢弃竞态）**（`cli/src/tui.ts`，
-  `cfd9c48` 引入）：启动时 probe 写 `ESC[6n` 查询光标位置，终端回复 CPR
-  （`ESC[row;colR`）。`feedProbe` 匹配到 CPR 后整个 chunk `return true`，但**用户启动后
-  立刻输入时，终端的 CPR 响应和首个按键会合并成同一 stdin chunk**——按键（如 `o`）被
-  连带丢弃。表现为「每次重启后首次输入 o 都不行」，与 toggle 快捷键无关。修复：
-  `feedProbe` 改为**剥掉 CPR 序列、保留 chunk 其余字节**继续走正常输入路径
-  （返回剩余串，空/null 区分）。真实路径复现（mock TTY + `start()` + 同 chunk
-  `ESC[1;3Ro`）：修复前 `o` 丢失，修复后存活。smoke 回归断言覆盖（走真实 stdin 路径）。
-- **`o`/`O` 空 composer toggle 在空 transcript 吞键**（`cli/src/tui.ts`，`3c0e3ef`
-  引入）：`o` 在空 composer 时作为 toggle 快捷键，但空 transcript（无任何 tool 块）时
-  `#toggleFocus` no-op，键被消费却无效果。现在仅当存在可 toggle 的 unit（group 或
-  带输出的 tool item）时才走 toggle，否则 `o` 正常进入 composer。smoke 回归断言覆盖。
-- **DSR probe 响应格式错误**（`cli/src/tui.ts`，`cfd9c48` 引入）：`feedProbe` 正则
-  以 `A` 结尾匹配 CPR，但终端对 DSR 的响应（Cursor Position Report）以 **`R`** 结尾
-  （`ESC[row;colR`）——真实终端上 probe 永远匹配不到、宽度探测静默失效。改为
-  `ESC[<row>;<col>R`（接受任意行号，只用列）。真实路径验证：`ESC[1;3R` 正确触发
-  `width(─)` 从 1 → 2。
+- **26 个字母中只有 `o`/`O` 在空输入框无法输入（根因：toggle 快捷键与字母冲突）**
+  （`cli/src/tui.ts`，`3c0e3ef` 引入，`d23aed3`/`7c9596b` 曾多次打补丁未根治）：
+  `o`/`O` 在空 composer 时被定义为「展开/折叠工具块」快捷键（conhost 无鼠标键盘
+  路径）。只要 transcript 里有可 toggle 的块（**重启恢复会话后必有上一轮 tool 块**），
+  空输入框打 `o` 就被吞掉改去 toggle——其余 25 个字母不受影响，因此表现为
+  「只有 o 不行，打头之后 o 正常」。**根治**：删除 `o`/`O` toggle 快捷键（连同
+  `#hasToggleable` 辅助），`o` 与所有字母一样走正常输入。空输入框 toggle 的唯一
+  键是 **Enter**（本就存在，`\r` case）。同步更新 help 提示（`Enter/o =` → `Enter =`）。
+  smoke 覆盖四种场景：空 transcript 首次 `o`、有 tool 块时空 composer `o`、CPR+key
+  同 chunk、Enter 折叠/展开仍正常。
+- **重启后首次输入 `o`/`O` 被吞（DSR probe chunk 丢弃竞态）**（`cli/src/tui.ts`，
+  `cfd9c48` 引入）：`feedProbe` 匹配到 CPR 后整个 chunk `return true`，若终端把 CPR
+  响应和首个按键合并成同一 stdin chunk，按键（如 `o`）被连带丢弃。修复：`feedProbe`
+  剥掉 CPR 序列、保留 chunk 其余字节继续走正常输入路径（返回剩余串，空/null 区分）。
+  真实路径复现（mock TTY + `start()` + 同 chunk `ESC[1;3Ro`）。smoke 走真实 stdin 路径。
 
 ### Added
 - **歧义宽度终端自动探测（DSR probe）**（`cli/src/tui.ts`）：启动时（raw mode 下、

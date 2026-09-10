@@ -4744,6 +4744,28 @@ await srv.connect(new StdioServerTransport());
     tui.feed("\r");
     assert(submitted === "o", `first 'o' on empty transcript lands in composer (got ${JSON.stringify(submitted)})`);
   }
+  // Regression: even with a toggleable unit present (restored session — the
+  // transcript already has tool blocks), 'o' on an empty composer must STILL
+  // type normally. The old o/O toggle shortcut ate it whenever a toggleable
+  // unit existed; the shortcut is gone entirely (Enter is the only toggle).
+  {
+    const { Tui } = await import("./tui.js");
+    let submitted: string | null = null;
+    const tui = new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: (l) => { submitted = l; },
+    });
+    tui.pushTool("run_cmd", { command: "echo hi" }, "k1");
+    tui.resolveTool("k1", true, { stdout: "l1\nl2\nl3" });
+    tui.feed("o");
+    tui.feed("\r");
+    assert(submitted === "o", `'o' on empty composer types even with a toggleable tool present (got ${JSON.stringify(submitted)})`);
+  }
   // Regression: the DSR probe must never swallow a keystroke batched in the
   // same stdin chunk as the CPR reply. Start() sends DSR; a terminal can
   // deliver CPR + the user's first key in ONE chunk; feedProbe used to return
@@ -4815,10 +4837,12 @@ await srv.connect(new StdioServerTransport());
   assert(body.some((l) => l.includes("l5")), "Enter on empty composer expands the last tool block");
   assert(body.some((l) => l.includes("enter to collapse")), "expanded tool hints enter-to-collapse");
 
-  // o on empty composer collapses it again
-  tui.feed("o");
+  // Enter on empty composer collapses it again (o is a NORMAL key now — the
+  // o/O toggle shortcut was removed because it ate the first 'o' typed; the
+  // ONLY toggle key on an empty composer is Enter)
+  tui.feed("\r");
   body = tl();
-  assert(!body.some((l) => l.includes("l5")), "o on empty composer collapses the tool block back");
+  assert(!body.some((l) => l.includes("l5")), "Enter on empty composer collapses the tool block back");
 
   // group: two same-name tool items WITHOUT output collapse into one row;
   // Enter expands (grouping only applies to tools with no output/diff).
@@ -4841,9 +4865,9 @@ await srv.connect(new StdioServerTransport());
   g.feed("\r");
   gb = gPlain().join("\n");
   assert(gb.includes("run_cmd") && gb.includes("a") && gb.includes("b"), "Enter expands the group into its tool rows");
-  g.feed("o");
+  g.feed("\r");
   gb = gPlain().join("\n");
-  assert(gb.includes("×2"), "o collapses the group back to the summary row");
+  assert(gb.includes("×2"), "Enter collapses the group back to the summary row");
 }
 
 // --- F#28 increment: worktree snapshot on checkpoints ------------------------
