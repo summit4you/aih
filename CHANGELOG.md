@@ -47,6 +47,14 @@ the versions listed here (`scripts/package` derives the version from
   构建 `callId → tool/call` 的 `Map`（O(n)），热路径 O(1) 查找。基准：
   50k 事件 1708.7ms → 25.3ms（**~67×**）。core 冒烟新增回归断言
   （15k 事件 < 500ms，O(n²) 下 ~1.7s 会失败）。
+  **二次修复（~4s 残留）**：修复 `tool/result` O(n²) 后同一会话仍有 ~4s 延迟。
+  profile 定位到第二个 O(n²) 热点——**MK#42 coverage 校验**：`deriveMessages`
+  对**每个** compaction 事件都做一次 `coverageDigest`（对**整个事件前缀**做
+  `JSON.stringify` + SHA-256）。会话含 15 个 compaction × 21k 事件 = 31.5 万次
+  序列化 + 哈希。改为 **只校验最新 compaction**（旧 compaction 已被其摘要覆盖，
+  无需重复哈希）+ **按 `upToSeq` memo 化 digest**（前缀不可变，每次会话只算
+  一次）。基准：同一真实 21k 事件会话 1863ms → 6.2ms（**~300×**）。core 冒烟
+  新增回归断言（12k 事件 × 3 compaction 5 次调用 < 300ms avg）。
 - **Windows 上 `aih update` 解压失败（`can't create '...\.bin\node-which': Invalid argument`）**（`scripts/package`）：
   分发包（node tarball）里 `node_modules/@aih/*` 用**符号链接**指向 `../../lib/*`，
   外加 npm 生成的 `.bin/*` 链接桩。Windows 自带的 `tar.exe`（libarchive）在

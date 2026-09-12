@@ -132,6 +132,10 @@ export class SessionLog {
   #listeners = new Set<SessionListener>();
   /** MK#43 — callId → placeholder body for pruned tool results. */
   #pruned = new Map<string, string>();
+  /** MK#42 — memoized coverage digests: upToSeq → digest. A compaction's
+   * coverage prefix is immutable, so re-hashing 20k+ events on every
+   * deriveMessages (~100ms) is pure waste; compute once per prefix. */
+  #coverageDigestCache = new Map<number, string>();
 
   append(event: SessionEventInput): SessionEvent {
     const full = Object.freeze({
@@ -277,19 +281,28 @@ export class SessionLog {
     const branchSummaries = this.#events.filter(
       (e): e is Extract<SessionEvent, { type: "branch_summary" }> => e.type === "branch_summary",
     );
-    for (const event of this.#events) {
+    // MK#42: verify the coverage digest BEFORE honoring the projection. A
+    // stale/foreign summary must never replace raw history silently — on
+    // mismatch we drop the projection and fail open to the full log.
+    // Only the NEWEST compaction needs verification: older compactions are
+    // already folded into the newest summary's covered prefix (deriving them
+    // would re-hash the full event list per compaction — O(n²) on long
+    // sessions, ~1.8s at 21k events).
+    for (let i = this.#events.length - 1; i >= 0; i--) {
+      const event = this.#events[i];
       if (event.type === "compaction") {
-        // MK#42: verify the coverage digest before honoring the projection.
-        // A stale/foreign summary must never replace raw history silently —
-        // on mismatch we drop the projection and fail open to the full log.
-        if (
-          event.coverage &&
-          coverageDigest(this.#events.filter((e) => e.seq <= event.coverage!.upToSeq)) !==
-            event.coverage.digest
-        ) {
-          continue; // treat as if this compaction never happened
+        if (!event.coverage) {
+          compact = event;
+        } else {
+          const { upToSeq, digest } = event.coverage;
+          let cached = this.#coverageDigestCache.get(upToSeq);
+          if (cached === undefined) {
+            cached = coverageDigest(this.#events.slice(0, upToSeq + 1));
+            this.#coverageDigestCache.set(upToSeq, cached);
+          }
+          if (cached === digest) compact = event;
         }
-        compact = event;
+        break; // newest compaction decides; older ones are subsumed
       }
     }
     // The compaction summary folds into the LEADING system message: some

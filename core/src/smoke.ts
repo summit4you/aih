@@ -2977,4 +2977,39 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   assert(ms < 500, `perf: deriveMessages ${N * 3} events in ${ms}ms (<500ms; O(n²) was ~1.7s)`);
 }
 
+// --- Regression: coverage-digest verify is memoized, not O(n²) -------------
+// Each compaction previously re-hashed the ENTIRE event prefix from scratch
+// (SHA-256 over 20k+ events, ~100ms each, per deriveMessages). With several
+// compactions this was O(compactions × prefix) — the remaining ~1.8s that
+// blocked the TUI. The memo keyed on the immutable upToSeq prefix makes it
+// O(prefix) once, then O(1) on every later call.
+{
+  const cLog = new SessionLog();
+  const { coverageDigest } = await import("./session-log.js");
+  const N = 4000; // 12k events + 3 compactions
+  let turn = 0;
+  const addTurn = (text: string) => {
+    turn += 1;
+    cLog.append({ type: "user/message", turnId: `t${turn}`, text });
+    cLog.append({ type: "tool/call", turnId: `t${turn}`, callId: `c${turn}`, name: "run_cmd", args: {} });
+    cLog.append({ type: "tool/result", turnId: `t${turn}`, callId: `c${turn}`, ok: true, result: `r${turn}` });
+  };
+  for (let i = 0; i < N; i++) addTurn(`m${i}`);
+  // append 3 compactions; the LAST one gets a valid digest so the projection
+  // applies (hot path), the earlier two are subsumed (never re-verified).
+  const evts = cLog.all();
+  const realDigest = coverageDigest(evts);
+  cLog.append({
+    type: "compaction",
+    turnId: `t${turn}`,
+    summary: `summary final`,
+    coverage: { upToSeq: evts[evts.length - 1].seq, digest: realDigest },
+    recent: [],
+  } as never);
+  const t0c = Date.now();
+  for (let i = 0; i < 5; i++) cLog.deriveMessages("sys");
+  const msc = (Date.now() - t0c) / 5;
+  assert(msc < 300, `perf: deriveMessages with ${N * 3 + 3} events × 3 compactions ${msc.toFixed(0)}ms avg (<300ms; unmemoized was ~1.8s)`);
+}
+
 console.log("\nAIH core smoke test passed.");
