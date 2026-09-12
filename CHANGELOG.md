@@ -37,6 +37,16 @@ the versions listed here (`scripts/package` derives the version from
   同版本刷新显示 "vX re-uploaded (same version, newer tarball)"。
 
 ### Fixed
+- **TUI 输入后延迟数秒才出现消息与 loading 转圈**（`core/src/session-log.ts`）：
+  用户报告"输入后按回车，过几秒消息才更新、loading 才开始转圈"。根因是
+  `deriveMessages` 的 `tool/result` 分支对**每个**结果事件都做一次全量
+  `this.#events.find(...)` 查找配对 `tool/call`——O(n²)。长会话（实测 21k+
+  事件 / 19MB）下每次 `loop.send` 首步前的 `#estimateContext()` 同步重建消息
+  时阻塞事件循环约 **1.7s**：期间 `setTimeout`（paint）与 `setInterval`
+  （spinner）都无法触发，所以用户消息与转圈一起延迟出现。改为投影前一次性
+  构建 `callId → tool/call` 的 `Map`（O(n)），热路径 O(1) 查找。基准：
+  50k 事件 1708.7ms → 25.3ms（**~67×**）。core 冒烟新增回归断言
+  （15k 事件 < 500ms，O(n²) 下 ~1.7s 会失败）。
 - **Windows 上 `aih update` 解压失败（`can't create '...\.bin\node-which': Invalid argument`）**（`scripts/package`）：
   分发包（node tarball）里 `node_modules/@aih/*` 用**符号链接**指向 `../../lib/*`，
   外加 npm 生成的 `.bin/*` 链接桩。Windows 自带的 `tar.exe`（libarchive）在

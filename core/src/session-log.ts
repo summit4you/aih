@@ -330,6 +330,15 @@ export class SessionLog {
         if (r.includes("refusal") || r.includes("sensitive")) refusalTurns.add(e.turnId);
       }
     }
+    // O(n) index: callId → tool/call event. Replaces the per-result O(n)
+    // .find() that made deriveMessages O(n²) on long sessions (21k+ events
+    // → tens of millions of string comparisons, blocking the event loop
+    // before the first await → TUI paint + spinner both delayed).
+    const callById = new Map<string, Extract<SessionEvent, { type: "tool/call" }>>();
+    for (const e of this.#events) {
+      if (e.type === "tool/call") callById.set(e.callId, e);
+    }
+
     const pushMessage = (event: SessionEvent): void => {
       switch (event.type) {
         case "user/message":
@@ -346,9 +355,7 @@ export class SessionLog {
           });
           break;
         case "tool/result": {
-          const call = this.#events.find(
-            (e) => e.type === "tool/call" && e.callId === event.callId,
-          );
+          const call = callById.get(event.callId);
           // OMP-R#10: a refused turn's assistant message is skipped below —
           // its tool call/result pairs must go with it or strict chat
           // templates see an orphan tool reply and reject the request.

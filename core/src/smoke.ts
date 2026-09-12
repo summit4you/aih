@@ -2958,4 +2958,23 @@ assert(truncStream.finishReason === "length", "streaming finish_reason=length is
   console.log("ok: PE#1/PE#2/PE#4 AgentLoop integration (sensor/budget → escalate, tripwire → continue)");
 }
 
+// --- Regression: deriveMessages is O(n), not O(n²) ------------------------
+// A per-result .find() over the whole event list made long sessions (21k+
+// events) block the event loop for ~1.7s before the first await → TUI paint
+// and spinner both delayed. The callId→call map keeps this linear.
+{
+  const perfLog = new SessionLog();
+  const N = 5000;
+  for (let i = 0; i < N; i++) {
+    perfLog.append({ type: "user/message", turnId: `t${i}`, text: `m${i}` });
+    perfLog.append({ type: "tool/call", turnId: `t${i}`, callId: `c${i}`, name: "run_cmd", args: {} });
+    perfLog.append({ type: "tool/result", turnId: `t${i}`, callId: `c${i}`, ok: true, result: "ok" });
+  }
+  const t0 = Date.now();
+  const perfMsgs = perfLog.deriveMessages("sys");
+  const ms = Date.now() - t0;
+  assert(perfMsgs.filter((m) => m.role === "tool").length === N, "perf: all tool results projected");
+  assert(ms < 500, `perf: deriveMessages ${N * 3} events in ${ms}ms (<500ms; O(n²) was ~1.7s)`);
+}
+
 console.log("\nAIH core smoke test passed.");
