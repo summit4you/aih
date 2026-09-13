@@ -2723,8 +2723,13 @@ constructor(opts: TuiOptions) {
       const done = todos.filter((t) => t.status === "completed").length;
       lines.push(accent(bold(`TODO ${done}/${todos.length}`)));
       // Wrap todo content to fit the panel (opencode uses wrapMode="word").
-      // Available width = pw - 2 (padding) - 2 (icon + space) = pw - 4.
-      const cw = Math.max(4, pw - 4);
+      // R8-1 — available width = pw (panel) − 4 (#panelSeg padding 2+2) − 3
+      // (icon 2 cols — ▶ counts 2 even on narrow-model — + 1 space). The old
+      // comment claimed pw−4 already accounted for icon+space, but #panelSeg
+      // clips the WHOLE line (icon + space + text) to pw−4, so every icon
+      // line lost columns at the right edge (observed with CJK todo text:
+      // a 33-col line against a 30-col budget).
+      const cw = Math.max(2, pw - 7);
       for (const t of todos) {
         const icon =
           t.status === "in_progress" ? warn(bold("▶"))

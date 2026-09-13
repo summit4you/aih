@@ -4148,7 +4148,7 @@ process.exit(ok === false ? 0 : 1);`;
   //      authoritative source and must beat the transcript-derived list, so a
   //      compaction + agent re-invoking the `todo` tool (or a replayed
   //      transcript) cannot wipe the panel.
-  const { Tui } = await import("./tui.js");
+  const { Tui, cols } = await import("./tui.js");
   const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
   const allDone = [
     { content: "step one", status: "completed" },
@@ -4179,6 +4179,26 @@ process.exit(ok === false ? 0 : 1);`;
   const hostPanel = tuiHost.panelLinesForTest(30).map(strip);
   assert(hostPanel.some((l) => l.startsWith("TODO 1/2")), `host todos() beats transcript (got ${JSON.stringify(hostPanel)})`);
   assert(hostPanel.some((l) => l.includes("step two")), "host list items render");
+  // R8-1 — icon+space+wrap must fit the pw−4 clip budget: a CJK-heavy item
+  // wrapped at pw−4 (the old budget) produced a pw−2-wide row → #panelSeg
+  // clipped 2 columns off every icon line's right edge.
+  const cjkTodos = [
+    { content: "很长的中文待办条目内容需要被换行处理超出两列", status: "in_progress" },
+    { content: "very long ascii todo item that also wraps across lines ok", status: "completed" },
+  ];
+  const tuiCjk = new Tui({
+    placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
+    statusLeft: "", statusRight: "", busy: () => false, onLine: () => {},
+    todos: () => cjkTodos, width: 140,
+  });
+  const PW = 34;
+  const cjkPanel = tuiCjk.panelLinesForTest(PW).map(strip);
+  // assert WITHOUT stripping first: cols() (display width, ANSI-aware) on the
+  // raw row is what #panelSeg clips against.
+  for (const l of tuiCjk.panelLinesForTest(PW)) {
+    assert(cols(l) <= PW - 4, `R8-1 panel todo row fits pw−4 clip budget (got ${cols(l)} cols for ${JSON.stringify(strip(l))})`);
+  }
+  assert(cjkPanel.some((l) => l.includes("很长的中文")), "R8-1 CJK todo content renders");
   // (3) host todos() returning null falls back to the transcript list
   const tuiFb = new Tui({
     placeholder: ">", meta: () => ({ agent: "t", model: "m", provider: "p" }), cwd: "/tmp",
