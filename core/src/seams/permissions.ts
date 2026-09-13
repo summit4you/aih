@@ -241,6 +241,12 @@ export class RulesetGate implements ApprovalGate {
    * (deny still wins).
    */
   evaluate(req: ApprovalRequest): "allow" | "ask" | "deny" | undefined {
+    // R3 P1 — match ONLY the resolved path. Matching the raw string first
+    // allowed a path like `/workspace/x/../../etc/cron.d/evil` to prefix-match
+    // an allow rule `/workspace/**` (the raw starts with /workspace/) and pass
+    // the gate, even though the file actually resolved to /etc — a path
+    // traversal straight through the allow boundary. `resolve()` collapses
+    // `..` segments first; only the canonical target may match a rule.
     const raw = targetOf(req);
     const abs = raw ? resolve(raw) : undefined;
     let action: "allow" | "ask" | "deny" | undefined;
@@ -261,10 +267,12 @@ export class RulesetGate implements ApprovalGate {
       (rule) =>
         rule.action === "allow" &&
         (rule.tool === req.tool || rule.tool === "*") &&
-        (matchPattern(rule.pattern, raw) || matchPattern(rule.pattern, abs)),
+        // R3 P1 — only the resolved path may match (raw-prefix traversal).
+        matchPattern(rule.pattern, abs),
     );
     for (const rule of this.rules) {
-      if (!matchPattern(rule.pattern, raw) && !matchPattern(rule.pattern, abs)) continue;
+      // R3 P1 — resolved path only; raw-prefix traversal cannot match.
+      if (!matchPattern(rule.pattern, abs)) continue;
       const pathScoped = !!rule.pattern && rule.pattern !== "*" && rule.pattern !== "**";
       if (!(pathScoped || rule.tool === req.tool || rule.tool === "*")) continue;
       // Priority floor: deny dominates, then ask, then allow.
@@ -290,12 +298,13 @@ export class RulesetGate implements ApprovalGate {
    * rule matched (the fallback/base decided).
    */
   explain(req: ApprovalRequest): PermissionRule | undefined {
-    const raw = targetOf(req);
-    const abs = raw ? resolve(raw) : undefined;
+    // R3 P1 — resolved path only (same rule as evaluate: raw-prefix traversal
+    // must never match a rule).
+    const abs = targetOf(req) ? resolve(targetOf(req) as string) : undefined;
     let winner: PermissionRule | undefined;
     let rank = -1; // 2=deny, 1=ask, 0=allow
     for (const rule of this.rules) {
-      if (!matchPattern(rule.pattern, raw) && !matchPattern(rule.pattern, abs)) continue;
+      if (!matchPattern(rule.pattern, abs)) continue;
       const pathScoped = !!rule.pattern && rule.pattern !== "*" && rule.pattern !== "**";
       if (!(pathScoped || rule.tool === req.tool || rule.tool === "*")) continue;
       const r = rule.action === "deny" ? 2 : rule.action === "ask" ? 1 : 0;

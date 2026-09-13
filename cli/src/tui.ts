@@ -739,6 +739,19 @@ export class Tui {
   #lastLines: string[] = [];
   #confirm: ((ans: "once" | "always" | "deny") => void) | null = null;
   #confirmText = "";
+  /**
+   * R5 P1 — confirm queue: approval prompts used to share ONE reusable
+   * `#confirm` slot, so a second concurrent ask (two MCP tools both declaring
+   * kind=read, permission=ask) overwrote the first's callback and the first
+   * Promise never resolved (turn hang). Prompts now queue: the ACTIVE one owns
+   * `#confirm` + `#confirmText` + `#confirmMode`; when it resolves, the next
+   * queued entry is pumped into the slot. Only one prompt renders at a time.
+   */
+  #confirmQueue: {
+    text: string;
+    mode: "confirm" | "runorcopy" | "grant";
+    resolve: (ans: "once" | "always" | "deny") => void;
+  }[] = [];
   /** IT#5 — "confirm" = [y]/[n]/[a]; "runorcopy" = [R]un/[C]opy/[N]o. */
   #confirmMode: "confirm" | "runorcopy" | "grant" = "confirm";
   #question: { resolve: (answer: string) => void; reject: (err: Error) => void } | null = null;
@@ -1185,17 +1198,38 @@ constructor(opts: TuiOptions) {
 
   askConfirm(question: string, scope: string): Promise<"once" | "always" | "deny"> {
     this.pushSystem(`⚠ approval requested: ${question}`);
-    this.#confirmText = `[y] once   [n] no   [a] always ${scope}   ${question}`;
-    this.requestPaint();
     return new Promise((resolve) => {
-      this.#confirm = (ans) => {
-        this.#confirm = null;
-        this.#confirmText = "";
-        this.pushSystem(ans === "deny" ? "denied" : "approved");
-        this.requestPaint();
-        resolve(ans);
-      };
+      this.#confirmQueue.push({
+        text: `[y] once   [n] no   [a] always ${scope}   ${question}`,
+        mode: "confirm",
+        resolve: (ans) => {
+          this.pushSystem(ans === "deny" ? "denied" : "approved");
+          resolve(ans);
+        },
+      });
+      this.#pumpConfirm();
     });
+  }
+
+  /**
+   * R5 P1 — activate the next queued confirm (if any). Only one prompt owns
+   * the #confirm slot; when it resolves it calls #pumpConfirm again, so N
+   * concurrent asks render serially and every Promise settles.
+   */
+  #pumpConfirm(): void {
+    if (this.#confirm) return; // an active prompt owns the slot
+    const next = this.#confirmQueue.shift();
+    if (!next) return;
+    this.#confirmMode = next.mode;
+    this.#confirmText = next.text;
+    this.#confirm = (ans) => {
+      this.#confirm = null;
+      this.#confirmText = "";
+      this.requestPaint();
+      next.resolve(ans);
+      this.#pumpConfirm(); // activate the next queued ask
+    };
+    this.requestPaint();
   }
 
   /**
@@ -1208,20 +1242,17 @@ constructor(opts: TuiOptions) {
    */
   askGrantScope(tool: string, scope: string): Promise<boolean> {
     this.pushSystem(`guardian denied ${tool} — allow this scope anyway?`);
-    // The key handler branches on #confirmMode to map g→"always" (grant) and
-    // n/Enter/Esc→deny; without "grant" the [g] key was unhandled.
-    this.#confirmMode = "grant";
-    this.#confirmText = `[g] grant ${scope}   [n] no`;
-    this.requestPaint();
     return new Promise((resolve) => {
-      this.#confirm = (ans) => {
-        this.#confirm = null;
-        this.#confirmText = "";
-        const granted = ans === "always";
-        this.pushSystem(granted ? "granted — this scope is now pre-authorized" : "grant declined");
-        this.requestPaint();
-        resolve(granted);
-      };
+      this.#confirmQueue.push({
+        text: `[g] grant ${scope}   [n] no`,
+        mode: "grant",
+        resolve: (ans) => {
+          const granted = ans === "always";
+          this.pushSystem(granted ? "granted — this scope is now pre-authorized" : "grant declined");
+          resolve(granted);
+        },
+      });
+      this.#pumpConfirm();
     });
   }
 
@@ -1235,17 +1266,13 @@ constructor(opts: TuiOptions) {
    */
   askRunOrCopy(command: string, scope: string): Promise<"run" | "copy" | "no"> {
     this.pushSystem(`⚠ write command needs approval: ${command}`);
-    this.#confirmMode = "runorcopy";
-    this.#confirmText = `[R]un   [C]opy   [N]o   ${scope}`;
-    this.requestPaint();
     return new Promise((resolve) => {
-      this.#confirm = (ans) => {
-        this.#confirm = null;
-        this.#confirmMode = "confirm";
-        this.#confirmText = "";
-        this.requestPaint();
-        resolve(ans === "once" ? "run" : ans === "always" ? "copy" : "no");
-      };
+      this.#confirmQueue.push({
+        text: `[R]un   [C]opy   [N]o   ${scope}`,
+        mode: "runorcopy",
+        resolve: (ans) => resolve(ans === "once" ? "run" : ans === "always" ? "copy" : "no"),
+      });
+      this.#pumpConfirm();
     });
   }
 

@@ -3767,6 +3767,79 @@ await srv.connect(new StdioServerTransport());
 }
 
 {
+  // R5 P1 — concurrent askConfirm: two parallel asks (e.g. two MCP tools both
+  // declaring kind=read, permission=ask invoked in sequence) used to hit ONE
+  // reusable `#confirm` slot — the second ask overwrote the first's callback,
+  // so the first Promise never resolved and the turn hung. Asks now queue:
+  // one prompt renders at a time; the second activates only after the first
+  // resolves (serialized display + both promises settle).
+  const { Tui } = await import("./tui.js");
+  const mkTui = () =>
+    new Tui({
+      placeholder: ">",
+      meta: () => ({ agent: "t", model: "m", provider: "p" }),
+      cwd: "/tmp",
+      statusLeft: "x",
+      statusRight: "y",
+      busy: () => false,
+      onLine: () => {},
+    });
+  {
+    const tui = mkTui();
+    const p1 = tui.askConfirm("first?", "s1");
+    const p2 = tui.askConfirm("second?", "s2");
+    // First prompt active: answer it → BOTH must settle (second queued).
+    tui.feed("y");
+    const a1 = await Promise.race([p1, new Promise((r) => setTimeout(() => r("TIMEOUT"), 300))]);
+    assert(a1 === "once", `R5 P1: first concurrent ask resolves (got ${JSON.stringify(a1)})`);
+    // Second prompt is now active (not resolved early, not lost).
+    const open = await Promise.race([p2.then(() => "answered"), new Promise((r) => setTimeout(() => r("OPEN"), 200))]);
+    assert(open === "OPEN", "R5 P1: second ask waits for the first (queued, not lost)");
+    tui.feed("n");
+    const a2 = await Promise.race([p2, new Promise((r) => setTimeout(() => r("TIMEOUT"), 300))]);
+    assert(a2 === "deny", `R5 P1: second concurrent ask resolves after the first (got ${JSON.stringify(a2)})`);
+  }
+  {
+    // Mixed modes serialize too: an askConfirm during an active askRunOrCopy
+    // queues behind it instead of stealing the key slot.
+    const tui = mkTui();
+    const p1 = tui.askRunOrCopy("npm run build", "scope");
+    const p2 = tui.askConfirm("plain?", "s");
+    tui.feed("R"); // answers run-or-copy (R, not y)
+    const a1 = await Promise.race([p1, new Promise((r) => setTimeout(() => r("TIMEOUT"), 300))]);
+    assert(a1 === "run", `R5 P1: run-or-copy resolves (got ${JSON.stringify(a1)})`);
+    const open = await Promise.race([p2.then(() => "answered"), new Promise((r) => setTimeout(() => r("OPEN"), 200))]);
+    assert(open === "OPEN", "R5 P1: queued askConfirm waits for active run-or-copy");
+    tui.feed("a");
+    const a2 = await Promise.race([p2, new Promise((r) => setTimeout(() => r("TIMEOUT"), 300))]);
+    assert(a2 === "always", `R5 P1: queued askConfirm resolves after run-or-copy (got ${JSON.stringify(a2)})`);
+  }
+  console.log("ok: R5 P1 — concurrent asks serialize (no single-slot overwrite, no hang)");
+}
+
+{
+  // R3 P2 — non-TTY EOF hang: SessionGate's ask path without a TUI falls back
+  // to readline on stdin. Piped stdin that ends without a line (EOF — e.g.
+  // `echo | aih run …` or a closed pipe in CI) used to leave readline's
+  // question callback pending forever → the turn hung (~1.5s observed).
+  // Spawn a subprocess with empty stdin (immediate EOF); it must settle with
+  // a deny in well under the timeout, not block waiting for input.
+  const gateUrl = new URL("./gate.js", import.meta.url).href;
+  const probe = `import { SessionGate, DenyGate } from ${JSON.stringify(gateUrl)};
+const g = new SessionGate(new DenyGate(), [{ tool: "write_file", pattern: "*", action: "ask" }]);
+const ok = await g.request({ tool: "write_file", kind: "write", args: { path: "/tmp/x" } });
+console.log("RESULT:" + JSON.stringify({ ok, denySource: g.lastDenySource }));
+process.exit(ok === false ? 0 : 1);`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
+    encoding: "utf8",
+    input: "", // stdin EOF immediately — no line will ever arrive
+    timeout: 10_000, // must NOT hang; safety net against regression
+  });
+  assert(r.status === 0 && r.stdout.includes('"ok":false'), `R3 P2: EOF → deny, no hang (status=${r.status}, out=${JSON.stringify(r.stdout.slice(-120))}, err=${JSON.stringify(r.stderr.slice(-120))})`);
+  console.log("ok: R3 P2 — non-TTY stdin EOF resolves ask to deny instead of hanging");
+}
+
+{
   // P#35 — Alt+Up recalls the last queued message back into the editor.
   const { Tui } = await import("./tui.js");
   const lines: string[] = [];

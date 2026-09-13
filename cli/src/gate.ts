@@ -392,10 +392,25 @@ export class SessionGate implements ApprovalGate {
   #readlineAsk(detail: string, scope: string): Promise<ConfirmAnswer> {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     return new Promise((resolve) => {
-      rl.question(`approve ${detail}? [y]es / [n]o / [a]lways ${scope} `, (ans) => {
+      // R3 P2 — non-TTY EOF hang: piped stdin (e.g. `echo | aih run …` or a
+      // closed pipe in CI) never delivers a line, so readline's question
+      // callback never fires and this Promise hangs the turn forever (the
+      // observed 1.5s+ stall). Listen for the interface closing on EOF: when
+      // stdin ends, readline emits `close` (its question callback stays
+      // pending). Resolve deny then — no human is at the keyboard. The answer
+      // callback may race with close (answer first → close still fires) so we
+      // settle through a single idempotent path.
+      let settled = false;
+      const settle = (ans: ConfirmAnswer): void => {
+        if (settled) return;
+        settled = true;
         rl.close();
+        resolve(ans);
+      };
+      rl.on("close", () => settle("deny"));
+      rl.question(`approve ${detail}? [y]es / [n]o / [a]lways ${scope} `, (ans) => {
         const a = ans.trim().toLowerCase();
-        resolve(a === "y" ? "once" : a === "a" ? "always" : "deny");
+        settle(a === "y" ? "once" : a === "a" ? "always" : "deny");
       });
     });
   }

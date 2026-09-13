@@ -416,6 +416,43 @@ assert(
   "wildcard rule stays tool-specific",
 );
 
+// R3 P1 — path traversal must NOT pass through an allow rule: the raw path
+// `/workspace/x/../../etc/cron.d/evil` *starts* with `/workspace/` and used to
+// prefix-match an `/workspace/**` allow, even though resolve() canonicalizes it
+// to `/etc/cron.d/evil` (outside the allowed tree). Only the RESOLVED path may
+// match a rule now.
+const traversalReq = {
+    tool: "edit" as const,
+    kind: "write" as const,
+    args: { path: "/workspace/x/../../etc/cron.d/evil" },
+  };
+assert(
+  new RulesetGate(new DenyAll(), [{ tool: "edit", pattern: "/workspace/**", action: "allow" }]).evaluate(traversalReq) === undefined,
+  "R3 P1: traversal raw path does not match the allow rule (resolved to /etc)",
+);
+const traversalGate = new RulesetGate(new DenyAll(), [{ tool: "edit", pattern: "/workspace/**", action: "allow" }]);
+assert(
+  (await traversalGate.request(traversalReq)) === false,
+  "R3 P1: traversal request falls through to the base (denied, not auto-approved)",
+);
+// Counter-check: the allowed tree itself still works after the fix.
+assert(
+  new RulesetGate(new DenyAll(), [{ tool: "edit", pattern: "/workspace/**", action: "allow" }]).evaluate({
+    tool: "edit" as const,
+    kind: "write" as const,
+    args: { path: "/workspace/src/a.ts" },
+  }) === "allow",
+  "R3 P1: in-tree absolute path still matches the allow rule",
+);
+// A deny rule on the RESOLVED target still catches traversal (deny dominates).
+assert(
+  new RulesetGate(new DenyAll(), [
+    { tool: "edit", pattern: "/workspace/**", action: "allow" },
+    { tool: "edit", pattern: "/etc/**", action: "deny" },
+  ]).evaluate(traversalReq) === "deny",
+  "R3 P1: deny on resolved /etc target dominates traversal",
+);
+
 const usageLog = new SessionLog();
 const usageLlm = new MockLLM([
   {
