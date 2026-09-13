@@ -26,6 +26,7 @@ import {
   OpenAICompatibleLLM,
   SessionLog,
   SessionStore,
+  parseSessionLines,
   ToolRegistry,
   FINAL_STATE_GUARD,
   GOAL_CONTRACT_TEMPLATE,
@@ -4309,16 +4310,24 @@ function sessionFiles(): Array<{ name: string; path: string; events: number; siz
     .sort((a, b) => b.mtime - a.mtime);
 }
 
+/**
+ * Load a named session's events (missing session → error + exit 1).
+ * Uses parseSessionLines (core) so a torn/bad line never crashes subcommands
+ * the way a raw JSON.parse per line used to (P#35 tolerance).
+ */
 function readSessionEvents(name: string): SessionEvent[] {
   const path = join(SESSIONS_DIR, `${name}.jsonl`);
   if (!existsSync(path)) {
     console.error(`error: no such session "${name}"`);
     process.exit(1);
   }
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => JSON.parse(l) as SessionEvent);
+  const { events, badLines } = parseSessionLines(readFileSync(path, "utf8"));
+  if (badLines.length > 0) {
+    process.stderr.write(
+      `warning: ${path}: skipped ${badLines.length} unparseable line(s) (line ${badLines.join(", ")})\n`,
+    );
+  }
+  return events;
 }
 
 function cmdSessionList() {

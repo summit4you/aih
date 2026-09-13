@@ -14,7 +14,7 @@ export {
   PARK_REASON,
 } from "./recovery.js";
 export type { ToolFact, ToolRecoveryState, RecoveryReport } from "./recovery.js";
-export { SessionStore } from "./session-store.js";
+export { SessionStore, parseSessionLines } from "./session-store.js";
 export {
   CONFIG_SCHEMA_VERSION,
   SESSION_SCHEMA_VERSION,

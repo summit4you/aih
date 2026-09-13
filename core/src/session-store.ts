@@ -4,6 +4,42 @@ import { SessionLog } from "./session-log.js";
 import { SESSION_SCHEMA_VERSION, checkSchemaVersion } from "./schema-version.js";
 import type { SessionEvent } from "./types.js";
 
+/**
+ * Parse an NDJSON session file's lines into events with tolerant semantics
+ * (P#35): a torn trailing line from a crash mid-append is dropped, and corrupt
+ * lines inside the session are skipped with a warning — no single bad line
+ * ever makes a whole session unreadable. Returns the parseable events.
+ *
+ * Shared by SessionStore.load (which repairs the file) and the CLI's
+ * readSessionEvents (read-only paths like `session show` / `fork` / `stats`),
+ * so every consumer behaves identically on damaged files.
+ */
+export interface ParsedSessionLines {
+  events: SessionEvent[];
+  /** 1-based line indexes that failed to parse (for warnings/repair). */
+  badLines: number[];
+  /** Index of the last parseable line (for torn-tail repair) or -1. */
+  lastGoodLine: number;
+}
+
+export function parseSessionLines(fileText: string): ParsedSessionLines {
+  const lines = fileText.split("\n");
+  const events: SessionEvent[] = [];
+  const badLines: number[] = [];
+  let lastGoodLine = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line) as SessionEvent);
+      lastGoodLine = i;
+    } catch {
+      badLines.push(i);
+    }
+  }
+  return { events, badLines, lastGoodLine };
+}
+
 export class SessionStore {
   #path: string;
   /** Last seq known to be in the file (full publish or incremental append). */
@@ -78,20 +114,8 @@ export class SessionStore {
     // Legacy sessions have no meta sidecar (or one without schemaVersion) and
     // load as before — backward compatible.
     checkSchemaVersion(this.#readMeta().schemaVersion, SESSION_SCHEMA_VERSION, "session", this.#path);
-    const lines = readFileSync(this.#path, "utf8").split("\n");
-    const events: SessionEvent[] = [];
-    const badLines: number[] = [];
-    let lastGoodLine = -1;
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i];
-      if (!line.trim()) continue;
-      try {
-        events.push(JSON.parse(line) as SessionEvent);
-        lastGoodLine = i;
-      } catch {
-        badLines.push(i);
-      }
-    }
+    const text = readFileSync(this.#path, "utf8");
+    const { events, badLines, lastGoodLine } = parseSessionLines(text);
     if (badLines.length === 0) {
       this.#rebaseline(events);
       return SessionLog.fromEvents(events);
@@ -102,7 +126,7 @@ export class SessionStore {
       process.stderr.write(
         `warning: ${this.#path}: dropped ${badLines.length} torn trailing line(s)\n`,
       );
-      this.#publish(`${lines.slice(0, lastGoodLine + 1).join("\n")}\n`);
+      this.#publish(`${text.split("\n").slice(0, lastGoodLine + 1).join("\n")}\n`);
       this.#rebaseline(events);
       return SessionLog.fromEvents(events);
     }

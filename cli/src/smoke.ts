@@ -1473,6 +1473,26 @@ assert(existsSync(".aih/sessions/s1-branch.jsonl"), "forked session file exists"
 const forkAgain = aih(["session", "fork", "s1", "s1-branch"]);
 assert(forkAgain.status === 1 && forkAgain.stderr.includes("already exists"), "fork refuses to overwrite an existing session");
 
+// --- P2-R2#1: torn tail must not crash session subcommands ---------------
+// P#35 tolerance belongs in EVERY session reader, not just SessionStore.load:
+// a torn final line (crash mid-append) used to make `session show`, `fork`,
+// `stats` and `/sessions view` throw a raw JSON.parse SyntaxError. They must
+// now skip the bad line with a warning and keep working.
+{
+  const broken = ".aih/sessions/s1-torn.jsonl";
+  writeFileSync(broken, `${readFileSync(sessionFile, "utf8").trimEnd()}\n{"seq":999,"ts":1,"type":"tool/ca`, "utf8");
+  const show2 = aih(["session", "show", "s1-torn"]);
+  assert(show2.status === 0 && show2.stdout.includes("first prompt alpha"), "session show survives a torn trailing line");
+  const fork2 = aih(["session", "fork", "s1-torn", "s1-torn-branch"]);
+  assert(fork2.status === 0 && fork2.stdout.includes("forked s1-torn"), "session fork survives a torn trailing line");
+  const stats2 = aih(["stats"]);
+  assert(stats2.status === 0, "stats survives a torn session file present");
+  const showWarn = aih(["session", "show", "s1-torn"]);
+  assert(showWarn.stderr.includes("unparseable"), "session show warns about the skipped line");
+  // The torn file is NOT atomically repaired by read-only subcommands (only
+  // SessionStore.load repairs); a subsequent full save re-baselines it.
+}
+
 // --- P#37①: distill an abandoned branch into a branch_summary event ---------
 {
   // mock mode: AIH_MOCK_AUX_TEXT feeds the distiller's tool-less call
