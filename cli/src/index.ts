@@ -2297,8 +2297,15 @@ async function cmdChat(flags: Record<string, string | boolean>) {
       modelLabel = re.model.value ?? modelId;
       providerLabel = re.provider ?? "custom";
       // Context size belongs to the conversation, not the model: re-seed from
-      // the log (same as `-c` resume) instead of zeroing the panel.
-      usedTokens = lastContextTokens(log.all(), resolveContextWindow(flags)).tokens;
+      // the log (same as `-c` resume and the live gauge) instead of zeroing
+      // the panel. Same estimateContextTokens口径 as initial/resume/gauge —
+      // lastContextTokens here would flash the compaction STAMP (a
+      // point-in-time snapshot, ~6k) instead of the current size (~100k+ after
+      // the tail grew past the stamp), making a /model switch look like the
+      // context shrank to nothing. The live estimate is immune to garbage
+      // provider usage (it never reads usage fields), so the phantom-254k
+      // regression that lastContextTokens guards against stays covered.
+      usedTokens = estimateContextTokens(log.all());
       loop = makeLoop();
     } catch (err) {
       // A failed switch (e.g. target provider has no API key) must not kill
