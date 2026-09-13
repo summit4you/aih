@@ -8205,6 +8205,20 @@ console.log("══════════════════════�
   assert(!/wp_0123456/.test(r2) && r2.includes("[redacted]"), "OC#7 redact masks a key=value assignment");
   const r3 = redactCredential("quota exhausted on provider X at /v1/chat/completions");
   assert(r3.includes("quota exhausted on provider X"), "OC#7 redact keeps benign reason text");
+  // R4 — provider token SHAPES, not just header/value shapes: ghp_/github_pat_/
+  // xox/AKIA/AIza are all real credential formats that reached owner.json raw
+  // (LONG_RUN_RE only covers 28+ base62, ghp_ tokens are 36+ so they
+  // coincidentally matched — but 16-char ghs_ / slack xox tokens didn't).
+  // Shapes are built via join() so this source file never contains a
+  // credential-shaped literal (D#11 redaction would rewrite it to a no-op
+  // assertion at authoring time).
+  const ghoShape = ["gh", "o_AbCdEf0123456789abcd"].join("");
+  const r4 = redactCredential(`forbidden: token ${ghoShape} expired`);
+  assert(!r4.includes(ghoShape) && r4.includes("[redacted]"), "R4 redact masks gho_ token shape");
+  const xoxShape = ["xo", "xb-1234567890abcd"].join("");
+  const r5 = redactCredential(`slack error near ${xoxShape}`);
+  assert(!r5.includes(xoxShape) && r5.includes("[redacted]"), "R4 redact masks xoxb slack token");
+  assert(redactCredential("quota exhausted on provider AKIA-adjacent prose") === "quota exhausted on provider AKIA-adjacent prose", "R4 redact keeps AKIA-adjacent prose (only AKIA+16 digits masked)");
 
   // ---- isolated registry under AIH_HOME ----
   const oHome = mkdtempSync(join(tmpdir(), "aih-owner-"));

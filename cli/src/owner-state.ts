@@ -94,7 +94,7 @@ function writeOwnerFile(state: OwnerState): void {
  *   - quoted secrets immediately after authorization/api-key headers
  */
 const SECRET_RUN_RE =
-  /\b(?:Bearer|sk-[A-Za-z0-9_\-]{6,}|key=?"?[A-Za-z0-9_\-\.]{6,}"?|(?:api[-_]?key|authorization|token|secret|password)\s*[:=]\s*"?[A-Za-z0-9_\-\.\/+]{6,}"?)/gi;
+  /\b(?:Bearer|sk-[A-Za-z0-9_\-]{6,}|(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|key=?"?[A-Za-z0-9_\-\.]{6,}"?|(?:api[-_]?key|authorization|token|secret|password)\s*[:=]\s*"?[A-Za-z0-9_\-\.\/+]{6,}"?)/gi;
 const LONG_RUN_RE = /\b[A-Za-z0-9_\-]{28,}\b/g;
 
 export function redactCredential(text: string): string {

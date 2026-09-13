@@ -2,7 +2,7 @@
 // Apache-2.0): spawned commands get a filtered environment so secrets
 // (API keys, tokens, passwords) are not exposed to agent-executed processes.
 
-const SECRET_HINT = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)/i;
+const SECRET_HINT = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL)/i;
 
 export interface EnvPolicyOptions {
   /** Extra vars to force-set in the child env after filtering (Codex `set`). */
