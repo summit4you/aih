@@ -8,6 +8,30 @@ the versions listed here (`scripts/package` derives the version from
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-13
+
+### Fixed
+- **权限门路径穿越（R3 P1，安全）**（`core/src/seams/permissions.ts`）：`RulesetGate.evaluate/explain`
+  此前对原始路径与 `resolve()` 后的绝对路径**各匹配一次、任一命中即放行**——`allow /workspace/**`
+  规则对请求 `/workspace/x/../../etc/cron.d/evil` 的 **raw 前缀命中**而放行，实际文件解析到
+  `/etc/cron.d/evil`（**穿越 allow/ask 权限门硬边界**）。现只匹配 `resolve()` 后的规范路径，
+  穿越路径不再能命中任一规则；合法树内绝对路径行为不变。core 冒烟新增 4 条回归（穿越拒 /
+  合法树仍放行 / deny 主导）。
+- **非 TTY ask 挂死（R3 P2）**（`cli/src/gate.ts`）：`SessionGate` 无 TUI 时 ask 回退到 readline；
+  管道 stdin **EOF 后 question 回调不触发** → Promise 永挂（实测 ~1.5s）。现监听 rl `close`
+  （EOF 时 readline 必然触发）→ 幂等 `settle("deny")`（fail-closed：无人在键盘前即拒绝，answer
+  先到时 close 为 no-op）。cli 冒烟新增 spawnSync EOF 子进程回归（10s 超时护栏）。
+- **并发 ask 槽位竞争（R5 P1，turn 悬挂）**（`cli/src/tui.ts`）：两个 `permission="ask"` 工具并发
+  ask（MCP 可声明 `kind=read, permission=ask`）→ 第二个覆盖单槽 `#confirm` 回调 → 第一个
+  Promise **永不 resolve** → turn 悬挂。`askConfirm`/`askGrantScope`/`askRunOrCopy` 统一改为入
+  `#confirmQueue`，`#pumpConfirm` 串行激活（按键模式随队首切换），resolve 后泵下一个——N 个并发
+  ask 串行渲染、每个必 settle。cli 冒烟新增 6 条断言。
+- **/model 切换瞬间上下文闪 6k（面板口径不一致）**（`cli/src/index.ts`）：`applyModel` 换模型后
+  re-seed 用 `lastContextTokens`（**compaction stamp 快照**优先，压缩时刻值 ~6k），而 `-c` resume
+  与实时 gauge 用 `estimateContextTokens`（当前真实大小）——同一会话切换后闪旧值，误以为上下文
+  丢失。re-seed 与 resume/gauge 统一为 `estimateContextTokens`（不读 usage 字段，天然免疫
+  garbage 数字；`lastContextTokens` 仍在 turn 后 fallback 保留，phantom-254k 回归不受影响）。
+
 ## [0.8.1] - 2026-09-10
 
 ### Added
