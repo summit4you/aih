@@ -24,7 +24,7 @@ three integration forms (MCP plugin / CLI / embedded SDK) — **without changing
 **macOS / Linux / WSL** — one-line install (requires [Node.js](https://nodejs.org/) ≥ 20):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash
+curl -fsSL https://raw.githubusercontent.com/summit4you/aih/main/scripts/install | bash -s -- --version "$(curl -fsSL https://api.github.com/repos/summit4you/aih/releases/latest | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')"
 ```
 
 **Windows PowerShell**:
